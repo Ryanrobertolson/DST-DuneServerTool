@@ -61,7 +61,13 @@ internal static partial class Program
             var command = RequireValue(options, "command").ToLowerInvariant();
             object result = command switch
             {
+                "character-xp" => ChangeCharacterXp(Require(options, "input"), Require(options, "safety-backup"),
+                    Require(options, "adapter"), Require(options, "levels"), RequireValue(options, "action"),
+                    ParseBalance(RequireValue(options, "amount"), "Character XP")),
                 "diagnostics" => ExportDiagnostics(Require(options, "input")),
+                "faction-progression" => SetFactionProgression(Require(options,"input"), Require(options,"safety-backup"),
+                    Require(options,"adapter"), Require(options,"nodes"), RequireValue(options,"faction"),
+                    RequireValue(options,"action"), ParseBalance(RequireValue(options,"amount"),"Faction reputation")),
                 "reset-specialization-rewards" => ResetSpecializationRewards(
                     Require(options, "input"), Require(options, "safety-backup"),
                     Require(options, "adapter"), Require(options, "keystones"), RequireValue(options, "track")),
@@ -2292,6 +2298,7 @@ internal static partial class Program
                   }
                 }
                 """.Replace("__SCHEMA_FINGERPRINT__", selfTestFingerprint));
+            SelfTestCharacterXp(root, target, adapterPath);
             var beforeNpe = InspectPath(target, adapterPath: adapterPath).Progression;
             if (beforeNpe.NpeNodesTotal != 2 || beforeNpe.NpeNodesComplete != 0)
             {
@@ -2683,6 +2690,8 @@ internal static partial class Program
                     "offline-solo-npe-completion",
                     "offline-enable-all-skills-preserves-unknowns",
                     "offline-exact-progression-points",
+                    "offline-character-xp-preserves-bonuses-and-spent-intel",
+                    "character-xp-reduction-protects-allocated-skills-and-original-save",
                     "progression-compatible-schema-accepted",
                     "unrelated-schema-changes-allow-inspection-and-verified-write",
                     "unrelated-schema-data-preserved",
