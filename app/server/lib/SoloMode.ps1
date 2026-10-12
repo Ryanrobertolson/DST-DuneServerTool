@@ -1,5 +1,6 @@
 ﻿. (Join-Path $PSScriptRoot 'SoloCosmetics.ps1')
 . (Join-Path $PSScriptRoot 'SoloBlueprintSettings.ps1')
+. (Join-Path $PSScriptRoot 'SoloXbox.ps1')
 $script:DuneSoloSection = '/Script/DuneSandbox.UserServerCustomSettings'
 $script:DuneSoloSettingKeys = @(
     'DifficultyLevel',
@@ -13,6 +14,7 @@ $script:DuneSoloSettingKeys = @(
     'LootRespawnSpeed',
     'FuelBurnTimeMultiplier',
     'InventoryVolumeMultiplier',
+    'PlayerInventoryStartingSize',
     'PlayerDamageToPlayer',
     'PlayerDamageToNPC',
     'PlayerDamageToVehicle',
@@ -61,7 +63,7 @@ $script:DuneSoloBooleanSettingKeys = @(
     'bBuildingInfiniteStability',
     'bLandsraadDisableDecreeRerollLimit'
 )
-$script:DuneSoloIntegerSettingKeys = @('FiefdomLimit', 'MaxLandclaimSegments')
+$script:DuneSoloIntegerSettingKeys = @('FiefdomLimit', 'MaxLandclaimSegments', 'PlayerInventoryStartingSize')
 $script:DuneSoloSelectSettingOptions = @{
     DropEquipmentOnDeath = @('Default', 'None', 'Backpack', 'All')
     SandwormConsequences = @('Default', 'None', 'Backpack', 'All')
@@ -69,6 +71,14 @@ $script:DuneSoloSelectSettingOptions = @{
 }
 $script:DuneSoloConsoleSection = 'ConsoleVariables'
 $script:DuneSoloConsoleSettings = @(
+    [ordered]@{
+        key = 'dw.EnableBuildablePlacementAlwaysFilled'
+        type = 'bool01'
+        default = ''
+        label = 'Skip hologram placement'
+        help = 'Place filled buildables instead of holograms. Independent of Instant build; leave unchecked to keep hologram placement. Unset leaves the file unchanged.'
+        status = 'Available'
+    },
     [ordered]@{
         key = 'Hydration.SunExposureEnabled'
         type = 'bool01'
@@ -199,9 +209,12 @@ function Get-DuneSoloAdapterDescriptor {
 
     $profileDir = Split-Path -Parent ([IO.Path]::GetFullPath($DbPath))
     $channel = [IO.Path]::GetFileName((Split-Path -Parent $profileDir))
+    $xbox = Get-DuneSoloXboxBlob -Path $DbPath
+    if ($xbox) { $channel = 'Xbox' }
     $manifestName = switch ($channel) {
         'FLS_retail' { 'solo-retail-v1.json' }
         'FLS_beta' { 'solo-legacy-v1.json' }
+        'Xbox' { 'solo-retail-v1.json' }
         default { '' }
     }
     if (-not $manifestName) {
@@ -330,6 +343,7 @@ function Find-DuneSoloProfiles {
 
     $root = [IO.Path]::GetFullPath($DataRoot)
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
+    if ([IO.Path]::GetFileName($root) -eq 'wgs') { return @(Find-DuneSoloXboxProfiles -DataRoot $root) }
 
     $searchRoot = Join-Path $root 'Cloud\PlayerClientStorage'
     if (-not (Test-Path -LiteralPath $searchRoot -PathType Container)) {
@@ -343,6 +357,8 @@ function Find-DuneSoloProfiles {
         $adapter = Get-DuneSoloAdapterDescriptor -DbPath $file.FullName
         [pscustomobject]@{
             id = [IO.Path]::GetFileName($profileDir)
+            platform = 'steam'
+            dataRoot = $DataRoot
             channel = [IO.Path]::GetFileName($channelDir)
             adapter = [string]$adapter.id
             legacy = [bool]$adapter.legacy
@@ -357,11 +373,24 @@ function Find-DuneSoloProfiles {
 }
 
 function Get-DuneSoloDiscovery {
-    param([Parameter(Mandatory)][string]$SelectedPath)
+    param([string]$SelectedPath = '', [ValidateSet('auto','steam','xbox')][string]$Platform = 'auto')
 
     Assert-DuneSoloSupportedPlatform
+    if (-not $SelectedPath.Trim()) {
+        $roots = @()
+        if ($Platform -ne 'xbox') { $roots += Get-DuneSoloDefaultDataRoot }
+        if ($Platform -ne 'steam') { $roots += @(Get-DuneSoloXboxRoots) }
+        $profiles = @($roots | ForEach-Object { Find-DuneSoloProfiles -DataRoot $_ })
+        $suggested = if ($profiles.Count -eq 1) { [string]$profiles[0].dbPath } else { '' }
+        return @{ ok = $true; dataRoot = if ($roots.Count -eq 1) { $roots[0] } else { '' }; settingsPath = ''; profiles = $profiles; suggestedDbPath = $suggested }
+    }
     $selectedFull = [IO.Path]::GetFullPath($SelectedPath)
     $dataRoot = Resolve-DuneSoloDataRoot -SelectedPath $selectedFull
+    $ancestor = $selectedFull
+    for ($i = 0; $i -lt 5 -and $ancestor; $i++) {
+        if ([IO.Path]::GetFileName($ancestor) -eq 'wgs') { $dataRoot = $ancestor; break }
+        $ancestor = Split-Path -Parent $ancestor
+    }
     $profiles = @(Find-DuneSoloProfiles -DataRoot $dataRoot)
     $directDb = Join-Path $selectedFull 'game.db'
     $suggestedDb = ''
@@ -382,7 +411,7 @@ function Get-DuneSoloDiscovery {
 }
 
 function Get-DuneSoloGameProcesses {
-    $names = @('DuneSandbox', 'DuneSandbox_BE', 'DuneSandbox-Win64-Shipping')
+    $names = @('DuneSandbox', 'DuneSandbox_BE', 'DuneSandbox-Win64-Shipping', 'DuneSandbox-WinGDK-Shipping', 'AppDuneAwakeningShipping')
     $found = @()
     foreach ($name in $names) {
         try {
@@ -404,11 +433,23 @@ function Assert-DuneSoloGameClosed {
 
 function Invoke-DuneSoloHelper {
     param(
-        [Parameter(Mandatory)][ValidateSet('inspect','diagnostics','character-xp','faction-progression','set-specialization','reset-specialization-rewards','backup','restore','grant-items','delete-item','import-blueprint','list-blueprints','export-blueprint','set-currencies','fill-water','set-weapon-ammo','repair-equipment','max-augment-attributes','max-specializations','complete-fremen','complete-npe','enable-skills','set-progression-points','unlock-main-quest')][string]$Command,
+        [Parameter(Mandatory)][ValidateSet('inspect','diagnostics','character-xp','faction-progression','set-specialization','reset-specialization-rewards','backup','restore','grant-items','delete-item','import-blueprint','list-blueprints','export-blueprint','set-currencies','fill-water','set-weapon-ammo','repair-equipment','max-augment-attributes','max-specializations','complete-fremen','complete-npe','enable-skills','set-progression-points','unlock-main-quest','unlock-trainer')][string]$Command,
         [Parameter(Mandatory)][hashtable]$Arguments
     )
 
     $helper = Get-DuneSoloHelperPath
+    foreach ($key in @('input','target')) {
+        if ($Arguments[$key] -and (Get-DuneSoloXboxBlob -Path ([string]$Arguments[$key]))) {
+            if ($Command -notin @('inspect','diagnostics','backup','list-blueprints','export-blueprint')) {
+                $prepared = New-DuneSoloXboxMutation -Command $Command -Arguments $Arguments
+                $committed = Commit-DuneSoloXboxMutation -Prepared $prepared
+                $result = $prepared.result
+                $result | Add-Member -NotePropertyName containerBackup -NotePropertyValue $committed.containerBackup -Force
+                return $result
+            }
+            if ($Command -eq 'backup') { Backup-DuneSoloXboxAccount -Blob (Get-DuneSoloXboxBlob -Path $Arguments[$key]) | Out-Null }
+        }
+    }
     if (-not $helper) {
         throw 'DuneSoloDb.exe is unavailable. Rebuild or reinstall DST with Solo Mode support.'
     }
@@ -471,6 +512,7 @@ function Invoke-DuneSoloProgressionAction {
         $arguments['keystones'] = Get-DuneSoloDataFilePath -Name 'dune-keystones.json'
     } elseif ($Action -eq 'enable-skills') {
         $arguments['skills'] = Get-DuneSoloDataFilePath -Name 'dune-skills-catalog.json'
+        $arguments['tags'] = Get-DuneSoloDataFilePath -Name 'dune-tags.json'
     }
     return Invoke-DuneSoloHelper -Command $Action -Arguments $arguments
 }
@@ -492,6 +534,26 @@ function Unlock-DuneSoloMainQuest {
         adapter = $adapter.manifestPath
         tags = Get-DuneSoloDataFilePath -Name 'dune-tags.json'
         quest = $Quest
+    }
+}
+
+function Unlock-DuneSoloTrainer {
+    param([Parameter(Mandatory)][ValidateSet('Swordmaster','Trooper','Mentat','BeneGesserit','Planetologist')][string]$Job, [string]$Confirm)
+    Assert-DuneSoloSupportedPlatform
+    if ($Confirm -ne 'UNLOCK SOLO TRAINER') { throw 'Confirm the Solo trainer unlock before continuing.' }
+    Assert-DuneSoloGameClosed
+    $profile = Get-DuneSoloProfile
+    Assert-DuneSoloProgressionAdapter -Profile $profile
+    $adapter = Get-DuneSoloAdapterDescriptor -DbPath $profile.dbPath
+    $safetyDir = Join-Path (Get-DuneSoloProfileBackupRoot -DbPath $profile.dbPath) 'pre-progression'
+    New-Item -ItemType Directory -Path $safetyDir -Force | Out-Null
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmssfff')
+    Invoke-DuneSoloHelper -Command 'unlock-trainer' -Arguments @{
+        input = $profile.dbPath
+        'safety-backup' = Join-Path $safetyDir "game-before-trainer-$stamp.db"
+        adapter = $adapter.manifestPath
+        tags = Get-DuneSoloDataFilePath -Name 'dune-tags.json'
+        job = $Job
     }
 }
 
@@ -853,6 +915,11 @@ function Get-DuneSoloProfile {
     $dataRoot = if ($state.dataRoot) { [string]$state.dataRoot } else { Get-DuneSoloDefaultDataRoot }
     $profiles = @(Find-DuneSoloProfiles -DataRoot $dataRoot)
     $dbPath = if ($state.dbPath) { [string]$state.dbPath } else { '' }
+    if ($dbPath -and [IO.Path]::GetFileName($dataRoot) -eq 'wgs') {
+        $container = Split-Path -Parent $dbPath
+        $current = @($profiles | Where-Object { (Split-Path -Parent $_.dbPath) -ieq $container })
+        if ($current.Count -eq 1) { $dbPath = [string]$current[0].dbPath }
+    }
     if ($dbPath -and -not (Test-DuneSoloPathWithinRoot -Path $dbPath -Root $dataRoot)) {
         throw 'Saved Solo database path is outside the configured data root.'
     }
@@ -865,7 +932,7 @@ function Get-DuneSoloProfile {
         }
     }
     $adapter = if ($dbPath) { Get-DuneSoloAdapterDescriptor -DbPath $dbPath } else { $null }
-    $settingsPath = Join-Path $dataRoot 'Config\Windows\ServerCustomSettings.ini'
+    $settingsPath = if ($adapter -and $adapter.channel -eq 'Xbox') { Join-Path (Get-DuneSoloDefaultDataRoot) 'Config\WinGDK\ServerCustomSettings.ini' } else { Join-Path $dataRoot 'Config\Windows\ServerCustomSettings.ini' }
     return @{
         dataRoot = $dataRoot
         dbPath = $dbPath
@@ -892,6 +959,11 @@ function Connect-DuneSoloProfile {
     }
     if ($DbPath) {
         $DbPath = [IO.Path]::GetFullPath($DbPath)
+        $xbox = Get-DuneSoloXboxBlob -Path $DbPath -ResolveCurrentGame
+        if ($xbox) {
+            $DbPath = $xbox.dbPath
+            $dataRoot = Split-Path -Parent $xbox.account
+        }
         if (-not (Test-DuneSoloPathWithinRoot -Path $DbPath -Root $dataRoot)) {
             throw 'Selected Solo database is outside the chosen data root.'
         }
@@ -916,6 +988,10 @@ function Connect-DuneSoloProfile {
         adapter = $adapter.manifestPath
     }
     Save-DuneSoloState -DataRoot $dataRoot -DbPath $DbPath -Adapter $adapter.id | Out-Null
+    if ($script:DuneSoloLoaderRoot -and (Get-Command Set-DuneSoloModPlatform -ErrorAction SilentlyContinue)) {
+        $modPlatform = if ($adapter.channel -eq 'Xbox') { 'xbox' } else { 'steam' }
+        Set-DuneSoloModPlatform -Platform $modPlatform
+    }
     return Get-DuneSoloStatus
 }
 
@@ -1023,7 +1099,7 @@ function Read-DuneSoloSettings {
     $gamePath = Join-Path (Split-Path -Parent $Path) 'Game.ini'
     $landclaimOverrides = @()
     $settingsProfile = Get-DuneSoloProfile
-    $retailOverrides = $settingsProfile.dbPath -and (Get-DuneSoloAdapterDescriptor -DbPath $settingsProfile.dbPath).channel -eq 'FLS_retail'
+    $retailOverrides = $settingsProfile.dbPath -and (Get-DuneSoloAdapterDescriptor -DbPath $settingsProfile.dbPath).channel -in @('FLS_retail','Xbox')
     if (Test-Path -LiteralPath $gamePath -PathType Leaf) {
         $inside = $false
         $landclaimOverrides = @(foreach ($line in [IO.File]::ReadAllLines($gamePath)) {
@@ -1032,6 +1108,18 @@ function Read-DuneSoloSettings {
         })
     }
     $entries = foreach ($key in $script:DuneSoloSettingKeys) {
+        if ($key -eq 'PlayerInventoryStartingSize') {
+            $inventoryValue = ''
+            $insideInventory = $false
+            if (Test-Path -LiteralPath $gamePath -PathType Leaf) {
+                foreach ($line in [IO.File]::ReadAllLines($gamePath)) {
+                    if ($line -match '^\s*\[(.+)\]\s*$') { $insideInventory = $Matches[1] -eq '/Script/DuneSandbox.InventorySystemSettings' }
+                    elseif ($insideInventory -and $line -match '^\s*PlayerInventoryStartingSize\s*=(.*)$') { $inventoryValue = $Matches[1].Trim() }
+                }
+            }
+            [pscustomobject]@{ key = $key; value = $inventoryValue; present = ($inventoryValue -ne ''); needsApply = $false }
+            continue
+        }
         $sharedLandclaim = -not $NativeValues -and $retailOverrides -and $key -eq 'MaxLandclaimSegments' -and $landclaimOverrides.Count -gt 0
         $effectiveValue = if ($sharedLandclaim) { [string]$landclaimOverrides[-1] }
             elseif ($values.ContainsKey($key)) { [string]$values[$key] } else { '' }
@@ -1099,12 +1187,24 @@ function Set-DuneSoloSettings {
         $normalized[$name] = $trimmed
     }
     if ($normalized.Count -eq 0) { throw 'No Solo settings were provided.' }
+    if ($normalized.ContainsKey('PlayerInventoryStartingSize')) {
+        $slots = [string]$normalized['PlayerInventoryStartingSize']
+        if ([int64]$slots -lt 1 -or [int64]$slots -gt [int]::MaxValue) { throw 'PlayerInventoryStartingSize must be a positive 32-bit whole number.' }
+        $inventoryPath = Join-Path (Split-Path -Parent (@(Get-DuneSoloEnginePaths -Profile $profile)[0])) 'Game.ini'
+        Assert-DuneSoloConfigPath -Path $inventoryPath
+        $normalized.Remove('PlayerInventoryStartingSize')
+        $otherResult = if ($normalized.Count) { Set-DuneSoloSettings -Settings $normalized -Confirm $Confirm } else { $null }
+        $inventoryBackup = Set-DuneSoloLandclaimOverride -Path $inventoryPath -Value $slots -Section '/Script/DuneSandbox.InventorySystemSettings' -Key 'PlayerInventoryStartingSize'
+        $settings = Read-DuneSoloSettings
+        if ([string](@($settings.entries | Where-Object key -eq 'PlayerInventoryStartingSize')[0].value) -ne $slots) { throw 'Inventory Game.ini verification failed.' }
+        return @{ ok = $true; settings = $settings; backupPath = $inventoryBackup; paths = @($otherResult.paths) + @($inventoryPath); backupPaths = @($otherResult.backupPaths) + @($inventoryBackup | Where-Object { $_ }) }
+    }
 
     # Native settings remain authoritative for their named controls. Landclaim
     # segments additionally require the client's BuildingSettings override.
     $gamePath = ''
     if ($normalized.ContainsKey('MaxLandclaimSegments') -and
-        (Get-DuneSoloAdapterDescriptor -DbPath $profile.dbPath).channel -eq 'FLS_retail') {
+        (Get-DuneSoloAdapterDescriptor -DbPath $profile.dbPath).channel -in @('FLS_retail','Xbox')) {
         if ([int64]$normalized['MaxLandclaimSegments'] -lt 1) { throw 'MaxLandclaimSegments must be at least 1.' }
         $enginePath = @(Get-DuneSoloEnginePaths -Profile $profile)[0]
         $gamePath = Join-Path (Split-Path -Parent $enginePath) 'Game.ini'
@@ -1242,9 +1342,11 @@ function Assert-DuneSoloConfigPath {
 }
 
 function Set-DuneSoloLandclaimOverride {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Value)
-    $section = '/Script/DuneSandbox.BuildingSettings'
-    $key = 'm_MaxNumLandclaimSegments'
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Value,
+        [ValidateSet('/Script/DuneSandbox.BuildingSettings','/Script/DuneSandbox.InventorySystemSettings')][string]$Section = '/Script/DuneSandbox.BuildingSettings',
+        [ValidateSet('m_MaxNumLandclaimSegments','PlayerInventoryStartingSize')][string]$Key = 'm_MaxNumLandclaimSegments')
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     $existed = Test-Path -LiteralPath $Path -PathType Leaf
     $bom = $false
     $lines = @()
@@ -1288,9 +1390,10 @@ function Set-DuneSoloLandclaimOverride {
 function Get-DuneSoloEnginePaths {
     param([Parameter(Mandatory)][hashtable]$Profile)
     $adapter = Get-DuneSoloAdapterDescriptor -DbPath ([string]$Profile.dbPath)
-    if ($adapter.channel -ne 'FLS_retail') {
+    if ($adapter.channel -notin @('FLS_retail','Xbox')) {
         throw "Solo Engine settings require the supported Retail adapter; found '$($adapter.channel)'."
     }
+    if ($adapter.channel -eq 'Xbox') { return @((Join-Path (Get-DuneSoloDefaultDataRoot) 'Config\WinGDK\Engine.ini')) }
     return @(
         (Join-Path ([string]$Profile.dataRoot) 'Config\Windows\Engine.ini')
     )
@@ -1311,8 +1414,8 @@ function Read-DuneSoloConsoleSettings {
     Assert-DuneSoloSupportedPlatform
     $profile = Get-DuneSoloProfile
     $profileDir = if ($profile.dbPath) { Split-Path -Parent ([string]$profile.dbPath) } else { '' }
-    $channel = if ($profileDir) { [IO.Path]::GetFileName((Split-Path -Parent $profileDir)) } else { '' }
-    if ($channel -ne 'FLS_retail') {
+    $channel = if ($profileDir) { (Get-DuneSoloAdapterDescriptor -DbPath $profile.dbPath).channel } else { '' }
+    if ($channel -notin @('FLS_retail','Xbox')) {
         return @{
             ok = $true
             supported = $false
@@ -1646,7 +1749,7 @@ function Assert-DuneSoloExpectedProfile {
     }
     $actual = Get-DuneSoloProfileToken -DbPath $profile.dbPath
     if ($actual -ne $ExpectedProfileToken.Trim().ToLowerInvariant()) {
-        throw 'The active Solo profile changed in another window. Refresh Solo Mode before writing.'
+        throw 'The active Solo save changed since this page loaded. Xbox saving or cloud sync can change the save-file connection. Close Dune, wait for sync to finish, then click Connect and validate for your intended save and retry. This request made no changes.'
     }
 }
 

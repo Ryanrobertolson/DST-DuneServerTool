@@ -9,7 +9,7 @@
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -67,11 +67,8 @@ Register-DuneRoute -Method POST -Path '/api/solo/discover' -LocalOnly -Handler {
     param($req, $res, $routeParams, $body)
     try {
         $path = [string](Get-DuneSoloBodyField -Body $body -Name 'path' -Default '')
-        if (-not $path.Trim()) {
-            Write-DuneError -Response $res -Status 400 -Message 'Select a Solo data folder.'
-            return
-        }
-        Write-DuneJson -Response $res -Body (Get-DuneSoloDiscovery -SelectedPath $path.Trim())
+        $platform = [string](Get-DuneSoloBodyField -Body $body -Name 'platform' -Default 'auto')
+        Write-DuneJson -Response $res -Body (Get-DuneSoloDiscovery -SelectedPath $path.Trim() -Platform $platform)
     } catch {
         Write-DuneError -Response $res -Status 400 -Message $_.Exception.Message
     }
@@ -212,7 +209,7 @@ Register-DuneRoute -Method DELETE -Path '/api/solo/backups' -LocalOnly -Handler 
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -252,7 +249,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/items/grant' -LocalOnly -Handle
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -272,7 +269,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/items/delete' -LocalOnly -Handl
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -291,7 +288,7 @@ Register-DuneRoute -Method GET -Path '/api/solo/blueprints' -LocalOnly -Handler 
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*changed in another window*') { 409 } elseif ($_.Exception.Message -like '*Connect a valid Solo save*') { 400 } else { 500 }
+        $status = if ($_.Exception.Message -like '*active Solo save changed*') { 409 } elseif ($_.Exception.Message -like '*Connect a valid Solo save*') { 400 } else { 500 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -312,7 +309,7 @@ Register-DuneRoute -Method GET -Path '/api/solo/blueprints/export' -LocalOnly -H
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*changed in another window*') { 409 } elseif ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*Connect a valid Solo save*') { 400 } else { 500 }
+        $status = if ($_.Exception.Message -like '*active Solo save changed*') { 409 } elseif ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*Connect a valid Solo save*') { 400 } else { 500 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -333,7 +330,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/blueprints/import' -LocalOnly -
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -351,7 +348,7 @@ Register-DuneRoute -Method PUT -Path '/api/solo/currencies' -LocalOnly -Handler 
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -368,7 +365,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/fillables/water' -LocalOnly -Ha
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -385,7 +382,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/items/augments/max' -LocalOnly 
 
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -403,7 +400,7 @@ Register-DuneRoute -Method PUT -Path '/api/solo/items/weapon-ammo' -LocalOnly -H
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -420,7 +417,24 @@ Register-DuneRoute -Method POST -Path '/api/solo/progression/main-quest/unlock' 
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
+        Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
+    }
+}
+
+Register-DuneRoute -Method POST -Path '/api/solo/progression/trainer/unlock' -LocalOnly -Handler {
+    param($req, $res, $routeParams, $body)
+    try {
+        $job = [string](Get-DuneSoloBodyField -Body $body -Name 'job' -Default '')
+        $confirm = [string](Get-DuneSoloBodyField -Body $body -Name 'confirm' -Default '')
+        $token = [string](Get-DuneSoloBodyField -Body $body -Name 'expectedProfileToken' -Default '')
+        $result = Invoke-WithDuneLock -Name 'solo-profile-data' -Script {
+            Assert-DuneSoloExpectedProfile -ExpectedProfileToken $token
+            Unlock-DuneSoloTrainer -Job $job -Confirm $confirm
+        }
+        Write-DuneJson -Response $res -Body $result
+    } catch {
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -437,7 +451,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/progression/specializations/max
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -454,7 +468,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/progression/find-the-fremen' -L
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -471,7 +485,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/progression/npe/complete' -Loca
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -488,7 +502,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/progression/skills/enable-all' 
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -528,7 +542,7 @@ Register-DuneRoute -Method PUT -Path '/api/solo/progression/points' -LocalOnly -
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -543,7 +557,7 @@ Register-DuneRoute -Method GET -Path '/api/solo/diagnostics' -LocalOnly -Handler
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -564,7 +578,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/progression/faction' -LocalOnly
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -584,7 +598,7 @@ Register-DuneRoute -Method PUT -Path '/api/solo/progression/specializations' -Lo
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -604,7 +618,7 @@ Register-DuneRoute -Method PUT -Path '/api/solo/progression/character-xp' -Local
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -621,7 +635,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/progression/specializations/res
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') { 409 } else { 400 }
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }
@@ -637,7 +651,7 @@ Register-DuneRoute -Method POST -Path '/api/solo/items/repair-equipment' -LocalO
         }
         Write-DuneJson -Response $res -Body $result
     } catch {
-        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*changed in another window*') {409} else {400}
+        $status = if ($_.Exception.Message -like '*still running*' -or $_.Exception.Message -like '*active Solo save changed*') {409} else {400}
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
     }
 }

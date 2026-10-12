@@ -326,7 +326,7 @@ Describe 'Solo Mode profile discovery and persistence' {
         (Read-DuneSoloState).dbPath | Should -Be $secondDb
         (Read-DuneSoloState).dataRoot | Should -Be $layout.root
         { Assert-DuneSoloExpectedProfile -ExpectedProfileToken $firstToken } |
-            Should -Throw '*changed in another window*'
+            Should -Throw '*active Solo save changed*'
     }
 
     It 'rejects a saved database path outside its configured root' {
@@ -342,11 +342,11 @@ Describe 'Solo Mode profile discovery and persistence' {
 Describe 'Solo Mode write gates and settings backups' {
     BeforeEach { Reset-TestSoloState }
 
-    It 'reports all 48 native settings even when the INI is absent' {
+    It 'reports all 49 settings even when the INI is absent' {
         $layout = New-TestSoloLayout
         Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
         $settings = Read-DuneSoloSettings
-        $settings.entries.Count | Should -Be 48
+        $settings.entries.Count | Should -Be 49
         @($settings.entries | Where-Object present).Count | Should -Be 0
     }
 
@@ -355,6 +355,24 @@ Describe 'Solo Mode write gates and settings backups' {
         Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
         { Set-DuneSoloSettings -Settings @{ GatheringAmount = '2.0' } -Confirm 'yes' } |
             Should -Throw '*APPLY SOLO SETTINGS*'
+    }
+    It 'writes inventory slots only to Game.ini and preserves unrelated content' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        $game = Join-Path $layout.config 'Game.ini'
+        [IO.File]::WriteAllText($game, "[/Script/DuneSandbox.InventorySystemSettings]`r`nPlayerInventoryStartingSize=35`r`nPlayerInventoryStartingSize=40`r`nKeepInventory=Yes`r`n[Other]`r`nKeep=Yes`r`n")
+        $before = [IO.File]::ReadAllText($game)
+        $result = Set-DuneSoloSettings -Settings @{ PlayerInventoryStartingSize = '100' } -Confirm 'APPLY SOLO SETTINGS'
+        [IO.File]::ReadAllText($result.backupPath) | Should -Be $before
+        $text = [IO.File]::ReadAllText($game)
+        ([regex]::Matches($text, '(?m)^PlayerInventoryStartingSize=')).Count | Should -Be 1
+        $text | Should -Match 'PlayerInventoryStartingSize=100'
+        $text | Should -Match 'KeepInventory=Yes'
+        $text | Should -Match 'Keep=Yes'
+        (Test-Path (Join-Path $layout.config 'ServerCustomSettings.ini')) | Should -BeFalse
+        ($result.settings.entries | Where-Object key -eq 'PlayerInventoryStartingSize').value | Should -Be '100'
+        { Set-DuneSoloSettings -Settings @{ PlayerInventoryStartingSize = '0' } -Confirm 'APPLY SOLO SETTINGS' } | Should -Throw '*positive*'
     }
 
     It 'blocks settings writes while a Dune process is running' {
@@ -545,12 +563,15 @@ Describe 'Solo Mode write gates and settings backups' {
 
         $before = Read-DuneSoloConsoleSettings
         $before.supported | Should -BeTrue
+        ($before.entries | Where-Object key -eq 'dw.EnableBuildablePlacementAlwaysFilled').value |
+            Should -Be ''
         ($before.entries | Where-Object key -eq 'Hydration.SunExposureEnabled').value |
             Should -Be '1'
 
         $result = Set-DuneSoloConsoleSettings -Settings @{
             'Hydration.SunExposureEnabled' = '0'
             'Vehicle.MaxVehiclesPerPlayer' = '20'
+            'dw.EnableBuildablePlacementAlwaysFilled' = '1'
             'Dune.DisableShieldOnShooting' = '0'
             'Vehicle.RecoveryTimeLimit' = '1'
             'dw.VehicleDurabilityDamageMultiplier' = '0.01'
@@ -571,6 +592,7 @@ Describe 'Solo Mode write gates and settings backups' {
         @([regex]::Matches($written, '(?m)^Hydration\.SunExposureEnabled=0\r?$')).Count |
             Should -Be 1
         $written | Should -Match '(?m)^Vehicle\.MaxVehiclesPerPlayer=20\r?$'
+        $written | Should -Match '(?m)^dw\.EnableBuildablePlacementAlwaysFilled=1\r?$'
         $written | Should -Match '(?m)^Dune\.DisableShieldOnShooting=0\r?$'
         $written | Should -Match '(?m)^Vehicle\.RecoveryTimeLimit=1\r?$'
         $written | Should -Match '(?m)^dw\.VehicleDurabilityDamageMultiplier=0\.01\r?$'
@@ -960,6 +982,27 @@ Describe 'Solo Mode write gates and settings backups' {
         Assert-MockCalled Invoke-DuneSoloHelper -Times 0
     }
 
+    It 'builds a trainer unlock with the selected save and retained backup' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        Mock Invoke-DuneSoloHelper { @{ ok = $true } }
+        (Unlock-DuneSoloTrainer -Job 'Mentat' -Confirm 'UNLOCK SOLO TRAINER').ok | Should -BeTrue
+        Assert-MockCalled Invoke-DuneSoloHelper -Times 1 -ParameterFilter {
+            $Command -eq 'unlock-trainer' -and $Arguments.input -eq $layout.db -and
+            $Arguments.job -eq 'Mentat' -and
+            $Arguments.tags -like '*dune-tags.json' -and
+            $Arguments['safety-backup'] -like '*pre-progression*'
+        }
+    }
+
+    It 'rejects a trainer unlock while the game is running' {
+        Mock Get-DuneSoloGameProcesses { @(@{name='DuneSandbox';pid=42}) }
+        Mock Invoke-DuneSoloHelper { throw 'Must not run' }
+        { Unlock-DuneSoloTrainer -Job 'Mentat' -Confirm 'UNLOCK SOLO TRAINER' } | Should -Throw '*still running*'
+        Assert-MockCalled Invoke-DuneSoloHelper -Times 0
+    }
+
     It 'builds each Retail progression command with a retained backup' {
         $layout = New-TestSoloLayout
         Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
@@ -1059,7 +1102,7 @@ Describe 'Solo Mode route security metadata' {
             & $Script
         }
         Mock Assert-DuneSoloExpectedProfile {
-            throw 'The selected Solo profile changed in another window. Refresh and try again.'
+            throw 'The selected Solo profile active Solo save changed. Refresh and try again.'
         }
         Mock Export-DuneSoloBlueprint {}
         . (Join-Path (Get-DstRepoRoot) 'app\server\routes\SoloMode.ps1')
@@ -1072,7 +1115,7 @@ Describe 'Solo Mode route security metadata' {
         & $script:CapturedSoloRouteHandlers['/api/solo/blueprints/export'] $request $response $null $null
 
         $response.Status | Should -Be 409
-        $response.Message | Should -Match 'changed in another window'
+        $response.Message | Should -Match 'active Solo save changed'
         Assert-MockCalled Export-DuneSoloBlueprint -Times 0 -Exactly
     }
 
@@ -1165,7 +1208,7 @@ Describe 'Solo Mode backup profile isolation' {
         $token = Get-DuneSoloProfileToken -DbPath $layout.db
         { Assert-DuneSoloExpectedProfile -ExpectedProfileToken $token } | Should -Not -Throw
         { Assert-DuneSoloExpectedProfile -ExpectedProfileToken ('0' * 64) } |
-            Should -Throw '*changed in another window*'
+            Should -Throw '*active Solo save changed*'
     }
 
     It 'keeps blueprint list and export behind the same stale-profile guard' {

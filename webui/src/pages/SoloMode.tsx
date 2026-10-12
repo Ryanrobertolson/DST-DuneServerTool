@@ -25,6 +25,7 @@ import {
   completeSoloFindTheFremen,
   completeSoloNpe,
   enableSoloAllSkills,
+  unlockSoloTrainer,
   exportSoloBlueprint,
   exportSoloDiagnostics,
   setSoloSpecialization,
@@ -166,6 +167,7 @@ const SOLO_BOOLEAN_SETTINGS = new Set([
 const SOLO_INTEGER_SETTINGS = new Set([
   'FiefdomLimit',
   'MaxLandclaimSegments',
+  'PlayerInventoryStartingSize',
 ])
 
 const SOLO_SELECT_SETTINGS: Record<string, SoloSettingOption[]> = {
@@ -278,7 +280,7 @@ const SETTING_GROUPS: Array<{ title: string; keys: string[] }> = [
       'DifficultyLevel', 'GatheringAmount', 'CraftingCost',
       'WaterExtractionRate', 'CraftingTimeMultiplier', 'BuildingCostMultiplier',
       'ResourceRespawnSpeed', 'LootRespawnSpeed', 'FuelBurnTimeMultiplier',
-      'InventoryVolumeMultiplier',
+      'InventoryVolumeMultiplier', 'PlayerInventoryStartingSize',
     ],
   },
   {
@@ -529,6 +531,7 @@ export function SoloMode() {
   const runtimeState = useApi<SoloRuntime>('/api/solo/runtime', { intervalMs: 3000 })
   const connected = statusState.data?.connected === true
   const activeProfileToken = statusState.data?.profileToken ?? ''
+  const [connectionRevision, setConnectionRevision] = useState(0)
   const settingsState = useApi<SoloSettingsResponse>('/api/solo/settings', { enabled: connected })
   const consoleSettingsState = useApi<SoloConsoleSettingsResponse>(
     '/api/solo/console-settings',
@@ -546,6 +549,7 @@ export function SoloMode() {
   const [dataRoot, setDataRoot] = useState('')
   const [selectedDb, setSelectedDb] = useState('')
   const [discoveredProfiles, setDiscoveredProfiles] = useState<SoloProfile[]>([])
+  const [savePlatform, setSavePlatform] = useState<'auto' | 'steam' | 'xbox'>('auto')
   const [draft, setDraft] = useState<Record<string, string>>({})
   const [consoleDraft, setConsoleDraft] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState<string | null>(null)
@@ -569,6 +573,7 @@ export function SoloMode() {
   const [intelDraft, setIntelDraft] = useState(0)
   const [journeyAction, setJourneyAction] = useState<'fremen' | 'npe'>('fremen')
   const [mainQuest, setMainQuest] = useState('DA_MQ_ANewBeginning')
+  const [trainerJob, setTrainerJob] = useState('Swordmaster')
   const initializedFromStatus = useRef(false)
 
   useEffect(() => {
@@ -653,8 +658,8 @@ export function SoloMode() {
   }, [consoleDraft, consoleSettingsState.data])
 
   const scanPath = async (path: string) => {
-    const discovery = await discoverSolo(path)
-    setDataRoot(discovery.dataRoot)
+    const discovery = await discoverSolo(path, savePlatform)
+    setDataRoot(discovery.dataRoot || discovery.profiles.find(p => p.dbPath === discovery.suggestedDbPath)?.dataRoot || '')
     setDiscoveredProfiles(discovery.profiles)
     setSelectedDb(discovery.suggestedDbPath)
     return discovery
@@ -695,6 +700,7 @@ export function SoloMode() {
         return
       }
       const result = await connectSolo(discovery.dataRoot, dbPath)
+      setConnectionRevision(value => value + 1)
       setDataRoot(result.dataRoot)
       setSelectedDb(result.dbPath)
       setDiscoveredProfiles(result.profiles)
@@ -1419,12 +1425,32 @@ export function SoloMode() {
         id="solo-connection"
         title="Solo save connection"
         icon="FolderCog"
-        subtitle="Choose the Steam account folder containing the Solo save you want to edit."
+        subtitle="Find a Steam or Xbox app / Microsoft Store PC Solo save."
         summary={connected ? 'Connected' : 'Not connected'}
       >
         <div className="space-y-3">
+          <div className="flex gap-2 items-end">
+            <label className="block flex-1">
+              <span className="text-xs text-text-muted">Game platform</span>
+              <select className={`${SOLO_INPUT_CLASS} mt-1`} value={savePlatform} onChange={event => {
+                setSavePlatform(event.target.value as 'auto' | 'steam' | 'xbox')
+                setDataRoot(''); setSelectedDb(''); setDiscoveredProfiles([])
+              }}>
+                <option value="auto">Auto — Steam and Xbox PC</option>
+                <option value="steam">Steam</option>
+                <option value="xbox">Xbox app / Microsoft Store PC</option>
+              </select>
+            </label>
+            <button type="button" className="btn-secondary" disabled={busy !== null} onClick={() => {
+              setBusy('discover')
+              void scanPath('').then(result => setNotice({ kind: 'ok', text: `Found ${result.profiles.length} Solo saves. Select a save and connect.` }))
+                .catch(error => setNotice({ kind: 'err', text: error instanceof Error ? error.message : String(error) }))
+                .finally(() => setBusy(null))
+            }}>Find saves automatically</button>
+          </div>
+          {status?.channel === 'Xbox' && <p className="text-xs text-text-muted">Xbox save edits retain a complete WGS account backup and validate a staged copy before replacing the current save. Settings use Config\WinGDK. Close Dune before writing.</p>}
           <label className="block">
-            <span className="text-xs text-text-muted">Solo save folder (Steam account)</span>
+            <span className="text-xs text-text-muted">Solo save folder</span>
             <div className="flex gap-2 mt-1">
               <input
                 className={`${SOLO_INPUT_CLASS} font-mono text-xs flex-1`}
@@ -1442,19 +1468,23 @@ export function SoloMode() {
             </div>
           </label>
 
-          {discoveredProfiles.length > 1 && (
+          {discoveredProfiles.length > 0 && (
             <label className="block">
-              <span className="text-xs text-text-muted">Steam account / Solo profile</span>
+              <span className="text-xs text-text-muted">Account / Solo profile</span>
               <select
                 className={`${SOLO_INPUT_CLASS} mt-1`}
                 style={{ colorScheme: 'inherit' }}
                 value={selectedDb}
-                onChange={event => setSelectedDb(event.target.value)}
+                onChange={event => {
+                  setSelectedDb(event.target.value)
+                  const profile = discoveredProfiles.find(p => p.dbPath === event.target.value)
+                  if (profile?.dataRoot) setDataRoot(profile.dataRoot)
+                }}
               >
                 <option value="">Choose one save...</option>
                 {discoveredProfiles.map(profile => (
                   <option key={profile.dbPath} value={profile.dbPath}>
-                    {profile.channel === 'FLS_retail' ? 'Retail' : 'Legacy'} / {profile.id}
+                    {profile.platform === 'xbox' ? 'Xbox PC' : profile.channel === 'FLS_retail' ? 'Steam Retail' : 'Steam Legacy'} / {profile.id}
                   </option>
                 ))}
               </select>
@@ -1489,7 +1519,7 @@ export function SoloMode() {
         ))}
       </div>
 
-      {tab === 'mods' && <SoloMods />}
+      {tab === 'mods' && <SoloMods connectionToken={`${activeProfileToken}:${connectionRevision}`} />}
       {tab === 'overview' && (
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
           <div className="card p-5">
@@ -1550,7 +1580,7 @@ export function SoloMode() {
                 ) : !blueprintSettingsState.data ? (
                   <div className="text-sm text-text-muted">Loading blueprint settings...</div>
                 ) : !blueprintSettingsState.data.supported ? (
-                  <div className="text-sm text-text-muted">These controls require a verified Retail Solo profile.</div>
+                  <div className="text-sm text-text-muted">{status?.channel === 'Xbox' ? 'Xbox settings are unavailable in this preview while save synchronization is being tested.' : 'These controls require a verified Retail Solo profile.'}</div>
                 ) : (
                   <div className="space-y-3">
                     <p className="text-sm text-text-muted">Set blueprint piece build timers to zero. Your previous settings are saved for restoration. Close Dune: Awakening before making changes.</p>
@@ -1579,13 +1609,13 @@ export function SoloMode() {
                   <div className="text-sm text-text-muted">Loading Retail Engine.ini settings...</div>
                 ) : !consoleSettingsState.data.supported ? (
                   <div className="rounded border border-warning/30 bg-warning/5 p-3 text-sm text-text-muted">
-                    These controls require a verified Retail <span className="font-mono">FLS_retail</span> profile.
+                    {status?.channel === 'Xbox' ? 'Xbox Engine settings are unavailable in this preview while platform configuration support is being verified.' : <>These controls require a verified Retail <span className="font-mono">FLS_retail</span> profile.</>}
                   </div>
                 ) : (
                   <div className="space-y-4">
                     <div className="rounded border border-warning/30 bg-warning/5 p-3 text-xs text-text-muted">
-                      Writes only <span className="font-mono">Config\Windows\Engine.ini</span> under the
-                      connected Retail Solo root. Vehicle recovery and durability values were tested
+                      Writes only <span className="font-mono">{status?.channel === 'Xbox' ? 'Config\\WinGDK\\Engine.ini' : 'Config\\Windows\\Engine.ini'}</span> under the
+                      game settings directory. Vehicle recovery and durability values were tested
                       by Coastal in Solo. Unset vehicle controls do not change the file.
                     </div>
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
@@ -1597,7 +1627,20 @@ export function SoloMode() {
                               {entry.status}
                             </span>
                           </span>
-                          {entry.type === 'bool01' ? (
+                          {entry.key === 'dw.EnableBuildablePlacementAlwaysFilled' ? (
+                            <label className="flex items-center gap-2 mt-2 text-sm">
+                              <input
+                                type="checkbox"
+                                checked={(consoleDraft[entry.key] ?? entry.value) === '1'}
+                                disabled={!canMutateActiveProfile || gameRunning}
+                                onChange={event => setConsoleDraft(current => ({
+                                  ...current,
+                                  [entry.key]: event.target.checked ? '1' : '0',
+                                }))}
+                              />
+                              Skip hologram placement
+                            </label>
+                          ) : entry.type === 'bool01' ? (
                             <SoloBooleanControl
                               value={consoleDraft[entry.key] ?? entry.value}
                               on="1"
@@ -1743,7 +1786,7 @@ export function SoloMode() {
                 <Icon name={busy === 'delete-selected' ? 'LoaderCircle' : 'Trash2'} size={14} className={busy === 'delete-selected' ? 'animate-spin' : ''} />
                 Delete selected ({selectedBackupPaths.size})
               </button>
-              <button className={`btn-primary ${SOLO_DISABLED_PRIMARY_CLASS}`} onClick={() => void createBackup()} disabled={!canMutateActiveProfile}>
+              <button className={`btn-primary ${SOLO_DISABLED_PRIMARY_CLASS}`} onClick={() => void createBackup()} disabled={!selectionMatchesActive || busy !== null || gameRunning}>
                 <Icon name={busy === 'backup' ? 'LoaderCircle' : 'Archive'} size={14} className={busy === 'backup' ? 'animate-spin' : ''} />
                 Create backup
               </button>
@@ -2363,10 +2406,21 @@ export function SoloMode() {
                   : journeyAction === 'npe' ? 'Complete NPE' : 'Complete Find the Fremen'}
               </button>
             </div>
+            <div className="card p-5 flex flex-col">
+              <h2 className="font-semibold">Unlock Trainers</h2>
+              <p className="text-sm text-text-muted mt-1 mb-3">Complete the selected trainer's contracts and apply their reward tags and skill-tree unlocks. Takes effect next launch.</p>
+              <label htmlFor="solo-trainer" className="text-sm">Trainer</label>
+              <select id="solo-trainer" className={`${SOLO_INPUT_CLASS} mt-1 mb-3`} value={trainerJob} onChange={event => setTrainerJob(event.target.value)} disabled={!canMutateActiveProfile || gameRunning || !!busy}>
+                <option value="Swordmaster">Swordmaster</option><option value="Trooper">Trooper</option><option value="Mentat">Mentat</option><option value="BeneGesserit">Bene Gesserit</option><option value="Planetologist">Planetologist</option>
+              </select>
+              <button className={`btn-primary ${SOLO_DISABLED_PRIMARY_CLASS}`} disabled={!canMutateActiveProfile || gameRunning || !!busy} onClick={() => void runProgressionAction('trainer', 'Unlock Solo trainer', token => unlockSoloTrainer(trainerJob, token))}>
+                {busy === 'progression:trainer' ? 'Applying...' : 'Unlock trainer'}
+              </button>
+            </div>
             <ProgressionActionCard
               icon="Sparkles"
               title="Enable all skills"
-              description="Raise 143 approved skills to value 7, leave Bindu Sprint and Voice Ignore learnable, preserve unknown Solo keys, keep at least 20 unspent points, and raise Intel to 100."
+              description="Unlock all five trainers and raise 143 approved skills to value 7. Leave Bindu Sprint and Voice Ignore learnable, preserve unknown Solo keys, keep at least 20 unspent points, and raise Intel to 100."
               status={`${inspection?.progression.skillsAtSeven ?? 0}/143 enabled · ${inspection?.progression.unspentSkillPoints ?? 0} unspent · ${inspection?.progression.intel ?? 0} Intel`}
               busy={busy === 'progression:skills'}
               disabled={!canMutateActiveProfile || gameRunning}

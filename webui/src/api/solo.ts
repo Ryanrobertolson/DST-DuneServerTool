@@ -7,6 +7,8 @@ export interface SoloProcess {
 }
 
 export interface SoloProfile {
+  platform?: 'steam' | 'xbox'
+  dataRoot?: string
   id: string
   channel: string
   adapter?: string
@@ -227,10 +229,10 @@ export function getSoloRuntime(): Promise<SoloRuntime> {
   return api<SoloRuntime>('/api/solo/runtime')
 }
 
-export function discoverSolo(path: string): Promise<SoloDiscovery> {
+export function discoverSolo(path: string, platform: 'auto' | 'steam' | 'xbox' = 'auto'): Promise<SoloDiscovery> {
   return api<SoloDiscovery>('/api/solo/discover', {
     method: 'POST',
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, ...(platform === 'auto' ? {} : { platform }) }),
   })
 }
 
@@ -531,6 +533,13 @@ export function unlockSoloMainQuest(quest: string, expectedProfileToken: string)
   return api('/api/solo/progression/main-quest/unlock', {
     method: 'POST',
     body: JSON.stringify({ quest, expectedProfileToken, confirm: 'UNLOCK SOLO MAIN QUEST' }),
+  })
+}
+
+export function unlockSoloTrainer(job: string, expectedProfileToken: string): Promise<SoloProgressionResult> {
+  return api('/api/solo/progression/trainer/unlock', {
+    method: 'POST',
+    body: JSON.stringify({ job, expectedProfileToken, confirm: 'UNLOCK SOLO TRAINER' }),
   })
 }
 
