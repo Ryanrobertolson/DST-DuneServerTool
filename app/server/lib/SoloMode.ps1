@@ -433,7 +433,7 @@ function Assert-DuneSoloGameClosed {
 
 function Invoke-DuneSoloHelper {
     param(
-        [Parameter(Mandatory)][ValidateSet('inspect','diagnostics','character-xp','faction-progression','set-specialization','reset-specialization-rewards','backup','restore','grant-items','delete-item','import-blueprint','list-blueprints','export-blueprint','set-currencies','fill-water','set-weapon-ammo','repair-equipment','max-augment-attributes','max-specializations','complete-fremen','complete-npe','enable-skills','set-progression-points','unlock-main-quest','unlock-trainer')][string]$Command,
+        [Parameter(Mandatory)][ValidateSet('inspect','diagnostics','character-xp','faction-progression','set-specialization','reset-specialization-rewards','backup','restore','grant-items','delete-item','import-blueprint','list-blueprints','export-blueprint','set-currencies','fill-water','set-weapon-ammo','repair-equipment','max-augment-attributes','max-specializations','complete-fremen','complete-npe','enable-skills','set-progression-points','unlock-main-quest','unlock-trainer','unlock-testing-stations')][string]$Command,
         [Parameter(Mandatory)][hashtable]$Arguments
     )
 
@@ -534,6 +534,25 @@ function Unlock-DuneSoloMainQuest {
         adapter = $adapter.manifestPath
         tags = Get-DuneSoloDataFilePath -Name 'dune-tags.json'
         quest = $Quest
+    }
+}
+
+function Unlock-DuneSoloTestingStations {
+    param([Parameter(Mandatory)][ValidateSet('all','DA_Dgn_024_Darkness','DA_Dgn_089_Radiation','DA_Dgn_136_Fire','DA_Dgn_152_Electric','DA_Dgn_195_Poison','DA_Dgn_Pit')][string]$Station, [string]$Confirm)
+    Assert-DuneSoloSupportedPlatform
+    if ($Confirm -ne 'UNLOCK SOLO TESTING STATIONS') { throw 'Confirm the Solo Testing Station unlock before continuing.' }
+    Assert-DuneSoloGameClosed
+    $profile = Get-DuneSoloProfile
+    Assert-DuneSoloProgressionAdapter -Profile $profile
+    $adapter = Get-DuneSoloAdapterDescriptor -DbPath $profile.dbPath
+    $safetyDir = Join-Path (Get-DuneSoloProfileBackupRoot -DbPath $profile.dbPath) 'pre-progression'
+    New-Item -ItemType Directory -Path $safetyDir -Force | Out-Null
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmssfff')
+    Invoke-DuneSoloHelper -Command 'unlock-testing-stations' -Arguments @{
+        input = $profile.dbPath
+        'safety-backup' = Join-Path $safetyDir "game-before-testing-stations-$stamp.db"
+        adapter = $adapter.manifestPath
+        station = $Station
     }
 }
 
