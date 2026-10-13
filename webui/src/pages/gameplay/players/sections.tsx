@@ -30,7 +30,7 @@ import {
   setFactionTier, setSkillPoints,
   setStarterClass, spawnVehicle, teleportToPlayer, teleportToLocation, setRespawn, getTeleportDestinations, getPlayers, updatePlayerTags, wipeCodex, resetFaction, snapshotBuilds, getFreshStartSnapshots, restoreBuilds, grantAllSkills,
   chatWhisper, isValidTemplateId, getItemCatalog, getCosmeticsCatalog, getPlayerOwnedCosmetics, filterCosmeticsCatalog, getHouseSwatchCosmetics, type CosmeticEntry,
-  parseTcnoPackageText, grantHouseSwatches, grantBuildingSets, getBuildingSetCosmetics, grantSkins, getSkinCosmetics, type HouseSwatchKind,
+  grantReviewedCustomization, getReviewedGrantCounts, parseTcnoPackageText, grantHouseSwatches, grantBuildingSets, getBuildingSetCosmetics, grantSkins, getSkinCosmetics, type HouseSwatchKind,
   giveItems, getItemPackages, saveItemPackage, deleteItemPackage,
   getLandsraadOverview, getLandsraadPlayerContributions, setLandsraadContribution,
   getPlayerJourneyNodes, completeJourneyNode, resetJourneyNode,
@@ -645,6 +645,18 @@ interface ActionDef {
 }
 
 const ACTIONS: ActionDef[] = [
+  { id: 'observed-schematic-recipes', group: 'Items', label: 'Schematic Recipes (717)', icon: 'BookOpen', offlineOnly: true, experimental: true,
+    rowNote: 'Grant observed crafting recipe entries directly. Existing recipes and remaining uses are preserved; this does not deliver inventory items.',
+    confirm: p => `Grant 717 observed schematic recipe entries to ${p.name}? Existing recipe uses will be preserved. A backup is recommended before granting. Check crafting in-game after login.\n\n${COSMETIC_LICENSE_NOTICE}`,
+    run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedSchematicRecipes') },
+  { id: 'observed-character-swatches', group: 'Items', label: 'Character Swatches (311)', icon: 'Palette', offlineOnly: true, experimental: true,
+    rowNote: 'Save the observed swatch IDs directly to this character. Existing unlocks are preserved; individual in-game availability varies.',
+    confirm: p => `Grant 311 character swatch IDs to ${p.name}? A backup is recommended before granting.\n\n${COSMETIC_LICENSE_NOTICE}`,
+    run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedCharacterSwatches') },
+  { id: 'observed-gear-appearances', group: 'Items', label: 'Gear Appearances (401)', icon: 'Palette', offlineOnly: true, experimental: true,
+    rowNote: 'Save the observed armor and weapon appearance IDs directly to this character. Individual in-game availability varies.',
+    confirm: p => `Grant 401 gear appearance IDs to ${p.name}? A backup is recommended before granting.\n\n${COSMETIC_LICENSE_NOTICE}`,
+    run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedGearAppearances') },
   // ----- Currency -----
   { id: 'give-solari', group: 'Currency', label: 'Give Solari', icon: 'Coins', balance: 'solari',
     fields: [{ key: 'amount', label: 'Amount', type: 'number', placeholder: '10000' }],
@@ -1046,6 +1058,20 @@ function ActionRow({ def, player, busy, stats, open, danger, onToggle, runAction
   runAction: (def: ActionDef, exec: () => Promise<{ message: string }>) => Promise<boolean>
 }) {
   const disabled = busy
+  const [grantCounts, setGrantCounts] = useState<{total: number; owned: number; remaining: number} | null>(null)
+  const [grantCountsLoading, setGrantCountsLoading] = useState(false)
+  const selection = ({'observed-character-swatches':'ObservedCharacterSwatches','observed-gear-appearances':'ObservedGearAppearances','observed-schematic-recipes':'ObservedSchematicRecipes'} as Record<string,string>)[def.id]
+  useEffect(() => {
+    if (!selection || busy) return
+    let current = true
+    setGrantCounts(null)
+    setGrantCountsLoading(true)
+    getReviewedGrantCounts(player.id, player.controller_id, player.account_id, selection)
+      .then(counts => { if (current) setGrantCounts(counts) })
+      .catch(() => { if (current) setGrantCounts(null) })
+      .finally(() => { if (current) setGrantCountsLoading(false) })
+    return () => { current = false }
+  }, [selection, player.id, player.controller_id, player.account_id, busy])
   // Read-only "current balance" note shown above currency actions.
   const balanceNote = (() => {
     if (!def.balance || !stats) return null
@@ -1069,7 +1095,10 @@ function ActionRow({ def, player, busy, stats, open, danger, onToggle, runAction
         onClick={onToggle}
         title={def.liveOnly ? 'Requires player to be online' : def.offlineOnly ? 'Requires player to be offline — the game caches this value in memory while online and overwrites it on logout' : undefined}>
         <Icon name={def.icon} size={14} className={`shrink-0 ${danger ? 'text-error' : 'text-text-dim'}`} />
-        <span className="flex-1 min-w-0 font-medium">{def.label}</span>
+        <span className="flex-1 min-w-0 flex flex-col gap-1.5">
+          <span className="font-medium break-words">{def.label}</span>
+          {selection && <span className="text-xs text-text-muted">{grantCounts ? `${grantCounts.owned}/${grantCounts.total} owned · ${grantCounts.remaining} remaining` : grantCountsLoading ? 'Checking character unlocks…' : 'Character counts unavailable'}</span>}
+          <span className="flex flex-wrap gap-1.5">
         {def.experimental && (
           <span className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-accent/20 text-accent border border-accent/50 shrink-0" title="Experimental — may not take effect in-game">EXPERIMENTAL</span>
         )}
@@ -1079,6 +1108,8 @@ function ActionRow({ def, player, busy, stats, open, danger, onToggle, runAction
         {def.offlineOnly && (
           <span className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-info/20 text-info border border-info/50 shrink-0">OFFLINE REQ'D</span>
         )}
+          </span>
+        </span>
         <Icon name={open ? 'ChevronDown' : 'ChevronRight'} size={14} className="shrink-0 text-text-dim" />
       </button>
       {open && (

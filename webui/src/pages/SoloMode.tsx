@@ -33,6 +33,7 @@ import {
   resetSoloSpecializationRewards,
   grantSoloItems,
   grantSoloUnlocks,
+  grantSoloReviewedCustomization,
   type SoloUnlockKind,
   type SoloCosmeticOwnership,
   importSoloBlueprint,
@@ -356,7 +357,7 @@ function StatusPill({ ok, children }: { ok: boolean; children: React.ReactNode }
 }
 
 export const SOLO_COSMETIC_ENTITLEMENT_WARNING =
-  'Grants apply only to this Solo save. They do not create Funcom account ownership or unlock content on official servers.'
+  'Grants apply only to this Solo character. They do not create Funcom account ownership.'
 
 export function groupSoloCosmetics(
   catalog: CosmeticEntry[],
@@ -2226,6 +2227,28 @@ export function SoloMode() {
                 Import blueprint
               </button>
             </div>
+
+            {[
+              { id: 'ObservedCharacterSwatches', label: 'Character Swatches (311)' },
+              { id: 'ObservedGearAppearances', label: 'Gear Appearances (401)' },
+              { id: 'ObservedSchematicRecipes', label: 'Schematic Recipes (717)' },
+            ].map(choice => <button key={choice.id} className="btn-primary mt-4" disabled={!canMutateActiveProfile || gameRunning || !!busy}
+              onClick={async () => {
+                if (!window.confirm(`Grant the reviewed ${choice.label}? A safety backup will be created.${choice.id === 'ObservedSchematicRecipes' ? ' This saves crafting recipes directly, not inventory items. Existing recipe uses are preserved.' : ''}\n\n${COSMETIC_LICENSE_NOTICE}`)) return
+                setBusy('reviewed-customization')
+                setNotice(null)
+                try {
+                  await grantSoloReviewedCustomization(statusState.data?.profileToken ?? '', choice.id)
+                  setNotice({ kind: 'ok', text: `${choice.label} saved. ${choice.id === 'ObservedSchematicRecipes' ? 'Open the game and check your crafting recipes. Existing recipe uses were preserved.' : 'Open the game and select the appearance or swatch in the customization menu.'}` })
+                  await Promise.all([statusState.refresh(), backupsState.refresh()])
+                } catch (error) { setNotice({ kind: 'err', text: error instanceof Error ? error.message : String(error) }) }
+                finally { setBusy(null) }
+              }}>
+              {choice.label} (experimental)
+              <span className="block text-xs font-normal">{statusState.data?.cosmeticOwnership?.reviewedCounts?.[choice.id]
+                ? `${statusState.data.cosmeticOwnership.reviewedCounts[choice.id].owned}/${statusState.data.cosmeticOwnership.reviewedCounts[choice.id].total} owned · ${statusState.data.cosmeticOwnership.reviewedCounts[choice.id].remaining} remaining`
+                : 'Character counts unavailable'}</span>
+            </button>)}
 
             <SoloCosmeticGrantCard
               busy={busy === 'give-items'}

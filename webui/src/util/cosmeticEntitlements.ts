@@ -1,2 +1,2 @@
 export const COSMETIC_LICENSE_NOTICE =
-  'Some cosmetics require a license or entitlement granted directly by Funcom. DST cannot grant those licenses or entitlements, so delivering their tokens may not unlock them in-game.'
+  'These are character unlocks for the selected Solo or self-hosted character, not account unlocks or purchases. DST does not grant official Funcom licenses or account entitlements. A saved unlock or delivered token may not make every cosmetic usable in-game.'

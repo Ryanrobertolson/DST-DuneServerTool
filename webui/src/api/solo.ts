@@ -118,6 +118,7 @@ export interface SoloRangedWeapon {
 
 export type SoloUnlockKind = 'building-sets' | 'armor' | 'weapon' | 'vehicle' | 'dyes' | 'house' | 'placeables'
 export interface SoloCosmeticOwnership {
+  reviewedCounts?: Record<string, {total: number; owned: number; remaining: number}>
   available: boolean
   owned: string[]
   unlocked: string[]
@@ -652,4 +653,9 @@ export function resetSoloSpecializationRewards(track: string, expectedProfileTok
 
 export function repairSoloEquipment(expectedProfileToken: string, destination = 'carried'): Promise<{ok: boolean; repaired: number; safetyBackup: string; inspection: SoloInspection}> {
   return api('/api/solo/items/repair-equipment', {method: 'POST', body: JSON.stringify({expectedProfileToken, destination, confirm: 'REPAIR SOLO EQUIPMENT'})})
+}
+export function grantSoloReviewedCustomization(expectedProfileToken: string, customizationId = 'StillSCharDyepackImota') {
+  return api<SoloProgressionResult>('/api/solo/reviewed-customization', {
+    method: 'POST', body: JSON.stringify({ expectedProfileToken, customizationId, confirm: 'GRANT REVIEWED CUSTOMIZATION' }),
+  })
 }
