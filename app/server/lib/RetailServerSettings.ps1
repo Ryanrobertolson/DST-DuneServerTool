@@ -2,6 +2,67 @@ $script:DuneRetailServerSettingsSection = '/Script/DuneSandbox.UserServerCustomS
 $script:DuneRetailServerSettingsFileBrowserPath = '/srv/UserSettings/UserServerCustomSettings.ini'
 $script:DuneRetailServerSettingsGamePath = '/home/dune/server/DuneSandbox/Saved/Config/LinuxServer/ServerCustomSettings.ini'
 
+function Get-DuneRetailStartupSyncPreferencePath {
+    Join-Path (Join-Path $env:APPDATA 'DuneServer') 'retail-startup-sync.json'
+}
+
+function Get-DuneRetailStartupSyncPreference {
+    $path=Get-DuneRetailStartupSyncPreferencePath
+    if(-not(Test-Path -LiteralPath $path)){return @{enabled=$true; injectionsApplied=$true; scope='Solo and self-hosted'}}
+    $preference=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    if($preference.enabled -isnot [bool]){throw 'Server Settings startup synchronization preference is invalid.'}
+    foreach ($field in @('injectionsApplied','cleanupPending')) {
+        if ($null -ne $preference.PSObject.Properties[$field] -and $preference.$field -isnot [bool]) {throw 'Server Settings startup synchronization preference is invalid.'}
+    }
+    $applied = if ($null -ne $preference.PSObject.Properties['injectionsApplied']) { [bool]$preference.injectionsApplied } else { [bool]$preference.enabled }
+    $pending = if ($null -ne $preference.PSObject.Properties['cleanupPending']) { [bool]$preference.cleanupPending } else { -not $preference.enabled }
+    return @{enabled=[bool]$preference.enabled; injectionsApplied=$applied; cleanupPending=$pending; scope='Solo and self-hosted'; changedAt=$preference.changedAt}
+}
+
+function Test-DuneConfigurationInjectionEnabled {
+    if ($script:DuneConfigurationExplicitApply) { return $true }
+    $state = Get-DuneRetailStartupSyncPreference
+    $applied = if ($state.ContainsKey('injectionsApplied')) { $state.injectionsApplied } else { $state.enabled }
+    return ($state.enabled -and $applied)
+}
+
+function Remove-DuneManagedSettingsYamlInjections {
+    param([Parameter(Mandatory)][string]$Ip)
+    # No INI writes: clear only names owned by DST, preserving all other exec
+    # commands and userIniConfig files.
+    $cleared = Set-V6ConsoleVariableOverrides -Ip $Ip -Names @() -Values @{} -ManagedNames (Get-DuneManagedStartupConsoleVariableKeyMap)
+    if (-not $cleared.Success) { throw 'DST startup YAML injections could not be cleared.' }
+    $snapshot = Get-DuneRetailServerSettingsSnapshot -Ip $Ip
+    if (-not $snapshot.available) { throw 'Server Settings ownership could not be inspected for YAML cleanup.' }
+    if ($snapshot.fileAuthority -and $snapshot.target.upstreamConfigured -and $snapshot.target.upstreamFileName -ceq 'ServerCustomSettings.ini') {
+        $bg = Get-V6Battlegroup -Ip $Ip
+        $path = '/spec/serverGroup/template/spec/global/userIniConfig/files/ServerCustomSettings.ini'
+        $value = $bg.Bg.spec.serverGroup.template.spec.global.userIniConfig.files.'ServerCustomSettings.ini'
+        $patch = @(
+            @{op='test';path='/metadata/resourceVersion';value=[string]$bg.Bg.metadata.resourceVersion}
+            @{op='test';path=$path;value=$value}
+            @{op='remove';path=$path}
+        ) | ConvertTo-Json -Depth 100 -Compress
+        $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($patch))
+        $result = (Invoke-V6Ssh -Ip $Ip -Cmd "base64 -d | sudo kubectl patch battlegroup '$($snapshot.target.battlegroup)' -n '$($snapshot.target.namespace)' --type=json --patch-file=/dev/stdin 2>&1" -StdinData $payload -TimeoutSec 30) -join "`n"
+        if ($result -notmatch '\bpatched\b') { throw 'DST settings YAML injection cleanup failed.' }
+        $verified = Get-V6Battlegroup -Ip $Ip
+        if ($null -ne $verified.Bg.spec.serverGroup.template.spec.global.userIniConfig.files.'ServerCustomSettings.ini') {throw 'DST YAML injection cleanup readback failed.'}
+    }
+    return @{ok=$true}
+}
+
+function Set-DuneRetailStartupSyncPreference([bool]$Enabled, [switch]$Applied, [switch]$CleanupPending) {
+    $path=Get-DuneRetailStartupSyncPreferencePath
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    $temp=$path+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+    try {
+        [IO.File]::WriteAllText($temp,(@{enabled=$Enabled; injectionsApplied=($Enabled -and [bool]$Applied); cleanupPending=[bool]$CleanupPending; changedAt=[DateTime]::UtcNow.ToString('o')}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temp -Destination $path -Force
+    } finally {if(Test-Path -LiteralPath $temp){Remove-Item -LiteralPath $temp -Force}}
+    return Get-DuneRetailStartupSyncPreference
+}
+
 $script:DuneRetailServerSettingGroups = [ordered]@{
     'World and economy' = @(
         'DifficultyLevel', 'PVPMode', 'GatheringAmount', 'CraftingCost',
@@ -737,14 +798,15 @@ function Set-DuneRetailServerSettings {
         [Parameter(Mandatory)][AllowEmptyCollection()][hashtable]$Updates,
         [Parameter(Mandatory)][string]$ExpectedRevision,
         [string]$ImportOperatorRevision,
-        [switch]$SynchronizeOnly
+        [switch]$SynchronizeOnly,
+        [switch]$StageForRestart
     )
     $current = Get-DuneRetailServerSettingsSnapshot -Ip $Ip
     if (-not $current.available) { throw [InvalidOperationException]::new([string]$current.reason) }
     if (-not $ExpectedRevision -or $ExpectedRevision -cne [string]$current.revision) {
         throw [InvalidOperationException]::new('Retail Server Settings changed since they were loaded. Refresh and review the current values before saving.')
     }
-    if (-not $current.target.stopped -or [int]$current.target.serverPodCount -ne 0) {
+    if (-not $StageForRestart -and (-not $current.target.stopped -or [int]$current.target.serverPodCount -ne 0)) {
         throw [InvalidOperationException]::new('Stop the battlegroup fully before saving Official Retail Server Settings.')
     }
 
@@ -761,6 +823,15 @@ function Set-DuneRetailServerSettings {
         ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $raw -Updates $Updates
     }
     $updatedRevision = Get-DuneRetailServerSettingsTextSha256 -Value $updated
+    if (-not (Test-DuneConfigurationInjectionEnabled)) {
+        if ($SynchronizeOnly) {return @{ok=$true;skipped=$true}}
+        $fileRaw = if ($current.Contains('fileRaw')) { [string]$current.fileRaw } else { [string]$current.raw }
+        $revision = Get-DuneRetailServerSettingsTextSha256 -Value $fileRaw
+        if ($revision -cne $updatedRevision -or -not $current.fileExists) {
+            Write-DuneRetailServerSettingsFile -Ip $Ip -Target $target -Content $updated -ExpectedRevision $revision -ExpectedExists:($current.fileExists -ne $false)
+        }
+        return @{ok=$true;applied=$Updates.Count;revision=$updatedRevision;settings=@((ConvertFrom-DuneRetailServerSettingsRaw -Raw $updated).settings);target=(Get-DuneRetailServerSettingsPublicTarget -Target $target);restartRequired=$true;message='Settings saved to the INI only. YAML injections were not changed.'}
+    }
     $bg = Get-V6Battlegroup -Ip $Ip
     if ([string]$bg.Bg.metadata.resourceVersion -cne [string]$target.resourceVersion) {
         throw [InvalidOperationException]::new('Battlegroup configuration changed during save. No operator configuration was changed.')
@@ -816,18 +887,29 @@ function Set-DuneRetailServerSettings {
     $fileExisted = $current.fileExists -ne $false
     $runtime = Get-DuneRetailServerSettingsRuntimeSnapshot -Ip $Ip -Target $target
     if (-not $runtime.available) { throw 'The Linux runtime settings could not be inspected. No settings were changed.' }
-    $backup = Backup-DuneRetailServerSettingsContent -Ip $Ip -Target $target -Raw $fileRaw
+    $writeFile = (-not $SynchronizeOnly -or $current.needsMigration) -and
+        (-not $fileExisted -or $fileRevision -cne $updatedRevision)
+    # Preserve content only when this transaction actually replaces it.
+    # Startup synchronization must not accumulate identical canonical backups.
+    $backup = @{}
+    if ($writeFile -and $fileExisted) {
+        $backup = Backup-DuneRetailServerSettingsContent -Ip $Ip -Target $target -Raw $fileRaw
+    }
     $operatorRaw = [string]$target.upstreamContent
-    if ($target.upstreamConfigured -and $operatorRaw -cne $fileRaw) {
+    if ($target.upstreamConfigured -and $operatorRaw -cne $updated -and
+        (-not $backup.path -or $operatorRaw -cne $fileRaw)) {
         $operatorBackupTarget = Copy-DuneRetailServerSettingsMap -Value $target
         $operatorBackupTarget.path = "$($target.path).operator"
         $backup.operator = Backup-DuneRetailServerSettingsContent -Ip $Ip -Target $operatorBackupTarget -Raw $operatorRaw
     }
-    $writeRuntime = -not $runtime.fileExists -or [string]$runtime.revision -cne $updatedRevision
-    if ($writeRuntime) {
+    # Explicit Apply INIs already authorizes a restart. Stage the operator
+    # content now, but never replace a running game's runtime INI. The stopped
+    # startup transaction performs that write before the next start.
+    $writeRuntime = (-not $StageForRestart -or ($target.stopped -and [int]$target.serverPodCount -eq 0)) -and
+        (-not $runtime.fileExists -or [string]$runtime.revision -cne $updatedRevision)
+    if ($writeRuntime -and $runtime.fileExists) {
         $backup.runtime = Backup-DuneRetailServerSettingsContent -Ip $Ip -Target $runtime.target -Raw ([string]$runtime.raw)
     }
-    $writeFile = -not $SynchronizeOnly -or $current.needsMigration
     if ($writeFile) {
         Write-DuneRetailServerSettingsFile -Ip $Ip -Target $target -Content $updated `
             -ExpectedRevision $fileRevision -ExpectedExists $fileExisted
@@ -932,7 +1014,8 @@ function Set-DuneRetailServerSettings {
 }
 
 function Sync-DuneRetailServerSettingsForStartup {
-    param([Parameter(Mandatory)][string]$Ip)
+    param([Parameter(Mandatory)][string]$Ip, [switch]$StageForRestart)
+    if(-not(Test-DuneConfigurationInjectionEnabled)){return @{ok=$true;skipped=$true;disabled=$true}}
     $snapshot = Get-DuneRetailServerSettingsSnapshot -Ip $Ip
     if (-not $snapshot.available) { throw [string]$snapshot.reason }
     if (-not $snapshot.fileExists -and -not $snapshot.needsMigration) {
@@ -946,7 +1029,7 @@ function Sync-DuneRetailServerSettingsForStartup {
         }
     }
     return Set-DuneRetailServerSettings -Ip $Ip -Updates @{} `
-        -ExpectedRevision $snapshot.revision -SynchronizeOnly
+        -ExpectedRevision $snapshot.revision -SynchronizeOnly -StageForRestart:$StageForRestart
 }
 
 function Select-DuneRetailServerSettingsAuthority {
@@ -954,7 +1037,7 @@ function Select-DuneRetailServerSettingsAuthority {
     $Snapshot.fileRaw = [string]$Snapshot.raw
     $Snapshot.fileRevision = [string]$Snapshot.revision
     $Snapshot.fileAuthority = $FileAuthority
-    $Snapshot.needsMigration = $Snapshot.target.upstreamConfigured -and -not $FileAuthority -and
+    $Snapshot.needsMigration = (Test-DuneConfigurationInjectionEnabled) -and $Snapshot.target.upstreamConfigured -and -not $FileAuthority -and
         -not [string]::IsNullOrWhiteSpace([string]$Snapshot.target.upstreamContent)
     if ($Snapshot.needsMigration) {
         # Preserve existing YAML overrides on the first upgrade. Reading never

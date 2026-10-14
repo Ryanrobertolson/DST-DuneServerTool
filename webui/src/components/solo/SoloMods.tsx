@@ -40,7 +40,7 @@ export function SoloMods({ connectionToken = '' }: { connectionToken?: string })
   )
   const refresh = async () => {
     const result = await api<State>('/api/solo/mods')
-    setState(result)
+    setState({ ...result, mods: result.mods.filter(mod => mod.id !== 'dst-regis-tanks') })
     setGamePath(result.gamePath)
     setPlatform((result as State & { platform?: string }).platform ?? 'steam')
     setSoloArguments(result.soloArguments ?? '')
@@ -115,14 +115,14 @@ export function SoloMods({ connectionToken = '' }: { connectionToken?: string })
       </label>
       {notice && <p role="status" className="text-sm w-full">{notice}</p>}
       {(error || state?.launchError) && <p role="alert" className="text-danger whitespace-pre-wrap text-sm w-full">{error || state?.launchError}</p>}
-      <button className="btn-primary" disabled={busy} onClick={() => void run('launch', { withMods: true })}>Launch with Mods</button>
-      <button className="btn-secondary" disabled={busy} onClick={() => void run('launch', { withMods: false })}>Launch Normally</button>
+      <button className="btn-secondary" disabled={busy} onClick={() => void run('launch', { withMods: true })}>Launch with Mods</button>
+      <button className="btn-primary" disabled={busy} onClick={() => void run('launch', { withMods: false })}>Launch Solo</button>
       <button className="btn-secondary" disabled={busy} title="Close Dune first. Restore original launch files and remove DST session DLLs; saves and installed mods are kept." onClick={() => void run('restore')}>Reset launch files</button>
       <button className="btn-secondary" disabled={busy} onClick={() => void run('shortcut')}>Create desktop shortcut</button>
     </div>
   }>
     <div className="space-y-3">
-      <p className="text-sm text-text-muted">Launching with mods, including through the desktop shortcut, disables BattlEye for that game session.</p>
+      <p className="text-sm text-text-muted">Supported Steam Solo launches include built-in Tank support and disable BattlEye for that session. Launch with Mods also loads your enabled mods; Xbox mod launches disable BattlEye too.</p>
       {platform === 'xbox' && (
         <p className="rounded border border-warning/30 bg-warning/5 p-3 text-sm text-text-muted">
           Xbox app / Game Pass mods require a version updated by the mod author for Game Pass.
@@ -154,6 +154,7 @@ export function SoloMods({ connectionToken = '' }: { connectionToken?: string })
           <button className="btn-secondary" aria-label={`Move ${mod.name} down`} disabled={busy || index === state.mods.length - 1} onClick={() => move(index, 1)}>Move Down</button>
         </div>
         {mod.errors.map((message, i) => <p className="text-danger text-sm mt-1" key={i}>{message}</p>)}
+        {mod.id === 'dst-regis-tanks' && mod.warnings?.map((message, i) => <p className="text-text-muted text-sm mt-1" key={`warning-${i}`}>{message}</p>)}
       </SortableMod>)}
       </SortableContext>
       {createPortal(<DragOverlay>{dragged && <div className="border border-border rounded p-3 bg-surface shadow-lg flex items-center gap-3"><Icon name="GripVertical" size={14} />{state?.mods.find(mod => mod.folder === dragged)?.name}</div>}</DragOverlay>, document.body)}

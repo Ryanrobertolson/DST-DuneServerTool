@@ -21,7 +21,7 @@ param(
 # Wraps the original battlegroup.ps1 menu and adds extra tools
 # ============================================================
 
-$script:ToolVersion = "16.4.2.1"
+$script:ToolVersion = "16.5.0"
 
 # Cold-boot readiness budgets (seconds). A fresh battlegroup's FIRST boot can
 # take 10-30 min: k3s + funcom-operators initialize, metrics-server restarts a
@@ -1313,6 +1313,10 @@ function Sync-DuneRetailSettingsBeforeStart {
         . (Join-Path $Root 'lib\Db-Postgres.ps1')
         . (Join-Path $Root 'lib\K8s.ps1')
         . (Join-Path $Root 'server\lib\RetailServerSettings.ps1')
+        . (Join-Path $Root 'server\lib\GameConfig.ps1')
+        . (Join-Path $Root 'server\lib\RegisTanksBuild.ps1')
+        . (Join-Path $Root 'server\lib\RegisTanksActivation.ps1')
+        $script:AppDir = $Root
         $script:V6SshKeyCache = $KeyPath
         $deadline = [DateTime]::UtcNow.AddSeconds(90)
         do {
@@ -1321,7 +1325,15 @@ function Sync-DuneRetailSettingsBeforeStart {
             if ([DateTime]::UtcNow -ge $deadline) { throw 'Game pods have not stopped. Server Settings were not synchronized and the battlegroup was not started.' }
             Start-Sleep -Seconds 2
         } while ($true)
-        $null = Sync-DuneRetailServerSettingsForStartup -Ip $VmIp
+        $management = Get-DuneRetailStartupSyncPreference
+        if (-not $management.enabled -and $management.cleanupPending) {
+            $null = Remove-DuneManagedSettingsYamlInjections -Ip $VmIp
+            $null = Set-DuneRetailStartupSyncPreference -Enabled $false
+        }
+        if (Test-DuneConfigurationInjectionEnabled) {
+            $null = Sync-DuneRetailServerSettingsForStartup -Ip $VmIp
+            $null = Initialize-DuneRegisTanksForStartup -Ip $VmIp
+        }
     } $retailRoot $Ip $sshKey
 }
 

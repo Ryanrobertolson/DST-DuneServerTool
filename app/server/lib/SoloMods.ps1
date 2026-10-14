@@ -2,6 +2,58 @@ $soloModAppRoot = if($script:AppDir){$script:AppDir}else{[IO.Path]::GetFullPath(
 $script:DuneSoloModsRoot = Join-Path $soloModAppRoot 'Mods'
 $script:DuneSoloLoaderRoot = Join-Path $soloModAppRoot 'ModLoader'
 $script:DuneSoloRuntimeAssets = Join-Path $soloModAppRoot 'resources\solo-mod-runtime'
+$script:DuneBundledSoloModsRoot = Join-Path $soloModAppRoot 'resources\solo-mods'
+
+function Install-DuneRegisTanksMod {
+    Assert-DuneSoloGameClosed
+    $source=Join-Path $script:DuneBundledSoloModsRoot 'dst-regis-tanks'
+    $destination=Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks'
+    if(-not(Test-Path -LiteralPath (Join-Path $source 'Scripts\main.lua'))){throw 'Bundled Regis Tanks mod is missing. Reinstall DST.'}
+    if(Test-Path -LiteralPath $destination){throw 'Regis Tanks is already installed. Existing files were preserved.'}
+    New-Item -ItemType Directory -Path $script:DuneSoloModsRoot -Force | Out-Null
+    Copy-Item -LiteralPath $source -Destination $destination -Recurse -ErrorAction Stop
+    return Get-DuneSoloMods
+}
+
+function Set-DuneRegisTanksLaunchContext([string]$GamePath,[string]$Platform) {
+    if($Platform -ne 'steam'){throw 'Regis Tanks currently supports Steam Solo only.'}
+    $exe=Join-Path $GamePath 'DuneSandbox\Binaries\Win64\DuneSandbox-Win64-Shipping.exe'
+    if((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne 'B9A77E7A178CFA8D88D65743BCBB04EF9D45E13539DB0BBD148E172BDA86A9E9'){throw 'Regis Tanks does not support this game build. Disable it to launch other mods.'}
+    $manifest=[IO.Path]::GetFullPath((Join-Path $GamePath '..\..\appmanifest_1172710.acf'))
+    if(-not(Test-Path -LiteralPath $manifest) -or (Get-Content -LiteralPath $manifest -Raw) -notmatch '"buildid"\s+"25789117"'){throw 'Regis Tanks requires the supported Steam game build.'}
+    $context=Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks\Scripts\dst-steam-manifest.txt'
+    [IO.File]::WriteAllText($context,$manifest,[Text.UTF8Encoding]::new($false))
+}
+
+function Test-DuneSoloRegisTankBuild([string]$GamePath, [string]$Platform) {
+    if ($Platform -ne 'steam' -or -not $GamePath) { return $false }
+    $exe = Join-Path $GamePath 'DuneSandbox\Binaries\Win64\DuneSandbox-Win64-Shipping.exe'
+    $manifest = [IO.Path]::GetFullPath((Join-Path $GamePath '..\..\appmanifest_1172710.acf'))
+    return (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $manifest) -and
+        ((Get-Content -LiteralPath $manifest -Raw) -match '"buildid"\s+"25789117"') -and
+        ((Get-FileHash -LiteralPath $exe).Hash -eq 'B9A77E7A178CFA8D88D65743BCBB04EF9D45E13539DB0BBD148E172BDA86A9E9')
+}
+
+function Enable-DuneSoloRegisTanks {
+    Assert-DuneSoloGameClosed
+    $state = Get-DuneSoloMods
+    if ($state.platform -ne 'steam' -or -not $state.gamePath) { throw 'Select your Steam game folder in Solo mods first.' }
+    # Validate the installed game before importing or changing any selection.
+    $exe = Join-Path $state.gamePath 'DuneSandbox\Binaries\Win64\DuneSandbox-Win64-Shipping.exe'
+    if (-not (Test-Path -LiteralPath $exe) -or (Get-FileHash -LiteralPath $exe).Hash -ne 'B9A77E7A178CFA8D88D65743BCBB04EF9D45E13539DB0BBD148E172BDA86A9E9') { throw 'Regis Tanks does not support this game build.' }
+    if (-not $state.runtimeReady) { Install-DuneSoloModRuntime | Out-Null }
+    if (-not @($state.mods | Where-Object id -eq 'dst-regis-tanks').Count) { Install-DuneRegisTanksMod | Out-Null }
+    # Built-in support follows the installed DST version. Optional user mods
+    # and custom settings are not replaced.
+    $tankScript = Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks\Scripts\main.lua'
+    if ((Get-Item -LiteralPath $tankScript).Attributes -band [IO.FileAttributes]::ReparsePoint) {throw 'Built-in Tank script cannot be a linked file.'}
+    Copy-Item -LiteralPath (Join-Path $script:DuneBundledSoloModsRoot 'dst-regis-tanks\Scripts\main.lua') -Destination $tankScript -Force
+    $state = Get-DuneSoloMods
+    $mods = @($state.mods | ForEach-Object {
+        @{folder=$_.folder;enabled=if($_.id -eq 'dst-regis-tanks'){$true}elseif($_.id -in @('dst-regis-tanks-trial','dst-regis-tanks-dart-trial','dst-regis-tanks-persistence-trial','dst-regis-tanks-fire-persistence-trial','dst-regis-tanks-probe')){$false}else{[bool]$_.enabled}}
+    })
+    return Set-DuneSoloModSelection @{mods=$mods;platform=$state.platform;gamePath=$state.gamePath}
+}
 
 function Read-DuneModJson([string]$Path, $Default) {
     if (Test-Path -LiteralPath $Path) { return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
@@ -45,7 +97,7 @@ function Get-DuneSoloMods {
                 $meta = Read-DuneModJson (Join-Path $folder.FullName 'mod.json') @{}
                 $enabled = $false
                 if ($state.PSObject.Properties.Name -contains $folder.Name) { $enabled = [bool]$state.($folder.Name) }
-                $mods += [pscustomobject]@{ folder=$folder.Name; id=$(if($meta.id){[string]$meta.id}else{$folder.Name}); name=$(if($meta.name){[string]$meta.name}else{$folder.Name}); version=[string]$meta.version; enabled=$enabled; requires=@($meta.requires); loadAfter=@($meta.loadAfter); loadBefore=@($meta.loadBefore); conflicts=@($meta.conflicts); warnings=@(); errors=@() }
+                $mods += [pscustomobject]@{ folder=$folder.Name; id=$(if($meta.id){[string]$meta.id}else{$folder.Name}); name=$(if($meta.name){[string]$meta.name}else{$folder.Name}); version=[string]$meta.version; enabled=$enabled; requires=@($meta.requires); loadAfter=@($meta.loadAfter); loadBefore=@($meta.loadBefore); conflicts=@($meta.conflicts); warnings=@($meta.warnings | Where-Object { $_ }); errors=@() }
             } catch { $mods += [pscustomobject]@{folder=$folder.Name;id=$folder.Name;name=$folder.Name;version='';enabled=$false;requires=@();loadAfter=@();loadBefore=@();conflicts=@();warnings=@();errors=@('Invalid mod.json: '+$_.Exception.Message)} }
         }
     }
@@ -182,14 +234,20 @@ function Start-DuneSoloModGame([bool]$WithMods) {
     $bin=Join-Path $status.gamePath ('DuneSandbox\Binaries\'+$target)
     $exe=Join-Path $bin ('DuneSandbox-'+$target+'-Shipping.exe')
     if(-not(Test-Path -LiteralPath $exe)){throw 'Select the Dune Awakening installation folder.'}
-    if(-not $WithMods){Start-Process -FilePath $exe -WorkingDirectory $bin -ArgumentList (Get-DuneSoloLaunchArguments -SkipIntro $status.skipIntro -ExtraArguments $status.soloArguments);return @{ok=$true}}
+    $tankSupport = Test-DuneSoloRegisTankBuild -GamePath $status.gamePath -Platform $status.platform
+    if ($tankSupport) { $status = Enable-DuneSoloRegisTanks }
+    if(-not $WithMods -and -not $tankSupport){Start-Process -FilePath $exe -WorkingDirectory $bin -ArgumentList (Get-DuneSoloLaunchArguments -SkipIntro $status.skipIntro -ExtraArguments $status.soloArguments);return @{ok=$true}}
     if(-not $status.runtimeReady){throw 'Install the mod runtime first.'}
-    $selected=@($status.mods | Where-Object enabled)
+    $selected=@($status.mods | Where-Object { $_.enabled -and (($WithMods -and $_.id -ne 'dst-regis-tanks') -or ($tankSupport -and $_.id -eq 'dst-regis-tanks')) })
     if(-not $selected.Count){throw 'Enable at least one mod.'}
     $errors=@($selected | ForEach-Object {$name=$_.name; $_.errors | ForEach-Object {"${name}: $_"}})
     if($errors.Count){throw ($errors -join "`n")}
     foreach($mod in $selected){
         $folder=Join-Path $script:DuneSoloModsRoot $mod.folder
+        if($mod.id -eq 'dst-regis-tanks'){
+            if($mod.folder -ne 'dst-regis-tanks'){throw 'Regis Tanks must use its bundled folder identifier.'}
+            Set-DuneRegisTanksLaunchContext -GamePath $status.gamePath -Platform $status.platform
+        }
         if(-not(Test-Path (Join-Path $folder 'Scripts\main.lua')) -and -not(Test-Path (Join-Path $folder 'dlls\main.dll'))){throw "$($mod.name): this runtime supports Lua and UE4SS native mods. This package has no loadable entry point."}
     }
     # Respect the user's saved load order; authors and users manage ordering requirements.
@@ -197,6 +255,9 @@ function Start-DuneSoloModGame([bool]$WithMods) {
     $sessionRoot=Join-Path $script:DuneSoloLoaderRoot ('Session-'+[guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $sessionRoot -Force | Out-Null
     $runtime=Join-Path $sessionRoot 'ue4ss'
+    if ($tankSupport) {
+        [IO.File]::WriteAllText((Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks\Scripts\dst-command-root.txt'), $sessionRoot, [Text.UTF8Encoding]::new($false))
+    }
     Copy-Item (Join-Path $script:DuneSoloLoaderRoot 'Runtime\ue4ss') $runtime -Recurse
     $ini=Join-Path $runtime 'UE4SS-settings.ini'
     $text=Get-Content $ini -Raw
@@ -213,11 +274,27 @@ function Start-DuneSoloModGame([bool]$WithMods) {
         $source=if($file -eq 'dwmapi.dll'){Join-Path $script:DuneSoloLoaderRoot 'Runtime\dwmapi.dll'}else{Join-Path $runtime 'UE4SS.dll'}
         $records += @{path=$dest;backup=$backup;hash=(Get-FileHash $source).Hash;installed=$false;restored=$false}
     }
-    $session=@{files=$records;root=$sessionRoot;state='prepared';logPath=(Join-Path $runtime 'UE4SS.log');soloArguments=$status.soloArguments}
+    # Some mods discover their peers through the launcher layout rather than
+    # UE4SS's ControllingModsTxt. Publish the same actual session selection at
+    # both established paths without changing the controlling load order.
+    $compatList = Join-Path $sessionRoot 'active-mods.txt'
+    $compatMods = @($status.mods | ForEach-Object { @{folder=$_.folder;enabled=($ordered.folder -ccontains $_.folder)} })
+    Write-DuneSoloModLoadList -Path $compatList -Mods $compatMods -IncludeDisabled
+    $stateRoot = Join-Path (Split-Path -Parent $script:DuneSoloModsRoot) 'State'
+    foreach ($dest in @((Join-Path $script:DuneSoloModsRoot 'mods.txt'), (Join-Path $stateRoot 'active-mods.txt'))) {
+        $parent = Split-Path -Parent $dest
+        if ((Test-Path -LiteralPath $parent) -and ((Get-Item -LiteralPath $parent).Attributes -band [IO.FileAttributes]::ReparsePoint)) {throw 'Mod-list compatibility path cannot be a linked directory.'}
+        if ((Test-Path -LiteralPath $dest) -and ((Get-Item -LiteralPath $dest).Attributes -band [IO.FileAttributes]::ReparsePoint)) {throw 'Mod-list compatibility file cannot be a linked file.'}
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        $backup = Join-Path $sessionRoot ('mod-list-'+$records.Count+'.original')
+        if (Test-Path -LiteralPath $dest) {Copy-Item -LiteralPath $dest -Destination $backup}
+        $records += @{path=$dest;backup=$backup;source=$compatList;hash=(Get-FileHash -LiteralPath $compatList).Hash;installed=$false;restored=$false}
+    }
+    $session=@{files=$records;root=$sessionRoot;tankSupport=$tankSupport;state='prepared';logPath=(Join-Path $runtime 'UE4SS.log');soloArguments=$status.soloArguments}
     $session | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $script:DuneSoloLoaderRoot 'session.json') -Encoding utf8
     try {
         foreach($record in $records){
-            $source=if($record.path.EndsWith('dwmapi.dll')){Join-Path $script:DuneSoloLoaderRoot 'Runtime\dwmapi.dll'}else{Join-Path $runtime 'UE4SS.dll'}
+            $source=if($record.source){$record.source}elseif($record.path.EndsWith('dwmapi.dll')){Join-Path $script:DuneSoloLoaderRoot 'Runtime\dwmapi.dll'}else{Join-Path $runtime 'UE4SS.dll'}
             # Journal intent before writing so an interrupted copy remains recoverable.
             $record.installed=$true
             $session | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $script:DuneSoloLoaderRoot 'session.json') -Encoding utf8
@@ -231,6 +308,36 @@ function Start-DuneSoloModGame([bool]$WithMods) {
         Start-Process -FilePath $shell -WindowStyle Hidden -ArgumentList $watchArgs -ErrorAction Stop
         return @{ok=$true}
     } catch { Restore-DuneSoloModSession;throw }
+}
+
+function Grant-DuneSoloRegisTank([string]$Preset) {
+    if ($Preset -cnotin @('T6_CombatDart','T6_CombatFire')) {throw 'Select Dart or Flamethrower Tank.'}
+    $session = Read-DuneModJson (Join-Path $script:DuneSoloLoaderRoot 'session.json') $null
+    if (-not $session -or -not $session.tankSupport) {throw 'Launch supported Solo through DST before granting a Tank.'}
+    $root = [IO.Path]::GetFullPath([string]$session.root)
+    if ([IO.Path]::GetDirectoryName($root) -ne [IO.Path]::GetFullPath($script:DuneSoloLoaderRoot).TrimEnd('\','/') -or
+        (Get-Item -LiteralPath $root).Attributes -band [IO.FileAttributes]::ReparsePoint) {throw 'Solo session command path is invalid.'}
+    $request = Join-Path $root 'tank-request.txt'
+    $response = Join-Path $root 'tank-response.txt'
+    if (Test-Path -LiteralPath $request) {throw 'A Tank grant is awaiting the game. Check the game before trying again.'}
+    $id = [guid]::NewGuid().ToString('N')
+    $temp = Join-Path $root ($id+'.tmp')
+    try {
+        [IO.File]::WriteAllText($temp, "$id|$Preset", [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temp -Destination $request -ErrorAction Stop
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            if (Test-Path -LiteralPath $response) {
+                $result = [IO.File]::ReadAllText($response).Split('|',3)
+                if ($result.Count -eq 3 -and $result[0] -ceq $id) {
+                    if ($result[1] -cne 'ok') {throw $result[2]}
+                    return @{ok=$true;message='Tank grant sent to the Solo world. Check the open ground near your character.'}
+                }
+            }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        throw 'The game has not confirmed the grant. Enter your Solo world and check before trying again.'
+    } finally {if (Test-Path -LiteralPath $temp) {Remove-Item -LiteralPath $temp -Force}}
 }
 
 function Get-DuneSoloLaunchArguments([switch]$SkipIntro, [string]$RuntimeDll='', [string]$ExtraArguments='') {
@@ -268,10 +375,13 @@ function Set-DuneGameLaunchPreferences($Body) {
     return Get-DuneGameLaunchPreferences
 }
 
-function Write-DuneSoloModLoadList([string]$Path, $Mods) {
+function Write-DuneSoloModLoadList([string]$Path, $Mods, [switch]$IncludeDisabled) {
     # UE4SS treats a UTF-8 BOM as part of the first mod name. PS 5.1 UTF8
     # Set-Content adds one, so use an explicit BOM-free encoding on all hosts.
-    [string[]]$lines=@($Mods | ForEach-Object {"$($_.folder) : 1"})
+    [string[]]$lines=@($Mods | ForEach-Object {
+        $on = if ($IncludeDisabled -and -not $_.enabled) {0} else {1}
+        "$($_.folder) : $on"
+    })
     [IO.File]::WriteAllLines($Path, $lines, [Text.UTF8Encoding]::new($false))
 }
 

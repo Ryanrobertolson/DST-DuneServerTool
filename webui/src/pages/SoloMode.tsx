@@ -4,6 +4,7 @@ import { PageHeader } from '../components/PageHeader'
 import { CollapsibleCard } from '../components/CollapsibleCard'
 import { ItemPicker } from '../components/ItemPicker'
 import { SoloMods } from '../components/solo/SoloMods'
+import { SoloRegisTanks } from '../components/solo/SoloRegisTanks'
 import { SoloFactionProgression } from '../components/solo/SoloFactionProgression'
 import { SoloCharacterXp } from '../components/solo/SoloCharacterXp'
 import { WickMaps } from './WickMaps'
@@ -1973,6 +1974,7 @@ export function SoloMode() {
       )}
       {tab === 'inventory' && (
         <div className="space-y-4">
+          <SoloRegisTanks connectionToken={`${activeProfileToken}:${connectionRevision}`} />
           <button className="btn-secondary" disabled={!canMutateActiveProfile || gameRunning || busy !== null} onClick={() => void repairEquipment()}>Repair all carried equipment</button>
           <div className="flex flex-wrap gap-2 items-center">
             <label htmlFor="solo-repair-container">Repair a storage container</label>
