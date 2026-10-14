@@ -649,15 +649,15 @@ interface ActionDef {
 const ACTIONS: ActionDef[] = [
   { id: 'regis-tanks', group: 'Vehicle', label: 'Regis Tanks', icon: 'Truck', liveOnly: true, custom: 'regis-tanks',
     run: () => Promise.resolve({ message: '' }) },
-  { id: 'observed-schematic-recipes', group: 'Items', label: 'Schematic Recipes (717)', icon: 'BookOpen', offlineOnly: true, experimental: true,
+  { id: 'observed-schematic-recipes', group: 'Items', label: 'Grant All Schematic Recipes (717)', icon: 'BookOpen', offlineOnly: true, experimental: true,
     rowNote: 'Grant observed crafting recipe entries directly. Existing recipes and remaining uses are preserved; this does not deliver inventory items.',
     confirm: p => `Grant 717 observed schematic recipe entries to ${p.name}? Existing recipe uses will be preserved. A backup is recommended before granting. Check crafting in-game after login.\n\n${COSMETIC_LICENSE_NOTICE}`,
     run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedSchematicRecipes') },
-  { id: 'observed-character-swatches', group: 'Items', label: 'Character Swatches (311)', icon: 'Palette', offlineOnly: true, experimental: true,
+  { id: 'observed-character-swatches', group: 'Items', label: 'Grant All Character Swatches (311)', icon: 'Palette', offlineOnly: true, experimental: true,
     rowNote: 'Save the observed swatch IDs directly to this character. Existing unlocks are preserved; individual in-game availability varies.',
     confirm: p => `Grant 311 character swatch IDs to ${p.name}? A backup is recommended before granting.\n\n${COSMETIC_LICENSE_NOTICE}`,
     run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedCharacterSwatches') },
-  { id: 'observed-gear-appearances', group: 'Items', label: 'Gear Appearances (401)', icon: 'Palette', offlineOnly: true, experimental: true,
+  { id: 'observed-gear-appearances', group: 'Items', label: 'Grant All Gear Appearances (401)', icon: 'Palette', offlineOnly: true, experimental: true,
     rowNote: 'Save the observed armor and weapon appearance IDs directly to this character. Individual in-game availability varies.',
     confirm: p => `Grant 401 gear appearance IDs to ${p.name}? A backup is recommended before granting.\n\n${COSMETIC_LICENSE_NOTICE}`,
     run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedGearAppearances') },
@@ -2883,7 +2883,16 @@ function ItemsActionBlock({ player, canWrite, flash, onChanged, onFlush }: {
   const [openId, setOpenId] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
-  const acts = useMemo(() => ACTIONS.filter(a => a.group === ITEMS_GROUP && (!isPlayer || !PLAYER_HIDDEN_ACTIONS.has(a.id))), [isPlayer])
+  const acts = useMemo(() => {
+    const first = ['give-item', 'give-vehicle-kit', 'give-package', 'grant-cosmetic', 'repair-gear', 'max-augment-attributes']
+    const rank = (action: ActionDef) => {
+      const priority = first.indexOf(action.id)
+      if (priority >= 0) return priority
+      return action.experimental ? 8 : action.liveOnly ? 7 : 6
+    }
+    return ACTIONS.filter(a => a.group === ITEMS_GROUP && (!isPlayer || !PLAYER_HIDDEN_ACTIONS.has(a.id)))
+      .sort((a, b) => rank(a) - rank(b))
+  }, [isPlayer])
 
   if (!canWrite || acts.length === 0) return null
 
@@ -2913,13 +2922,18 @@ function ItemsActionBlock({ player, canWrite, flash, onChanged, onFlush }: {
   }
 
   return (
-    <div className="player-manage-grid mb-2">
-      {acts.map(a => (
+    <div className="space-y-3 mb-2">
+      {[0, 1, 2].map(tier => {
+        const items = acts.filter(action => (action.experimental ? 2 : action.liveOnly ? 1 : 0) === tier)
+        return items.length > 0 && <div key={tier} className="player-manage-grid player-items-grid">
+      {items.map(a => (
         <div key={a.id} data-expanded={openId === a.id ? 'true' : undefined}>
           <ActionRow def={a} player={player} busy={busy} stats={null}
             open={openId === a.id} onToggle={() => openAction(a.id)} runAction={runAction} />
         </div>
       ))}
+        </div>
+      })}
     </div>
   )
 }

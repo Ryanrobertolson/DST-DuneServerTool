@@ -13,6 +13,72 @@
 }
 AfterAll { if($script:ModTestRoot.StartsWith([IO.Path]::GetTempPath())){Remove-Item -LiteralPath $script:ModTestRoot -Recurse -Force} }
 Describe 'Solo mod import and dependencies' {
+    It 'lists bundled runtime versions and preserves a saved selection when another entry is added' {
+        $body=@{mods=@();platform='steam';gamePath='C:/Game';runtimeVersion='3.0.1-1164-g5e627997'}
+        $state=Set-DuneSoloModSelection $body
+        $state.runtimeVersions.Count | Should -Be 2
+        $state.runtimePreferenceVersion | Should -Be $body.runtimeVersion
+        $profiles=@(Get-DuneSoloRuntimeProfiles)+@(@{version='future-test';label='Future';folder='Future';archive='future.zip';hash='test'})
+        Mock Get-DuneSoloRuntimeProfiles {return $profiles}
+        (Get-DuneSoloMods).runtimeVersions.Count | Should -Be 3
+        (Get-DuneSoloMods).runtimeVersion | Should -Be $body.runtimeVersion
+        (Set-DuneSoloModSelection @{mods=@();platform='steam';gamePath='C:/Game';runtimeVersion='future-test'}).runtimeVersion | Should -Be 'future-test'
+        {Set-DuneSoloModSelection @{mods=@();runtimeVersion='unbundled'}} | Should -Throw '*bundled UE4SS*'
+        (Get-DuneSoloMods).runtimePreferenceVersion | Should -Be 'future-test'
+    }
+    It 'defaults to the previous runtime even if an enabled mod declares the newer build' {
+        $mods=@([pscustomobject]@{enabled=$true;requires=@(@{id='ue4ss';version='3.0.1-1164-g5e627997'})})
+        (Get-DuneSoloRuntimeProfile $mods).version | Should -Be '3.0.1-1140-gf58e8f84'
+        (Get-DuneSoloMods).useNewerRuntime | Should -BeFalse
+    }
+    It 'persists explicit runtime choice without changing Tank-only launch or hiding a declared mismatch' {
+        Import-DuneSoloMod (New-ModZip ([guid]::NewGuid().ToString('N')) @{
+            'LegacyChoice/Scripts/main.lua'='print(1)'
+            'LegacyChoice/mod.json'='{"id":"LegacyChoice","requires":[{"id":"ue4ss","version":"3.0.1-1140-gf58e8f84"}]}'
+        }) | Out-Null
+        $body=@{mods=@(@{folder='LegacyChoice';enabled=$true});platform='steam';gamePath='C:/SteamGame';useNewerRuntime=$true}
+        $state=Set-DuneSoloModSelection $body
+        $state.runtimeVersion | Should -Be '3.0.1-1164-g5e627997'
+        $state.runtimeWarnings.Count | Should -Be 1
+        $body.useNewerRuntime=$false
+        $state=Set-DuneSoloModSelection $body
+        $state.runtimeVersion | Should -Be '3.0.1-1140-gf58e8f84'
+        $state.runtimeWarnings.Count | Should -Be 0
+        Set-DuneSoloLaunchRuntime $state $false | Out-Null
+        $state.runtimeVersion | Should -Be '3.0.1-1164-g5e627997'
+        Set-DuneSoloModSelection @{mods=$body.mods;platform='steam';gamePath='C:/AnotherGame'} | Out-Null
+        (Get-DuneSoloMods).useNewerRuntime | Should -BeFalse
+    }
+    It 'uses the previous runtime for declared dependencies without replacing the current runtime or mod settings' {
+        Install-DuneSoloModRuntime -Profile (Get-DuneSoloRuntimeProfile @() -TankOnly) | Out-Null
+        $currentHash=(Get-FileHash (Join-Path $script:DuneSoloLoaderRoot 'Runtime/ue4ss/UE4SS.dll')).Hash
+        Import-DuneSoloMod (New-ModZip ([guid]::NewGuid().ToString('N')) @{
+            'Legacy/Scripts/main.lua'='print(1)'
+            'Legacy/mod.json'='{"id":"Legacy","requires":[{"id":"ue4ss","version":"3.0.1-1140-gf58e8f84"}]}'
+            'Legacy/custom.ini'='user setting'
+        }) | Out-Null
+        Set-DuneSoloModSelection @{mods=@(@{folder='Legacy';enabled=$true});platform='steam';gamePath='C:/SteamGame'} | Out-Null
+        (Get-DuneSoloMods).runtimeVersion | Should -Be '3.0.1-1140-gf58e8f84'
+        Install-DuneSoloModRuntime | Out-Null
+        (Get-DuneSoloMods).runtimeReady | Should -BeTrue
+        (Get-FileHash (Join-Path $script:DuneSoloLoaderRoot 'Runtime/ue4ss/UE4SS.dll')).Hash | Should -Be $currentHash
+        Get-Content (Join-Path $script:DuneSoloModsRoot 'Legacy/custom.ini') | Should -Be 'user setting'
+        (Get-Content (Join-Path $script:DuneSoloLoaderRoot 'selection.json') -Raw | ConvertFrom-Json).Legacy | Should -BeTrue
+        $state=Get-DuneSoloMods
+        Set-DuneSoloLaunchRuntime $state $false | Out-Null
+        $state.runtimeVersion | Should -Be '3.0.1-1164-g5e627997'
+        Set-DuneSoloLaunchRuntime $state $true | Out-Null
+        $state.runtimeVersion | Should -Be '3.0.1-1140-gf58e8f84'
+    }
+    It 'selects automatic fallback after confirmed initialization failure but ignores optional scans and mod errors' {
+        Test-DuneSoloRuntimeStartupFailure 'UE4SS initialization failed: missing engine function' | Should -BeTrue
+        Test-DuneSoloRuntimeStartupFailure 'Failed to find ConsoleManagerSingleton' | Should -BeFalse
+        Test-DuneSoloRuntimeStartupFailure 'Mod NBSCore error: menu missing' | Should -BeFalse
+        Test-DuneSoloRuntimeStartupFailure "UE4SS initialization failed`nEvent loop start" | Should -BeFalse
+        New-Item -ItemType Directory -Path $script:DuneSoloLoaderRoot -Force | Out-Null
+        @{version='3.0.1-1140-gf58e8f84'} | ConvertTo-Json | Set-Content (Join-Path $script:DuneSoloLoaderRoot 'runtime-fallback.json')
+        (Get-DuneSoloMods).runtimeVersion | Should -Be '3.0.1-1140-gf58e8f84'
+    }
     It 'sends a button grant to the current session and waits for matching game acknowledgement' {
         $script:TankCommandTestRoot=Join-Path $script:DuneSoloLoaderRoot ('Session-'+[guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:TankCommandTestRoot -Force | Out-Null
@@ -27,18 +93,16 @@ Describe 'Solo mod import and dependencies' {
     It 'rejects unsupported variants before queuing a game command' {
         {Grant-DuneSoloRegisTank -Preset 'OtherVehicle'} | Should -Throw '*Select Dart*'
     }
-    It 'includes built-in Tanks in normal Solo launch and preserves optional mod selections' -ForEach @(@{WithMods=$false;Expected=1},@{WithMods=$true;Expected=2}) {
+    It 'includes built-in Tanks in normal Solo launch and preserves optional mod selections' -ForEach @(@{WithMods=$false;Expected=1;Platform='steam';Target='Win64'},@{WithMods=$true;Expected=2;Platform='steam';Target='Win64'},@{WithMods=$false;Expected=1;Platform='xbox';Target='WinGDK'},@{WithMods=$true;Expected=2;Platform='xbox';Target='WinGDK'}) {
         $script:DuneBundledSoloModsRoot=Join-Path (Get-DstRepoRoot) 'app/resources/solo-mods'
         $library=Join-Path $script:ModTestRoot ([guid]::NewGuid().ToString('N')+'/steamapps')
         $game=Join-Path $library 'common/DuneAwakening'
-        $bin=Join-Path $game 'DuneSandbox/Binaries/Win64'
+        $bin=Join-Path $game ('DuneSandbox/Binaries/'+$Target)
         New-Item -ItemType Directory -Path $bin -Force | Out-Null
-        $exe=Join-Path $bin 'DuneSandbox-Win64-Shipping.exe'
+        $exe=Join-Path $bin ('DuneSandbox-'+$Target+'-Shipping.exe')
         New-Item -ItemType File -Path $exe | Out-Null
-        '"buildid" "25789117"' | Set-Content (Join-Path $library 'appmanifest_1172710.acf')
         Import-DuneSoloMod (New-ModZip ([guid]::NewGuid().ToString('N')) @{'UserMod/Scripts/main.lua'='print(1)'}) | Out-Null
-        Set-DuneSoloModSelection @{mods=@(@{folder='UserMod';enabled=$true});gamePath=$game;platform='steam'} | Out-Null
-        Mock Get-FileHash { @{Hash='B9A77E7A178CFA8D88D65743BCBB04EF9D45E13539DB0BBD148E172BDA86A9E9'} } -ParameterFilter { $LiteralPath -eq $exe }
+        Set-DuneSoloModSelection @{mods=@(@{folder='UserMod';enabled=$true});gamePath=$game;platform=$Platform} | Out-Null
         Mock Start-Process {}
         $statePath = Join-Path (Split-Path -Parent $script:DuneSoloModsRoot) 'State/active-mods.txt'
         if ($WithMods) {
@@ -83,24 +147,23 @@ Describe 'Solo mod import and dependencies' {
         { Install-DuneRegisTanksMod } | Should -Throw '*Close Dune*'
         Test-Path (Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks') | Should -BeFalse
     }
-    It 'writes launch context for a supported Steam library outside the default installation' {
+    It 'writes storefront-neutral launch context without requiring a Steam manifest' -ForEach @(@{Platform='steam';Target='Win64'},@{Platform='xbox';Target='WinGDK'}) {
         $script:DuneBundledSoloModsRoot=Join-Path (Get-DstRepoRoot) 'app/resources/solo-mods'
         Install-DuneRegisTanksMod | Out-Null
-        $library=Join-Path $script:ModTestRoot 'Custom Library/steamapps'
-        $game=Join-Path $library 'common/DuneAwakening'
-        New-Item -ItemType Directory -Path $game -Force | Out-Null
-        '"buildid" "25789117"' | Set-Content (Join-Path $library 'appmanifest_1172710.acf')
-        Mock Get-FileHash { @{Hash='B9A77E7A178CFA8D88D65743BCBB04EF9D45E13539DB0BBD148E172BDA86A9E9'} }
-        Set-DuneRegisTanksLaunchContext -GamePath $game -Platform steam
-        Get-Content (Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks/Scripts/dst-steam-manifest.txt') | Should -Be (Join-Path $library 'appmanifest_1172710.acf')
+        $game=Join-Path $script:ModTestRoot ([guid]::NewGuid().ToString('N'))
+        $bin=Join-Path $game ('DuneSandbox/Binaries/'+$Target)
+        New-Item -ItemType Directory -Path $bin -Force | Out-Null
+        New-Item -ItemType File -Path (Join-Path $bin ('DuneSandbox-'+$Target+'-Shipping.exe')) | Out-Null
+        Set-DuneRegisTanksLaunchContext -GamePath $game -Platform $Platform
+        Get-Content (Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks/Scripts/dst-launch-platform.txt') | Should -Be $Platform
     }
-    It 'blocks Xbox and changed executables before writing tank launch context' {
-        { Set-DuneRegisTanksLaunchContext -GamePath 'C:/OtherGame' -Platform xbox } | Should -Throw '*Steam Solo only*'
-        Mock Get-FileHash { @{Hash='CHANGED'} }
-        { Set-DuneRegisTanksLaunchContext -GamePath 'C:/OtherGame' -Platform steam } | Should -Throw '*does not support this game build*'
-        Test-Path (Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks/Scripts/dst-steam-manifest.txt') | Should -BeFalse
+    It 'rejects absent installations and unknown platforms before writing context' {
+        { Set-DuneRegisTanksLaunchContext -GamePath 'C:/MissingGame' -Platform xbox } | Should -Throw '*Select a Steam or Xbox PC*'
+        Test-DuneSoloRegisTankBuild -GamePath 'C:/MissingGame' -Platform other | Should -BeFalse
+        Test-Path (Join-Path $script:DuneSoloModsRoot 'dst-regis-tanks/Scripts/dst-launch-platform.txt') | Should -BeFalse
     }
     It 'switches connected platforms without touching mod selections and recalls both folders' {
+        Mock Find-DuneSoloXboxInstallation { '' }
         Set-DuneSoloModSelection @{mods=@(@{folder='Kept';enabled=$true});platform='steam';gamePath='C:\Steam\Dune'} | Out-Null
         Set-DuneSoloModPlatform -Platform xbox -GamePath 'C:\Xbox\Dune'
         Set-DuneSoloModPlatform -Platform steam
@@ -110,6 +173,16 @@ Describe 'Solo mod import and dependencies' {
         Set-DuneSoloModPlatform -Platform xbox
         (Get-DuneSoloMods).gamePath | Should -Be 'C:\Xbox\Dune'
         (Get-Content (Join-Path $script:DuneSoloLoaderRoot 'selection.json') -Raw | ConvertFrom-Json).Kept | Should -BeTrue
+    }
+    It 'shows the accessible Xbox folder behind a registered package junction' {
+        $content=Join-Path $script:ModTestRoot 'XboxReadableContent'
+        $registered=Join-Path $script:ModTestRoot 'XboxPackageJunction'
+        New-Item -ItemType Directory -Path (Join-Path $content 'DuneSandbox/Binaries/WinGDK') -Force | Out-Null
+        Set-Content (Join-Path $content 'DuneSandbox/Binaries/WinGDK/DuneSandbox-WinGDK-Shipping.exe') 'test executable'
+        New-Item -ItemType Junction -Path $registered -Target $content | Out-Null
+        Mock Get-AppxPackage { @([pscustomobject]@{InstallLocation=$registered;Version='2.0.12.0'}) }
+        try { Find-DuneSoloXboxInstallation | Should -Be $content }
+        finally { [IO.Directory]::Delete($registered) }
     }
     It 'discovers the registered Xbox installation only when its executable exists' {
         $root=Join-Path $script:ModTestRoot 'RegisteredXbox'
@@ -141,7 +214,26 @@ Describe 'Solo mod import and dependencies' {
         Set-DuneSoloModSelection @{mods=@();gamePath=$game;platform='xbox'} | Out-Null
         Mock Start-Process {}
         Start-DuneSoloModGame $false | Out-Null
-        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath.EndsWith('DuneSandbox-WinGDK-Shipping.exe') }
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $ArgumentList -join ' ' -match 'DuneSandbox-WinGDK-Shipping.exe' }
+        (Get-DuneSoloMods).session.tankSupport | Should -BeTrue
+    }
+    It 'recovers an obsolete Xbox package folder while retaining valid manual installations and selections' {
+        $current=Join-Path $script:ModTestRoot 'XboxUpdated'
+        $manual=Join-Path $script:ModTestRoot 'XboxManual'
+        foreach($root in @($current,$manual)) {
+            $bin=Join-Path $root 'DuneSandbox/Binaries/WinGDK'
+            New-Item -ItemType Directory -Path $bin -Force | Out-Null
+            New-Item -ItemType File -Path (Join-Path $bin 'DuneSandbox-WinGDK-Shipping.exe') | Out-Null
+        }
+        Mock Find-DuneSoloXboxInstallation { $current }
+        Set-DuneSoloModSelection @{mods=@(@{folder='Kept';enabled=$true});platform='steam';gamePath='C:\Steam\Dune'} | Out-Null
+        Set-DuneSoloModPlatform -Platform xbox -GamePath (Join-Path $script:ModTestRoot 'XboxRemoved')
+        (Get-DuneSoloMods).gamePath | Should -Be $current
+        (Get-Content (Join-Path $script:DuneSoloLoaderRoot 'selection.json') -Raw | ConvertFrom-Json).Kept | Should -BeTrue
+        Set-DuneSoloModPlatform -Platform xbox -GamePath $manual
+        (Get-DuneSoloMods).gamePath | Should -Be $manual
+        Set-DuneSoloModPlatform -Platform steam
+        (Get-DuneSoloMods).gamePath | Should -Be 'C:\Steam\Dune'
     }
     It 'preserves quoted custom arguments in normal and modded launch arguments' {
         $extra='-example="two words" -another=3'
@@ -167,6 +259,7 @@ Describe 'Solo mod import and dependencies' {
         (Get-DuneGameLaunchPreferences).soloArguments | Should -Be '-log'
     }
     It 'passes saved arguments to the game executable during normal Solo launch' {
+        Mock Test-DuneSoloRegisTankBuild { $false }
         $game=Join-Path $script:ModTestRoot 'Game'
         $bin=Join-Path $game 'DuneSandbox/Binaries/Win64'
         New-Item -ItemType Directory -Path $bin -Force | Out-Null
@@ -191,6 +284,7 @@ Describe 'Solo mod import and dependencies' {
         }
     }
     It 'automatically restores a leftover session and continues normal launch' {
+        Mock Test-DuneSoloRegisTankBuild { $false }
         $game=Join-Path $script:ModTestRoot 'RecoveredGame'
         $bin=Join-Path $game 'DuneSandbox/Binaries/Win64'
         New-Item -ItemType Directory -Path $bin -Force | Out-Null
@@ -204,6 +298,7 @@ Describe 'Solo mod import and dependencies' {
         Should -Invoke Start-Process -Times 1 -Exactly
     }
     It 'clears leftover restoration state before checking mod runtime requirements' {
+        Mock Test-DuneSoloRegisTankBuild { $false }
         $game=Join-Path $script:ModTestRoot 'RecoveredModGame'
         $bin=Join-Path $game 'DuneSandbox/Binaries/Win64'
         New-Item -ItemType Directory -Path $bin -Force | Out-Null
@@ -270,24 +365,70 @@ BeforeEach {
         New-Item -ItemType Directory -Path $script:DuneSoloLoaderRoot -Force | Out-Null
         Set-Content $selection '{"Kept":true}'
         Install-DuneSoloModRuntime | Out-Null
-        Test-Path (Join-Path $script:DuneSoloLoaderRoot 'Runtime/ue4ss/UE4SS.dll') | Should -BeTrue
+        Test-Path (Join-Path $script:DuneSoloLoaderRoot 'Runtime-1140/ue4ss/UE4SS.dll') | Should -BeTrue
         $archive=[IO.Compression.ZipFile]::OpenRead((Join-Path $script:DuneSoloRuntimeAssets 'configs.zip'))
         try {
             $reader=[IO.StreamReader]::new($archive.GetEntry('DuneAwakening/UE4SS-settings.ini').Open())
             try { $expected=$reader.ReadToEnd() } finally { $reader.Dispose() }
-            (Get-Content (Join-Path $script:DuneSoloLoaderRoot 'Runtime/ue4ss/UE4SS-settings.ini') -Raw) | Should -Be $expected
+            (Get-Content (Join-Path $script:DuneSoloLoaderRoot 'Runtime-1140/ue4ss/UE4SS-settings.ini') -Raw) | Should -Be $expected
         } finally { $archive.Dispose() }
         (Get-Content $selection -Raw).Trim() | Should -Be '{"Kept":true}'
         @(Get-ChildItem $script:DuneSoloLoaderRoot -Directory -Filter 'Configs-*').Count | Should -Be 0
         Should -Invoke Invoke-RestMethod -Times 0
         Should -Invoke Invoke-WebRequest -Times 0
-        { Install-DuneSoloModRuntime } | Should -Throw '*already installed*'
+        Install-DuneSoloModRuntime | Out-Null
+        (Get-DuneSoloMods).runtimeReady | Should -BeTrue
+        @(Get-ChildItem $script:DuneSoloLoaderRoot -Directory -Filter 'Runtime-before-repair-*').Count | Should -Be 1
+        (Get-Content $selection -Raw).Trim() | Should -Be '{"Kept":true}'
+    }
+
+    It 'returns the actual Mods folder for the desktop shell without starting service-session Explorer' {
+        Mock Start-Process { throw 'Backend must not start Explorer for a desktop request' }
+        $result = Open-DuneSoloModsFolder -Desktop
+        $result.ok | Should -BeTrue
+        $result.path | Should -Be ([IO.Path]::GetFullPath($script:DuneSoloModsRoot))
+        Test-Path -LiteralPath $result.path -PathType Container | Should -BeTrue
+        Should -Invoke Start-Process -Times 0
+    }
+
+    It 'does not claim a visible Explorer window from a service session' {
+        Mock Start-Process {}
+        if ([Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0) {
+            { Open-DuneSoloModsFolder } | Should -Throw '*DST desktop window*'
+            Should -Invoke Start-Process -Times 0
+        } else {
+            (Open-DuneSoloModsFolder).ok | Should -BeTrue
+            Should -Invoke Start-Process -Times 1
+        }
+    }
+
+    It 'repairs a partial runtime without replacing installed mods or selections' {
+        Install-DuneSoloModRuntime | Out-Null
+        Remove-Item -LiteralPath (Join-Path $script:DuneSoloLoaderRoot 'Runtime-1140/dwmapi.dll')
+        (Get-DuneSoloMods).runtimeReady | Should -BeFalse
+        New-Item -ItemType Directory -Path (Join-Path $script:DuneSoloModsRoot 'Kept/Scripts') -Force | Out-Null
+        Set-Content (Join-Path $script:DuneSoloModsRoot 'Kept/Scripts/main.lua') 'kept mod'
+        Set-Content (Join-Path $script:DuneSoloLoaderRoot 'selection.json') '{"Kept":true}'
+        Install-DuneSoloModRuntime | Out-Null
+        (Get-DuneSoloMods).runtimeReady | Should -BeTrue
+        (Get-Content (Join-Path $script:DuneSoloModsRoot 'Kept/Scripts/main.lua') -Raw).Trim() | Should -Be 'kept mod'
+        (Get-Content (Join-Path $script:DuneSoloLoaderRoot 'selection.json') -Raw).Trim() | Should -Be '{"Kept":true}'
+    }
+
+    It 'preserves the current runtime if publishing the staged replacement fails' {
+        Install-DuneSoloModRuntime | Out-Null
+        $runtimePath=Join-Path $script:DuneSoloLoaderRoot 'Runtime-1140'
+        Set-Content (Join-Path $runtimePath 'preserved.txt') 'previous runtime'
+        Mock Move-Item { throw 'Simulated replacement failure' } -ParameterFilter { $LiteralPath -like '*Runtime-*' -and $LiteralPath -notlike '*Runtime-before-repair-*' -and $Destination -eq $runtimePath }
+        { Install-DuneSoloModRuntime } | Should -Throw '*Simulated replacement failure*'
+        (Get-Content (Join-Path $runtimePath 'preserved.txt') -Raw).Trim() | Should -Be 'previous runtime'
+        (Get-DuneSoloMods).runtimeReady | Should -BeTrue
     }
 
     It 'rejects corrupt bundled archives before creating a runtime' {
         $script:DuneSoloRuntimeAssets=Join-Path $case 'BrokenAssets'
         New-Item -ItemType Directory $script:DuneSoloRuntimeAssets | Out-Null
-        Set-Content (Join-Path $script:DuneSoloRuntimeAssets 'runtime.zip') 'corrupt'
+        Set-Content (Join-Path $script:DuneSoloRuntimeAssets 'runtime-1140.zip') 'corrupt'
         Copy-Item (Join-Path (Get-DstRepoRoot) 'app/resources/solo-mod-runtime/configs.zip') $script:DuneSoloRuntimeAssets
         { Install-DuneSoloModRuntime } | Should -Throw '*checksum mismatch*'
         Test-Path $script:DuneSoloLoaderRoot | Should -BeFalse
@@ -366,6 +507,9 @@ BeforeEach {
         $path=Join-Path $root 'proxy';$backup=Join-Path $root 'original';'new'|Set-Content $path;'old'|Set-Content $backup
         $owned=Join-Path $root 'owned';'owned'|Set-Content $owned
         @{files=@(@{path=$path;backup=$backup;hash=(Get-FileHash $path).Hash;installed=$true;restored=$false},@{path=$owned;backup=(Join-Path $root 'absent');hash=(Get-FileHash $owned).Hash;installed=$true;restored=$false})} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $root 'session.json')
+        # The background Windows PowerShell watcher must restore even when
+        # its host cannot resolve the Get-FileHash cmdlet.
+        Mock Get-FileHash { throw 'Get-FileHash unavailable in watcher host' }
         & "$PSScriptRoot/../app/server/lib/SoloModsWatcher.ps1" -LoaderRoot $root -RestoreOnly
         Get-Content $path | Should -Be 'old'
         Test-Path $owned | Should -BeFalse

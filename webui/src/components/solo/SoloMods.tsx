@@ -8,9 +8,10 @@ import { api } from '../../api/client'
 import { ConfirmationModal } from '../ConfirmationModal'
 import { CollapsibleCard } from '../CollapsibleCard'
 import { pickLocalFolder } from '../../util/pathPicker'
+import { isShellHost, openShellFolder } from '../../util/shellBridge'
 
 interface Mod { folder: string; id: string; name: string; version: string; enabled: boolean; warnings?: string[]; errors: string[] }
-interface State { gameRunning?: boolean; mods: Mod[]; folder: string; gamePath: string; skipIntro: boolean; soloArguments?: string; runtimeReady: boolean; session: unknown; launchError?: string; runtimeLog?: string }
+interface State { runtimeVersions?: {version: string; label: string}[]; runtimePreferenceVersion?: string; useNewerRuntime?: boolean; runtimeVersion?: string; runtimeFallback?: boolean; runtimeWarnings?: string[]; gameRunning?: boolean; mods: Mod[]; folder: string; gamePath: string; skipIntro: boolean; soloArguments?: string; runtimeReady: boolean; session: { runtimeVersion?: string } | null; launchError?: string; runtimeLog?: string }
 
 function SortableMod({ mod, disabled, children }: { mod: Mod; disabled: boolean; children: ReactNode }) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: mod.folder, disabled })
@@ -31,6 +32,7 @@ export function SoloMods({ connectionToken = '' }: { connectionToken?: string })
   const [soloArguments, setSoloArguments] = useState('')
   const [dragged, setDragged] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [deleting, setDeleting] = useState<Mod | null>(null)
@@ -53,10 +55,27 @@ export function SoloMods({ connectionToken = '' }: { connectionToken?: string })
       await refresh()
       if (action === 'shortcut') setNotice('Desktop shortcut created.')
       if (action === 'restore') setNotice('Launch files reset. Normal launch restored; saves and installed mods were kept.')
+      if (action === 'runtime') setNotice('Mod runtime installed and verified. Saves, installed mods and mod selections were kept.')
     } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
     finally { setBusy(false) }
   }
   const save = (mods = state?.mods ?? [], path = gamePath) => run('selection', { mods, gamePath: path, platform })
+  const refreshMods = async () => {
+    setBusy(true); setRefreshing(true); setError(''); setNotice('')
+    try { await refresh(); setNotice('Mod list refreshed.') }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+    finally { setRefreshing(false); setBusy(false) }
+  }
+  const openModsFolder = async () => {
+    setBusy(true); setError(''); setNotice('')
+    try {
+      const desktop = isShellHost()
+      const result = await api<{ path: string }>('/api/solo/mods/open', { method: 'POST', body: JSON.stringify({ desktop }) })
+      if (desktop) await openShellFolder(result.path)
+      setNotice('Mods folder opening in File Explorer.')
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+    finally { setBusy(false) }
+  }
   const saveArguments = async () => {
     setBusy(true); setError('')
     try {
@@ -119,23 +138,34 @@ export function SoloMods({ connectionToken = '' }: { connectionToken?: string })
       <button className="btn-primary" disabled={busy} onClick={() => void run('launch', { withMods: false })}>Launch Solo</button>
       <button className="btn-secondary" disabled={busy} title="Close Dune first. Restore original launch files and remove DST session DLLs; saves and installed mods are kept." onClick={() => void run('restore')}>Reset launch files</button>
       <button className="btn-secondary" disabled={busy} onClick={() => void run('shortcut')}>Create desktop shortcut</button>
+      <button className="btn-secondary" disabled={busy || !state || state.gameRunning} onClick={() => void run('runtime')}>{state?.runtimeReady ? 'Repair mod runtime' : 'Install mod runtime'}</button>
     </div>
   }>
     <div className="space-y-3">
-      <p className="text-sm text-text-muted">Supported Steam Solo launches include built-in Tank support and disable BattlEye for that session. Launch with Mods also loads your enabled mods; Xbox mod launches disable BattlEye too.</p>
+      <p className="text-sm text-text-muted">Launch with Mods loads your enabled mods.</p>
+      <label className="flex items-center gap-2 text-sm">
+        UE4SS runtime
+        <select value={state?.runtimePreferenceVersion ?? state?.runtimeVersion ?? ''} disabled={busy || !state || state.gameRunning} onChange={e => void run('selection', { mods: state?.mods ?? [], gamePath, platform, runtimeVersion: e.target.value })}>
+          {state?.runtimeVersions?.map(runtime => <option key={runtime.version} value={runtime.version}>{runtime.label}</option>)}
+        </select>
+      </label>
+      {state?.runtimeVersion && <details><summary className="cursor-pointer text-sm text-text-muted">Runtime details</summary><p role="status" className="text-sm text-text-muted mt-2">Selected for next mod launch: UE4SS {state.runtimeVersion}.{state.gameRunning && state.session?.runtimeVersion ? ` Current session: UE4SS ${state.session.runtimeVersion}.` : ''}</p></details>}
+      {state?.runtimeFallback && <p className="text-sm text-warning">The newer runtime failed to initialize. DST selected previous runtime 1140 for the next launch. Select a runtime again to retry your chosen version.</p>}
+      {state?.runtimeWarnings?.map(message => <p className="text-sm text-warning" key={message}>{message}</p>)}
       {platform === 'xbox' && (
         <p className="rounded border border-warning/30 bg-warning/5 p-3 text-sm text-text-muted">
-          Xbox app / Game Pass mods require a version updated by the mod author for Game Pass.
-          Check the author&apos;s compatibility notes before installing; DST&apos;s Xbox support does not make Steam-only mods compatible.
+          Use mods compatible with Xbox PC / Game Pass.
         </p>
       )}
       {deleting && <ConfirmationModal title={`Delete ${deleting.name}?`} description="This permanently removes the mod folder and its INI settings. You can reinstall the mod from its ZIP." confirmLabel="Delete mod" onCancel={() => setDeleting(null)} onConfirm={() => { const folder = deleting.folder; setDeleting(null); void run('delete', { folder }) }} />}
       <a className="text-sm text-accent-bright underline" href="https://www.nexusmods.com/duneawakening" target="_blank" rel="noopener noreferrer">Browse Dune: Awakening mods on Nexus Mods</a>
       <div className="flex flex-wrap gap-2">
         <button className="btn-secondary" disabled={busy} onClick={() => void install()}>Install mod ZIP</button>
-        <button className="btn-secondary" disabled={busy} onClick={() => void run('open')}>Open Mods Folder</button>
-        <button className="btn-secondary" disabled={busy} onClick={() => void refresh().catch(e => setError(String(e)))}>Refresh</button>
-        {!state?.runtimeReady && <button className="btn-secondary" disabled={busy} onClick={() => void run('runtime')}>Install mod runtime</button>}
+        <button className="btn-secondary" disabled={busy} onClick={() => void openModsFolder()}>Open Mods Folder</button>
+        <button className="btn-secondary" disabled={busy} aria-busy={refreshing} onClick={() => void refreshMods()}>
+          <Icon name={refreshing ? 'LoaderCircle' : 'RefreshCw'} size={14} className={refreshing ? 'animate-spin' : ''} />
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </button>
       </div>
       {state && state.mods.length > 1 && <p className="text-sm text-text-muted">Mods load from top to bottom. Follow the mod author's load order instructions.</p>}
       <DndContext sensors={sensors} collisionDetection={closestCorners}
@@ -161,7 +191,7 @@ export function SoloMods({ connectionToken = '' }: { connectionToken?: string })
       </DndContext>
       {state && !state.mods.length && <p className="text-sm text-text-muted">No mods installed.</p>}
       
-      <p className="text-xs text-text-muted">Solo only. Normal launch bypasses the mod runtime. DST supports its mod-loading framework only. We make no guarantees that any individual mod will or will not work, and DST does not provide individual mod troubleshooting. Contact the mod author or discuss issues with the community.</p>
+      <p className="text-xs text-text-muted">Solo only. Launch Solo includes built-in Tank support; Launch with Mods also loads enabled mods. DST supports its mod-loading framework only. We make no guarantees that any individual mod will or will not work, and DST does not provide individual mod troubleshooting. Contact the mod author or discuss issues with the community.</p>
       <a className="text-xs text-accent-bright underline" href="https://discord.com/channels/1517599283757453333/1558246888967245957" target="_blank" rel="noopener noreferrer">Solo mod discussion</a>
       {state?.runtimeLog && <details><summary className="cursor-pointer text-sm">Loader log</summary><pre className="text-xs whitespace-pre-wrap max-h-64 overflow-auto mt-2">{state.runtimeLog}</pre></details>}
     </div>
