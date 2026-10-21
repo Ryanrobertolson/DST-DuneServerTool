@@ -1,6 +1,7 @@
-BeforeAll {
+﻿BeforeAll {
     . "$PSScriptRoot\_TestHelpers.ps1"
     $script:OriginalAppData = $env:APPDATA
+    $script:OriginalConfigFile = $script:DuneConfigFile
     $script:PortalTestRoot = Join-Path (Get-DstRepoRoot) '.portal-auth-test-data'
     $env:APPDATA = $script:PortalTestRoot
     Remove-Item -LiteralPath $script:PortalTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -9,6 +10,7 @@ BeforeAll {
     . (Join-Path (Get-DstRepoRoot) 'app\server\lib\RemoteAccess.ps1')
     . (Join-Path (Get-DstRepoRoot) 'app\server\lib\RequestPrincipal.ps1')
     . (Join-Path (Get-DstRepoRoot) 'app\server\HttpServer.ps1')
+    $script:DuneConfigFile = Join-Path $script:PortalTestRoot 'dune-server.config'
     function New-PortalTestRequest {
         param([string]$Cookie = '', [string]$Address = '127.0.0.1', [string]$Origin = 'https://portal.example.test')
         $cookies = @{}
@@ -23,11 +25,22 @@ BeforeAll {
 
 AfterAll {
     $env:APPDATA = $script:OriginalAppData
+    $script:DuneConfigFile = $script:OriginalConfigFile
     Remove-Item -LiteralPath $script:PortalTestRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Describe 'Portal account password security' {
     BeforeEach { Remove-Item -LiteralPath $script:PortalTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    It 'requires a host-assigned character for a Player account and creates a linked-player principal' {
+        { New-DunePortalAccount -Username 'player-one' -Role player } | Should -Throw '*linked game character*'
+        $created = New-DunePortalAccount -Username 'player-one' -Role player -GameCharacterId '11' -GameCharacterLabel 'Own'
+        $principal = New-DuneRequestPrincipal -Request (New-PortalTestRequest -Address '192.0.2.1') -AccountMode $true -PortalSessionAuth @{ ok=$true;account=$created.account;sessionId='session' }
+        $principal.type | Should -Be 'linked-player'
+        $principal.linkedCharacter.id | Should -Be '11'
+        $public = Get-DunePortalPublicAccount $created.account
+        $public.role | Should -Be 'player'
+        $public.ContainsKey('password') | Should -BeFalse
+    }
     It 'hashes with versioned PBKDF2-HMAC-SHA256 and verifies in constant-time code' {
         $hash = New-DunePortalPasswordHash 'correct horse battery'
         $hash.algorithm | Should -Be 'PBKDF2-HMAC-SHA256'
@@ -154,7 +167,7 @@ Describe 'Legacy Cloudflare ACL enablement' {
         Assert-MockCalled Test-DuneCloudflareAccessJwt -Times 0 -Exactly
     }
 
-    It 'keeps JWT and owner authorization unchanged after an explicit re-enable' {
+    It 'rejects retained Cloudflare enablement without validating JWTs' {
         Save-DuneRemoteAcl -Acl @{
             owner = 'owner@example.test'
             legacyCloudflareEnabled = $true
@@ -163,9 +176,8 @@ Describe 'Legacy Cloudflare ACL enablement' {
 
         $result = Test-DuneRemoteRequest -Request ([pscustomobject]@{ Headers = @{} })
 
-        $result.ok | Should -BeTrue
-        $result.role | Should -Be 'owner'
-        Assert-MockCalled Test-DuneCloudflareAccessJwt -Times 1 -Exactly
+        $result.ok | Should -BeFalse
+        Assert-MockCalled Test-DuneCloudflareAccessJwt -Times 0 -Exactly
     }
 
     It 'revokes ordinary API and WebSocket launch-token access after disablement' {
@@ -228,9 +240,7 @@ Describe 'Legacy Cloudflare ACL enablement' {
             })
             $enabledBody = [Text.Encoding]::UTF8.GetString($enabledResponse.OutputStream.ToArray()) | ConvertFrom-Json
 
-            $enabledResponse.StatusCode | Should -Be 200
-            $enabledBody.principal | Should -Be 'legacy-token'
-            $enabledBody.transport | Should -Be 'cloudflare-access'
+            $enabledResponse.StatusCode | Should -Be 401
 
             Save-DuneRemoteAcl -Acl @{
                 owner = 'owner@example.test'

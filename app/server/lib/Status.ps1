@@ -13,18 +13,18 @@ $script:DuneBattlegroupSnapshotCacheKey = '__cache:status-bg-snapshot'
 # unencrypted key (exit 0) and fails with an "incorrect passphrase" error for an
 # encrypted one — this works for both PEM and modern OpenSSH key formats.
 #
-# The empty passphrase MUST be spelled `'""'` (single-quoted double-quotes), not
-# `''`. Under Windows PowerShell 5.1 — the runtime DuneServer.exe uses — a bare
-# empty-string argument is dropped when invoking a native exe, so ssh-keygen would
-# see `-P -f <path>`, swallow `-f` as the passphrase, and fail every key with
-# "Too many arguments" — making this helper return $null (undetermined) for BOTH
-# encrypted and plain keys. `'""'` survives as a literal empty string. Verified
-# on PS 5.1.
+# Windows PowerShell 5.1/Legacy needs a quoted empty argument because it drops
+# bare empty strings. Modern PowerShell preserves empty strings and literal
+# quotes, so it must receive an actual empty string instead.
 function Test-DuneSshKeyEncrypted {
     param([string]$KeyPath)
     if (-not $KeyPath -or -not (Test-Path -LiteralPath $KeyPath)) { return $null }
     try {
-        $out  = & ssh-keygen -y -P '""' -f $KeyPath 2>&1
+        # PS 5.1 represents native stderr as error records. Inspect the exit
+        # code even when the caller uses Stop; an encrypted key is expected.
+        $ErrorActionPreference = 'Continue'
+        $emptyPassphrase = if ($PSVersionTable.PSVersion -ge [version]'7.3' -and $PSNativeCommandArgumentPassing -ne 'Legacy') { '' } else { '""' }
+        $out  = & ssh-keygen -y -P $emptyPassphrase -f $KeyPath 2>&1
         $code = $LASTEXITCODE
         if ($code -eq 0) { return $false }
         $text = ($out | Out-String)
@@ -59,22 +59,86 @@ function Get-DuneSshFailureReason {
     return $null
 }
 
+function Get-DuneLanVmSnapshot {
+    param($HyperV, [switch]$Force)
+    # Share only discovery metadata across API runspaces. Credentials stay in
+    # the current request; changing host/account selects a different cache.
+    $key = '__cache:lan-vm:' + $HyperV.ComputerName + ':' + $HyperV.Credential.UserName + ':' + $script:DuneVmName
+    $table = $script:DuneApiLockTable
+    if (-not $table) {
+        if (-not $script:DuneLanVmSnapshotCache) { $script:DuneLanVmSnapshotCache = [hashtable]::Synchronized(@{}) }
+        $table = $script:DuneLanVmSnapshotCache
+    }
+    $read = {
+        [Threading.Monitor]::Enter($table.SyncRoot)
+        try { $entry = $table[$key] } finally { [Threading.Monitor]::Exit($table.SyncRoot) }
+        if (-not $Force -and $entry -and ([datetime]::UtcNow - $entry.Fetched).TotalSeconds -lt 3) {
+            return $entry.Snapshot
+        }
+        return $null
+    }
+    $refresh = {
+        $cached = & $read
+        if ($null -ne $cached) { return $cached }
+        try {
+            $snapshot = Invoke-Command -ComputerName $HyperV.ComputerName -Credential $HyperV.Credential -ArgumentList $script:DuneVmName -ScriptBlock {
+                param($name)
+                $vm = Get-VM -Name $name -ErrorAction Stop
+                $addresses = @((Get-VMNetworkAdapter -VMName $name -ErrorAction Stop).IPAddresses)
+                @{ State=[string]$vm.State; UptimeSeconds=[int]$vm.Uptime.TotalSeconds; IPAddresses=$addresses }
+            } -ErrorAction Stop
+        } catch {
+            # A workgroup host can accept Hyper-V's credentialed CIM calls while
+            # denying a PowerShell remoting endpoint. Match the connection Test
+            # without requiring broader delegation or changing host policy.
+            $sessionError = $_.Exception.Message
+            try {
+                $vm = Get-VM -Name $script:DuneVmName @HyperV -ErrorAction Stop
+                $addresses = @((Get-VMNetworkAdapter -VMName $script:DuneVmName @HyperV -ErrorAction Stop).IPAddresses)
+                $snapshot = @{ State=[string]$vm.State; UptimeSeconds=[int]$vm.Uptime.TotalSeconds; IPAddresses=$addresses }
+            } catch {
+                throw "LAN VM discovery failed. PowerShell session: $sessionError. Hyper-V query: $($_.Exception.Message)"
+            }
+        }
+        [Threading.Monitor]::Enter($table.SyncRoot)
+        try { $table[$key] = @{ Snapshot=$snapshot; Fetched=[datetime]::UtcNow } }
+        finally { [Threading.Monitor]::Exit($table.SyncRoot) }
+        return $snapshot
+    }
+    $cached = & $read
+    if ($null -ne $cached) { return $cached }
+    if (Get-Command Invoke-WithDuneLock -ErrorAction SilentlyContinue) {
+        return Invoke-WithDuneLock -Name ("lan-vm-discovery:" + $key) -TimeoutSec 20 -Script $refresh
+    }
+    [Threading.Monitor]::Enter($table.SyncRoot)
+    try { return & $refresh } finally { [Threading.Monitor]::Exit($table.SyncRoot) }
+}
+
 function Get-DuneVmStatus {
+    param([switch]$Force)
+    if ((Get-Command Test-DuneSoloInstallation -ErrorAction SilentlyContinue) -and (Test-DuneSoloInstallation)) {
+        return @{ exists=$false; running=$false; name=''; state='Not applicable'; ip=$null; uptime=0 }
+    }
     try {
         # Local by default; targets a LAN Hyper-V host when VmHostMode='lan'.
         # The guest IP resolved below is what the entire SSH layer talks to, so
         # this discovery must succeed against whichever host owns the VM.
         $hv = Get-DuneHyperVSplat
-        $vm = Get-VM -Name $script:DuneVmName @hv -ErrorAction Stop
-        # Re-apply @hv (ComputerName + Credential) explicitly rather than
-        # piping $vm - confirmed by Get-Command that Get-VMNetworkAdapter's
-        # piped "-VM <VirtualMachine[]>" parameter set carries NO
-        # ComputerName/Credential/CimSession parameters at all, unlike its
-        # "-VMName <string[]>" set. Piping a remotely-fetched $vm silently
-        # drops the LAN host's credential (field-confirmed: VM running and its
-        # IP visible in Hyper-V Manager, but DST's own discovery came back
-        # empty/failed, leaving ServerHealth stuck on "Unknown").
-        $ip = (Get-VMNetworkAdapter -VMName $script:DuneVmName @hv).IPAddresses |
+        if ($hv.ComputerName) {
+            # Execute both Hyper-V reads on the host in one authenticated
+            # round-trip. Two remote CIM calls otherwise repeat authentication
+            # and discovery for every page's status request.
+            $snapshot = Get-DuneLanVmSnapshot -HyperV $hv -Force:$Force
+            $vm = [pscustomobject]@{ State=$snapshot.State; Uptime=[timespan]::FromSeconds($snapshot.UptimeSeconds) }
+            $addresses = $snapshot.IPAddresses
+        } else {
+            $vm = Get-VM -Name $script:DuneVmName @hv -ErrorAction Stop
+            $addresses = (Get-VMNetworkAdapter -VMName $script:DuneVmName @hv).IPAddresses
+        }
+        # The LAN adapter query runs locally on the credentialed host above;
+        # local mode uses the existing VMName parameter set. Never pipe a
+        # deserialized remote VM object into an uncredentialed adapter query.
+        $ip = $addresses |
               Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
         # Coerce to string. On VMs with multiple network adapters the pipeline
         # can hand back a PSObject wrapping the IP; without the cast, ConvertTo-Json
@@ -203,8 +267,18 @@ function Get-DuneBattlegroupSnapshot {
             if ($cached -ne $null) { return $cached }
         }
 
+        $previousEntry = Get-DuneBattlegroupSnapshotCacheEntry
+        $previous = if ($previousEntry) { $previousEntry.Snapshot } else { $null }
         $snapshot = Get-DuneBattlegroupSnapshotFresh -VmStatus $VmStatus
         Set-DuneBattlegroupSnapshotCacheEntry -Snapshot $snapshot
+        # The shared snapshot lock makes this one check per observed start,
+        # including a BG started outside DST. Status stays responsive while the
+        # existing background checker reconciles the persisted update badge.
+        if ($snapshot.available -and $snapshot.state -in @('starting', 'running') -and
+            (-not $previous -or -not $previous.available -or $previous.state -notin @('starting', 'running')) -and
+            $script:AppDir -and (Get-Command Start-DuneFuncomUpdateCheckAsync -ErrorAction SilentlyContinue)) {
+            try { [void](Start-DuneFuncomUpdateCheckAsync -ServerDir (Join-Path $script:AppDir 'server')) } catch {}
+        }
         return $snapshot
     }
 
@@ -695,7 +769,10 @@ function Get-BgGameServerValues {
     param([string]$Line)
     if (-not $Line) { return @() }
     # Strip any residual ANSI just in case, then tokenize on runs of whitespace.
-    $clean = ($Line -replace "`e\[[0-9;]*[A-Za-z]", '').Trim()
+    $clean = ($Line -replace "$([char]27)\[[0-9;]*[A-Za-z]", '').Trim()
+    # kubectl prints this notice below the Game Servers headers when empty.
+    # It is not a server row: counting it prevents shutdown polling completing.
+    if ($clean -match '^No resources found(?:\s|$)') { return @() }
     $tokens = @($clean -split '\s+' | Where-Object { $_ -ne '' })
     if ($tokens.Count -lt 4) { return @() }
     $n       = $tokens.Count

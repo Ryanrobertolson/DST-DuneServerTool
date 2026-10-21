@@ -1,8 +1,9 @@
-BeforeAll {
+﻿BeforeAll {
     . "$PSScriptRoot\_TestHelpers.ps1"
     . (Join-Path (Get-DstRepoRoot) 'app\server\HttpServer.ps1')
     Import-DstLib 'ApiContract.ps1'
     Import-DstLib 'RequestPrincipal.ps1'
+    Import-DstLib 'PlayerAccess.ps1'
     Import-DstLib 'PlatformRuntime.ps1'
     Import-DstLib 'Capabilities.ps1'
 
@@ -69,7 +70,7 @@ Describe 'Platform capability registry' {
         { Assert-DuneCapabilityRegistry $registry } | Should -Not -Throw
         @($registry.capabilities.id | Sort-Object -Unique).Count | Should -Be @($registry.capabilities).Count
         @($registry.capabilities | Where-Object { $_.rolloutState -ne 'unavailable' -and 'linked-player' -in @($_.allowedPrincipals) }).Count |
-            Should -Be 0
+            Should -Be 5
     }
 
     It 'rejects duplicate IDs, unknown guards, and duplicate endpoint IDs' {
@@ -122,7 +123,7 @@ Describe 'Platform capability registry' {
             $capabilities.Count | Should -BeGreaterThan 0
             @($capabilities | Where-Object rolloutState -eq 'unavailable').Count | Should -Be 0
         }
-        @(Get-DuneCapabilitiesForPrincipal @{ type = 'linked-player'; role = 'player' }).Count | Should -Be 0
+        @(Get-DuneCapabilitiesForPrincipal @{ type = 'linked-player'; role = 'player' } -RuntimePlatform windows).Count | Should -Be 5
     }
 
     It 'advertises static Maps but not the Windows cache capability on Linux' {
@@ -170,7 +171,7 @@ Describe 'Complete route classification' {
     It 'classifies the exact registered HTTP and WebSocket inventory' {
         $records = @(Get-PlatformRouteRecords)
         $manifest = Get-DuneRoutePolicyManifest
-        $records.Count | Should -Be 384
+        $records.Count | Should -Be 441
         $sources = @($records.SourceFile | Sort-Object -Unique)
         @($manifest.groups.source | Sort-Object) | Should -Be $sources
 
@@ -214,6 +215,10 @@ Describe 'Complete route classification' {
         })
         @($classifications | Where-Object { -not $_.classified }).Count | Should -Be 0
         @($classifications | Where-Object { -not $_.capabilityId }).Count | Should -Be 0
+        $labLocal = @($script:DuneRoutes | Where-Object Path -eq '/api/gameconfig/client/lab')
+        $labLocal.Count | Should -Be 1
+        $labLocal[0].Classification.currentAccess | Should -Be 'local-only'
+        $labLocal[0].Classification.allowedPrincipalTypes | Should -Be @('local-host')
         @($classifications | Where-Object { -not (Test-DuneRouteCapabilityCompatibility $_) }).Count |
             Should -Be 0
         @($classifications | Where-Object { $_.lifecycle -notin @('read','reversible-write','transactional-write','destructive') }).Count |
@@ -241,7 +246,7 @@ Describe 'Complete route classification' {
         @($script:DuneRoutes | Where-Object Path -eq '/api/server/name').Classification.capabilityId |
             Should -Be 'settings.game-server'
         $mapReadRoutes = @($script:DuneRoutes | Where-Object {
-            $_.Path -like '/api/v1/maps/*'
+            $_.Path -like '/api/v1/maps/*' -and $_.SourceFile -eq 'Maps.ps1'
         })
         $mapReadRoutes.Count | Should -Be 3
         @($mapReadRoutes | Where-Object {
@@ -249,10 +254,20 @@ Describe 'Complete route classification' {
             $_.Classification.lifecycle -ne 'read' -or
             $_.Classification.currentAccess -ne 'owner-admin'
         }).Count | Should -Be 0
+        $atlasRoutes = @($script:DuneRoutes | Where-Object SourceFile -eq 'Atlas.ps1')
+        $atlasRoutes.Count | Should -Be 4
+        foreach ($atlasRoute in $atlasRoutes) {
+            $atlasRoute.Classification.capabilityId | Should -Be 'map.observer'
+            $atlasRoute.Classification.currentAccess | Should -Be 'owner-admin'
+            $atlasRoute.LocalOnly | Should -BeFalse
+            (Test-DuneRoutePrincipalAccess -Route $atlasRoute -Principal @{type='portal-account';role='admin'}) | Should -BeTrue
+            (Test-DuneRoutePrincipalAccess -Route $atlasRoute -Principal @{type='portal-account';role='member'}) | Should -BeFalse
+            (Test-DuneRoutePrincipalAccess -Route $atlasRoute -Principal @{type='linked-player'}) | Should -BeFalse
+        }
         $mapView = @((Get-DuneCapabilityRegistry).capabilities | Where-Object id -eq 'map.view')[0]
         $mapLiveCache = @((Get-DuneCapabilityRegistry).capabilities | Where-Object id -eq 'map.live-cache')[0]
         @($mapView.allowedPrincipals | Sort-Object) | Should -Be @('admin','local-host','owner')
-        @($mapLiveCache.allowedPrincipals | Sort-Object) | Should -Be @('admin','local-host','owner')
+        @($mapLiveCache.allowedPrincipals | Sort-Object) | Should -Be @('admin','linked-player','local-host','owner')
         $mapRoute = $mapReadRoutes[0]
         (Test-DuneRoutePrincipalAccess -Route $mapRoute -Principal @{
             type = 'portal-account'; role = 'member'
@@ -334,7 +349,7 @@ $result = @{
         $LASTEXITCODE | Should -Be 0 -Because ($output -join [Environment]::NewLine)
         $resultLine = @($output | Where-Object { [string]$_ -like 'ROUTE_RESULT:*' })[-1]
         $result = ([string]$resultLine).Substring('ROUTE_RESULT:'.Length) | ConvertFrom-Json
-        $result.total | Should -Be 384
+        $result.total | Should -Be 441
         $result.unclassified | Should -Be 0
         $result.incompatible | Should -Be 0
         $result.podsCleanup | Should -Be 1

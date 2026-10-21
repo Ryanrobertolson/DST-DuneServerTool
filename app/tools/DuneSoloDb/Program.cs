@@ -1,4 +1,4 @@
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
@@ -20,11 +20,11 @@ internal static partial class Program
     private static readonly IReadOnlyDictionary<string, int> KnownStackLimits =
         new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
         {
-            ["Ammo"] = 500,
-            ["HeavyAmmo"] = 500,
-            ["InfantryRocketAmmo"] = 500,
-            ["Napalm"] = 500,
-            ["RocketAmmo"] = 500,
+            ["Ammo"] = 1000,
+            ["HeavyAmmo"] = 1000,
+            ["InfantryRocketAmmo"] = 250,
+            ["Napalm"] = 1000,
+            ["RocketAmmo"] = 250,
             ["SolarisCoin"] = int.MaxValue,
             ["AntiRadiationPill"] = 20
         };
@@ -61,7 +61,18 @@ internal static partial class Program
             var command = RequireValue(options, "command").ToLowerInvariant();
             object result = command switch
             {
+                "grant-legitimate-customization" => GrantLegitimateCustomization(Require(options, "input"),
+                    Require(options, "safety-backup"), Require(options, "adapter"), Require(options, "reviewed-catalog"),
+                    RequireValue(options, "customization-id")),
+                "character-xp" => ChangeCharacterXp(Require(options, "input"), Require(options, "safety-backup"),
+                    Require(options, "adapter"), Require(options, "levels"), RequireValue(options, "action"),
+                    ParseBalance(RequireValue(options, "amount"), "Character XP")),
                 "diagnostics" => ExportDiagnostics(Require(options, "input")),
+                "codex" => ReadCodex(Require(options, "input")),
+                "grant-codex" => GrantCodex(Require(options, "input"), Require(options, "safety-backup"), Require(options, "catalog"), Require(options, "selection")),
+                "faction-progression" => SetFactionProgression(Require(options,"input"), Require(options,"safety-backup"),
+                    Require(options,"adapter"), Require(options,"nodes"), RequireValue(options,"faction"),
+                    RequireValue(options,"action"), ParseBalance(RequireValue(options,"amount"),"Faction reputation")),
                 "reset-specialization-rewards" => ResetSpecializationRewards(
                     Require(options, "input"), Require(options, "safety-backup"),
                     Require(options, "adapter"), Require(options, "keystones"), RequireValue(options, "track")),
@@ -119,6 +130,7 @@ internal static partial class Program
                     Require(options, "safety-backup"),
                     ParseItemId(RequireValue(options, "item-id"), "Solo item id"),
                     Require(options, "adapter")),
+                "repair-equipment" => RepairEquipment(Require(options, "input"), Require(options, "safety-backup"), Require(options, "catalog"), RequireValue(options, "destination")),
                 "set-weapon-ammo" => SetWeaponAmmo(
                     Require(options, "input"),
                     Require(options, "safety-backup"),
@@ -128,6 +140,16 @@ internal static partial class Program
                 "max-augment-attributes" => MaxAugmentAttributes(
                     Require(options, "input"),
                     Require(options, "safety-backup")),
+                "unlock-main-quest" => UnlockMainQuest(
+                    Require(options, "input"), Require(options, "safety-backup"),
+                    Require(options, "adapter"), Require(options, "tags"),
+                    RequireValue(options, "quest")),
+                "unlock-testing-stations" => UnlockTestingStations(
+                    Require(options, "input"), Require(options, "safety-backup"),
+                    Require(options, "adapter"), RequireValue(options, "station")),
+                "unlock-trainer" => UnlockTrainer(
+                    Require(options, "input"), Require(options, "safety-backup"),
+                    Require(options, "adapter"), Require(options, "tags"), RequireValue(options, "job")),
                 "max-specializations" => MaxSpecializations(
                     Require(options, "input"),
                     Require(options, "safety-backup"),
@@ -145,14 +167,14 @@ internal static partial class Program
                     Require(options, "input"),
                     Require(options, "safety-backup"),
                     Require(options, "adapter"),
-                    Require(options, "skills")),
+                    Require(options, "skills"), Require(options, "tags")),
                 "set-progression-points" => SetProgressionPoints(
                     Require(options, "input"),
                     Require(options, "safety-backup"),
                     Require(options, "adapter"),
                     ParseBalance(RequireValue(options, "skill-points"), "Skill points"),
                     ParseBalance(RequireValue(options, "intel"), "Intel points")),
-                "self-test" => SelfTest(),
+                "self-test" => SelfTest(options.TryGetValue("adapter", out var selfTestAdapter) ? selfTestAdapter : null),
                 _ => throw new ArgumentException($"Unknown command: {command}")
             };
             WriteJson(result);
@@ -173,7 +195,7 @@ internal static partial class Program
         string catalogPath,
         bool requireGameClosed = true)
     {
-        if (ammo > 2_000_000_000)
+        if (ammo < 0 || ammo > 2_000_000_000)
         {
             throw new InvalidDataException("Ammo must be between 0 and 2000000000.");
         }
@@ -211,43 +233,41 @@ internal static partial class Program
                     lookup.CommandText = """
                         SELECT items.template_id,
                                items.inventory_id,
-                               inventories.actor_id
+                               inventories.actor_id,
+                               json(items.stats)
                         FROM items
                         JOIN inventories ON inventories.id = items.inventory_id
                         WHERE items.id = $item
-                          AND json_valid(items.stats)
-                          AND json_type(items.stats, '$.FWeaponItemStats[1].CurrentAmmo')
-                              IN ('integer', 'real');
+                          AND json_valid(items.stats);
                         """;
                     lookup.Parameters.AddWithValue("$item", itemId);
                     using var lookupReader = lookup.ExecuteReader();
                     if (!lookupReader.Read())
                     {
                         throw new InvalidDataException(
-                            "The selected ranged weapon no longer has an editable CurrentAmmo value.");
+                            "The selected item is missing or has invalid saved stats. Refresh and try again.");
                     }
                     templateId = lookupReader.GetString(0);
                     var inventoryId = lookupReader.GetInt64(1);
                     var actorId = lookupReader.IsDBNull(2) ? 0 : lookupReader.GetInt64(2);
+                    var originalStats = lookupReader.GetString(3);
                     lookupReader.Close();
                     if (!supportedInventories.Contains(inventoryId) && actorId != pawnId)
                     {
                         throw new InvalidDataException(
                             "The selected ranged weapon is not in a supported Solo inventory.");
                     }
+                    if (!TryReadWeaponAmmo(originalStats, templateId, catalog, out _))
+                        throw new InvalidDataException("The selected item is not an editable ranged weapon. Refresh and try again.");
                     var affected = ExecuteNonQuery(
                         connection,
                         """
                         UPDATE items
-                        SET stats = json_set(
-                                stats,
-                                '$.FWeaponItemStats[1].CurrentAmmo',
-                                $ammo
-                            ),
+                        SET stats = json($stats),
                             is_new = 1
                         WHERE id = $item;
                         """,
-                        ("$ammo", ammo),
+                        ("$stats", WithWeaponAmmo(originalStats, ammo)),
                         ("$item", itemId));
                     if (affected != 1)
                     {
@@ -756,7 +776,8 @@ internal static partial class Program
                         """
                         UPDATE items
                         SET stats = json_set(
-                            stats,
+                            CASE WHEN json_type(stats, '$.FFillableItemStats[1]') = 'object' THEN stats
+                            ELSE json_set(stats, '$.FFillableItemStats', json('[[],{}]')) END,
                             '$.FFillableItemStats[1].CurrentAmount',
                             $capacity
                         ),
@@ -901,7 +922,8 @@ internal static partial class Program
                             WHERE inventory_id = $inventory
                               AND template_id = $template
                               AND quality_level = $quality
-                              AND stack_size < $stackMax
+                              AND stack_size BETWEEN 0 AND $stackMax - 1
+                              AND json_type(COALESCE(stats, '{}'), '$.FAugmentedItemStats') IS NULL
                             ORDER BY position_index, id;
                             """;
                         existingCommand.Parameters.AddWithValue("$inventory", destination.Id);
@@ -1044,8 +1066,10 @@ internal static partial class Program
             }
         }
 
-    private static object SelfTest()
+    private static object SelfTest(string? retailAdapterPath = null)
     {
+        SelfTestCosmeticOwnership();
+        SelfTestLegitimateCustomizations();
         var root = Path.Combine(Path.GetTempPath(), $"dune-solo-self-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(root);
         try
@@ -1085,7 +1109,7 @@ internal static partial class Program
                     INSERT INTO actors (id, class, properties) VALUES (
                         10,
                         'PlayerPawn',
-                        jsonb('{"TechKnowledgePlayerComponent":{"m_TechKnowledgePoints":0,"m_TechKnowledge":{"m_TechKnowledgeData":[]}},"KeystonePlayerComponent":{"m_PurchasedKeystoneIDs":[]}}')
+                        jsonb('{"CraftingRecipesLibraryActorComponent":{"m_KnownItemRecipes":[{"BaseRecipeId":{"Name":"ExistingRecipe"},"m_QualityLevel":2,"m_NumberOfRecipeUses":7,"m_bIsLimitedUseRecipe":true}]},"TechKnowledgePlayerComponent":{"m_TechKnowledgePoints":0,"m_TechKnowledge":{"m_TechKnowledgeData":[]}},"KeystonePlayerComponent":{"m_PurchasedKeystoneIDs":[]}}')
                     );
                     INSERT INTO actors (id, class, properties) VALUES (
                         20,
@@ -1285,7 +1309,7 @@ internal static partial class Program
                         'HighCapacityLiterjon_06',
                         0,
                         0,
-                        '{"FItemStackAndDurabilityStats":[[],{}],"FFillableItemStats":[[],{"CurrentAmount":0.0}]}',
+                        '{"FItemStackAndDurabilityStats":[[],{}]}',
                         0
                     );
                     INSERT INTO items VALUES (
@@ -1528,7 +1552,7 @@ internal static partial class Program
                 """
                 {"destination":"inventory:2","items":[
                   {"templateId":"TestResource","quantity":12,"quality":0},
-                  {"templateId":"HeavyAmmo","quantity":501,"quality":0},
+                  {"templateId":"HeavyAmmo","quantity":1001,"quality":0},
                   {"templateId":"AntiRadiationPill","quantity":21,"quality":0}
                 ]}
                 """);
@@ -1550,6 +1574,7 @@ internal static partial class Program
                   },
                   "items":{
                     "TestResource":{"stack_max":10,"volume":1.0},
+                    "WeldingMaterial":{"stack_max":500,"volume":0.01},
                     "BuggyKnownParts":{"stack_max":1,"volume":110.0}
                   }
                 }
@@ -1602,6 +1627,7 @@ internal static partial class Program
                 throw new InvalidOperationException(
                     "Pre-augmented ranged grant stats did not preserve augments and loaded ammo.");
             }
+            TestEquipmentRepair(source, catalogPath, root);
             var catalog = ReadCatalog(catalogPath);
             if (catalog["RepairTool5"].Volume != 10d
                 || catalog["TreadwheelHull_6"].Volume != 15d
@@ -1706,7 +1732,7 @@ internal static partial class Program
                 """
                 {"destination":"inventory:2","items":[
                   {"templateId":"TestResource","quantity":12,"quality":0},
-                  {"templateId":"HeavyAmmo","quantity":501,"quality":0},
+                  {"templateId":"HeavyAmmo","quantity":1001,"quality":0},
                   {"templateId":"AntiRadiationPill","quantity":21,"quality":0}
                 ]}
                 """);
@@ -1752,12 +1778,37 @@ internal static partial class Program
                 var pillMax = ScalarLong(
                     connection,
                     "SELECT COALESCE(MAX(stack_size), 0) FROM items WHERE template_id = 'AntiRadiationPill';");
-                if (heavyQuantity != 501 || heavyRows != 2 || heavyMax != 500
+                if (heavyQuantity != 1001 || heavyRows != 2 || heavyMax != 1000
                     || pillQuantity != 21 || pillRows != 2 || pillMax != 20)
                 {
                     throw new InvalidOperationException(
                         "Picker-only stack-limit fallbacks were not applied correctly.");
                 }
+            }
+
+            File.WriteAllText(planPath, """
+                {"destination":"inventory:2","items":[
+                  {"templateId":"TestResource","quantity":13,"quality":0},
+                  {"templateId":"TestResource","quantity":7,"quality":1},
+                  {"templateId":"WeldingMaterial","quantity":450,"quality":0}
+                ]}
+                """);
+            GrantItems(target, Path.Combine(root,"safety","before-stack-fill.db"),planPath,catalogPath);
+            File.WriteAllText(planPath, """
+                {"destination":"inventory:2","items":[{"templateId":"WeldingMaterial","quantity":100,"quality":0}]}
+                """);
+            GrantItems(target, Path.Combine(root,"safety","before-stack-overflow.db"),planPath,catalogPath);
+            File.WriteAllBytes(grantedSqlite, Unwrap(ReadStable(target)).SqliteBytes);
+            using (var connection = new SqliteConnection(new SqliteConnectionStringBuilder {DataSource=grantedSqlite,Mode=SqliteOpenMode.ReadOnly,Pooling=false}.ToString()))
+            {
+                connection.Open();
+                if (ScalarLong(connection,"SELECT COUNT(*) FROM items WHERE template_id='TestResource' AND quality_level=0;") != 3
+                    || ScalarLong(connection,"SELECT SUM(stack_size) FROM items WHERE template_id='TestResource' AND quality_level=0;") != 25
+                    || ScalarLong(connection,"SELECT SUM(stack_size) FROM items WHERE template_id='TestResource' AND quality_level=1;") != 7
+                    || ScalarLong(connection,"SELECT COUNT(*) FROM items WHERE template_id='WeldingMaterial';") != 2
+                    || ScalarLong(connection,"SELECT MAX(stack_size) FROM items WHERE template_id='WeldingMaterial';") != 500
+                    || ScalarLong(connection,"SELECT SUM(stack_size) FROM items WHERE template_id='WeldingMaterial';") != 550)
+                    throw new InvalidOperationException("Stack grants failed to fill existing stacks, split overflow or preserve quality.");
             }
 
             File.WriteAllText(
@@ -2260,7 +2311,7 @@ internal static partial class Program
                   "specializations":{
                     "max_level":100,
                     "max_xp":44182,
-                    "tracks":{"Combat":0,"Crafting":1,"Exploration":2,"Gathering":3,"Sabotage":4}
+                    "tracks":{"Combat":4,"Crafting":1,"Exploration":3,"Gathering":2,"Sabotage":5}
                   },
                   "find_the_fremen":{
                     "nodes":["DA_MQ_FindTheFremen","DA_MQ_FindTheFremen.FirstTest"],
@@ -2287,6 +2338,8 @@ internal static partial class Program
                   }
                 }
                 """.Replace("__SCHEMA_FINGERPRINT__", selfTestFingerprint));
+            SelfTestAmmoEquipment(root, target, catalogPath);
+            SelfTestCharacterXp(root, target, adapterPath);
             var beforeNpe = InspectPath(target, adapterPath: adapterPath).Progression;
             if (beforeNpe.NpeNodesTotal != 2 || beforeNpe.NpeNodesComplete != 0)
             {
@@ -2315,13 +2368,20 @@ internal static partial class Program
                 throw new InvalidOperationException(
                     "Generic water-container detection or stillsuit exclusion failed.");
             }
+            if (retailAdapterPath is not null)
+            {
+                var shipped = JsonNode.Parse(File.ReadAllText(retailAdapterPath))!.AsObject();
+                var fixture = JsonNode.Parse(File.ReadAllText(adapterPath))!.AsObject();
+                fixture["specializations"] = shipped["specializations"]!.DeepClone();
+                File.WriteAllText(adapterPath, fixture.ToJsonString());
+            }
             var keystonePath = Path.Combine(root, "keystones.json");
             File.WriteAllText(
                 keystonePath,
                 """
                 {
                   "1":{"track":"Combat","level":1,"name":"DA_CombatKeystone_SkillPoint_Major"},
-                  "2":{"track":"Crafting","level":1,"name":"DA_CraftingKeystone_Test"}
+                  "2":{"track":"Crafting","level":1,"name":"DA_CraftingKeystone_Test","player_tags":["Character.Keystone.SelfTest.Effect"],"recipes":[{"id":"GrantedRecipe","quality":0,"uses":0}]}
                 }
                 """);
             var skillsPath = Path.Combine(root, "skills.json");
@@ -2338,6 +2398,26 @@ internal static partial class Program
                   ]
                 }
                 """);
+            var journeyTagsPath = Path.Combine(root, "journey-tags.json");
+            SelfTestTrainers(root, target, adapterPath, skillsPath);
+            SelfTestTestingStations(root, target, adapterPath);
+            // Use the same node-to-tag shape as the shipped catalog.
+            File.WriteAllText(journeyTagsPath,
+                """{"journey_node_tags":{"DA_MQ_ANewBeginning":["Journey.MainQuest.SelfTest"]}}""");
+            var questBackup = Path.Combine(root, "safety", "before-main-quest.db");
+            var questBefore = File.ReadAllBytes(target);
+            UnlockMainQuest(target, questBackup, adapterPath, journeyTagsPath, "DA_MQ_ANewBeginning");
+            if (!File.ReadAllBytes(questBackup).SequenceEqual(questBefore))
+                throw new InvalidOperationException("Main quest backup did not retain the original save.");
+            var questStable = SHA256.HashData(File.ReadAllBytes(target));
+            foreach (var unsupportedQuest in new[] { "DA_MQ_Unknown", "DA_MQ_TheGreatConvention" })
+            {
+                var questRejected = false;
+                try { UnlockMainQuest(target, Path.Combine(root, "safety", "rejected-main-quest.db"), adapterPath, journeyTagsPath, unsupportedQuest); }
+                catch (Exception ex) when (ex is ArgumentException or InvalidDataException) { questRejected = true; }
+                if (!questRejected || !SHA256.HashData(File.ReadAllBytes(target)).SequenceEqual(questStable))
+                    throw new InvalidOperationException("Unsupported or absent main quest did not fail closed.");
+            }
             MaxSpecializations(
                 target,
                 Path.Combine(root, "safety", "before-spec.db"),
@@ -2363,6 +2443,32 @@ internal static partial class Program
                 321,
                 654);
             var progressionInspection = InspectPath(target, adapterPath: adapterPath);
+            // Diagnostics include only safe progression tags, so assert the
+            // effect using a read-only unwrapped snapshot instead.
+            bool HasTestEffect()
+            {
+                var snapshot = Path.Combine(root, "effect-check.sqlite");
+                File.WriteAllBytes(snapshot, Unwrap(File.ReadAllBytes(target)).SqliteBytes);
+                using var check = OpenWritable(snapshot);
+                return ScalarLong(check, "SELECT COUNT(*) FROM player_tags WHERE character_id=1 AND tag='Character.Keystone.SelfTest.Effect';") == 1;
+            }
+            if (!HasTestEffect())
+                throw new InvalidOperationException("Max marked the reward purchased without its effect tag.");
+            void VerifyTestRecipes()
+            {
+                var snapshot = Path.Combine(root, "recipe-check.sqlite");
+                File.WriteAllBytes(snapshot, Unwrap(File.ReadAllBytes(target)).SqliteBytes);
+                using var check = OpenWritable(snapshot);
+                var recipes = ReadActorProperties(check, 10)["CraftingRecipesLibraryActorComponent"]?["m_KnownItemRecipes"] as JsonArray;
+                if (recipes?.Count != 2
+                    || recipes[0]?["BaseRecipeId"]?["Name"]?.GetValue<string>() != "ExistingRecipe"
+                    || GetInt(recipes[0] as JsonObject, "m_NumberOfRecipeUses") != 7
+                    || recipes[1]?["BaseRecipeId"]?["Name"]?.GetValue<string>() != "GrantedRecipe"
+                    || GetInt(recipes[1] as JsonObject, "m_NumberOfRecipeUses") != 0
+                    || recipes[1]?["m_bIsLimitedUseRecipe"]?.GetValue<bool>() != false)
+                    throw new InvalidOperationException("Max recipe grant changed an existing recipe or failed to grant unlimited use.");
+            }
+            VerifyTestRecipes();
             if (progressionInspection.Progression.Specializations.Length != 5
                 || progressionInspection.Progression.PurchasedRewards != 2
                 || progressionInspection.Progression.FremenNodesComplete != 2
@@ -2390,6 +2496,28 @@ internal static partial class Program
             SetSpecialization(target, Path.Combine(root, "safety", "before-zero-spec.db"), adapterPath, "Crafting", 0);
             if (InspectPath(target).Progression.Specializations.Single(track => track.TrackType == 1).Level != 0)
                 throw new InvalidOperationException("Solo specialization did not reach zero.");
+            foreach (var expected in new[] { (Name: "Crafting", Id: 1), (Name: "Gathering", Id: 2),
+                (Name: "Exploration", Id: 3), (Name: "Combat", Id: 4), (Name: "Sabotage", Id: 5) })
+            {
+                var beforeTrack = InspectPath(target).Progression;
+                SetSpecialization(target, Path.Combine(root, "safety", $"before-track-{expected.Id}.db"), adapterPath, expected.Name, 43);
+                var afterTrack = InspectPath(target).Progression;
+                if (afterTrack.Specializations.Single(t => t.TrackType == expected.Id).Level != 43
+                    || !beforeTrack.Specializations.Where(t => t.TrackType != expected.Id)
+                        .SequenceEqual(afterTrack.Specializations.Where(t => t.TrackType != expected.Id)))
+                    throw new InvalidOperationException($"Retail {expected.Name} targeted the wrong track.");
+            }
+            // Reproduce the reported saved level before exercising the reset.
+            SetSpecialization(target, Path.Combine(root, "safety", "before-sabotage-77.db"), adapterPath, "Sabotage", 77);
+            var beforeSabotage = InspectPath(target).Progression;
+            SetSpecialization(target, Path.Combine(root, "safety", "before-sabotage-reset.db"), adapterPath, "Sabotage", 0);
+            var afterSabotage = InspectPath(target).Progression;
+            if (afterSabotage.Specializations.Single(track => track.TrackType == 5).Level != 0
+                || !beforeSabotage.Specializations.Where(track => track.TrackType != 5)
+                    .SequenceEqual(afterSabotage.Specializations.Where(track => track.TrackType != 5))
+                || afterSabotage.PurchasedRewards != beforeSabotage.PurchasedRewards
+                || afterSabotage.FremenNodesComplete != beforeSabotage.FremenNodesComplete)
+                throw new InvalidOperationException("Sabotage reset changed another track, rewards or journeys.");
             var beforeRejectedLevel = File.ReadAllBytes(target);
             foreach (var invalid in new[] { (Track: "Unknown", Level: 20L), (Track: "Crafting", Level: 101L) })
             {
@@ -2411,6 +2539,8 @@ internal static partial class Program
             var rewardsBefore = InspectPath(target).Progression;
             var rewardResetBackup = Path.Combine(root, "safety", "before-crafting-reward-reset.db");
             ResetSpecializationRewards(target, rewardResetBackup, adapterPath, keystonePath, "Crafting");
+            if (HasTestEffect())
+                throw new InvalidOperationException("Reward reset left its effect tag behind.");
             var rewardsAfter = InspectPath(target).Progression;
             if (rewardsAfter.PurchasedRewards != rewardsBefore.PurchasedRewards - 1
                 || rewardsAfter.KeystoneBonusSkillPoints != rewardsBefore.KeystoneBonusSkillPoints
@@ -2435,6 +2565,7 @@ internal static partial class Program
                 || afterCombatReset.PurchasedRewards != 1)
                 throw new InvalidOperationException("Skill-point reward reset did not reconcile its bonus.");
             MaxSpecializations(target, Path.Combine(root, "safety", "before-regrant.db"), adapterPath, keystonePath);
+            VerifyTestRecipes();
             var afterRegrant = InspectPath(target).Progression;
             if (afterRegrant.KeystoneBonusSkillPoints != beforeCombatReset.KeystoneBonusSkillPoints
                 || afterRegrant.UnspentSkillPoints != beforeCombatReset.UnspentSkillPoints)
@@ -2466,27 +2597,55 @@ internal static partial class Program
                 File.ReadAllText(adapterPath).Replace(
                     selfTestFingerprint,
                     new string('0', 64)));
-            var schemaTargetBefore = SHA256.HashData(File.ReadAllBytes(target));
+            // A stale baseline hash must not block a compatible save or write.
+            InspectPath(target, adapterPath: badAdapterPath);
+            EnableAllSkills(target, Path.Combine(root, "safety", "different-hash.db"), badAdapterPath, skillsPath);
+
+            var divergentSqlite = Path.Combine(root, "divergent.sqlite");
+            File.WriteAllBytes(divergentSqlite, Unwrap(File.ReadAllBytes(target)).SqliteBytes);
+            using (var connection = OpenWritable(divergentSqlite))
+            {
+                ExecuteNonQuery(connection, "CREATE TABLE unrelated_future_data (id INTEGER PRIMARY KEY, value TEXT); INSERT INTO unrelated_future_data VALUES (1, 'keep'); ALTER TABLE player_state ADD COLUMN unrelated_future_value TEXT DEFAULT 'preserve';");
+            }
+            var divergentSave = Path.Combine(root, "divergent.db");
+            WrapSqlite(divergentSqlite, divergentSave);
+            var divergentInspection = InspectPath(divergentSave, adapterPath: adapterPath);
+            if (divergentInspection.SchemaFingerprint == selfTestFingerprint)
+                throw new InvalidOperationException("Schema variation fixture did not change the fingerprint.");
+            SetProgressionPoints(divergentSave, Path.Combine(root, "safety", "divergent.db"), adapterPath, 123, 456);
+            var divergentResult = InspectPath(divergentSave).Progression;
+            if (divergentResult.UnspentSkillPoints != 123 || divergentResult.Intel != 456)
+                throw new InvalidOperationException("Compatible schema variation prevented progression editing.");
+            File.WriteAllBytes(divergentSqlite, Unwrap(File.ReadAllBytes(divergentSave)).SqliteBytes);
+            using (var connection = OpenWritable(divergentSqlite))
+            {
+                if (ScalarString(connection, "SELECT value FROM unrelated_future_data;") != "keep"
+                    || ScalarString(connection, "SELECT unrelated_future_value FROM player_state;") != "preserve")
+                    throw new InvalidOperationException("Progression editing changed unrelated data.");
+                ExecuteNonQuery(connection, "ALTER TABLE specialization_tracks RENAME COLUMN xp_amount TO incompatible_xp;");
+            }
+            WrapSqlite(divergentSqlite, divergentSave);
+            var schemaTargetBefore = SHA256.HashData(File.ReadAllBytes(divergentSave));
             var schemaRejected = false;
             try
             {
-                EnableAllSkills(
-                    target,
+                MaxSpecializations(
+                    divergentSave,
                     Path.Combine(root, "safety", "bad-schema.db"),
-                    badAdapterPath,
-                    skillsPath);
+                    adapterPath,
+                    keystonePath);
             }
-            catch (InvalidDataException)
+            catch (SqliteException)
             {
                 schemaRejected = true;
             }
             if (!schemaRejected
                 || !CryptographicOperations.FixedTimeEquals(
                     schemaTargetBefore,
-                    SHA256.HashData(File.ReadAllBytes(target))))
+                    SHA256.HashData(File.ReadAllBytes(divergentSave))))
             {
                 throw new InvalidOperationException(
-                    "Progression schema mismatch did not fail closed.");
+                    "Missing required progression column did not fail without changing the save.");
             }
 
             using (var connection = new SqliteConnection(new SqliteConnectionStringBuilder
@@ -2545,6 +2704,10 @@ internal static partial class Program
                     "bank-storage-destination-discovery",
                     "solo-inventory-grouped-read-model",
                     "offline-weapon-ammo-update-with-safety-backup",
+                    "selected-container-equipment-repair-preserves-stats-backup-and-idempotence",
+                    "all-ranged-categories-and-unloaded-ammo-initialization",
+                    "worn-equipment-display-without-writable-destination-expansion",
+                    "invalid-ammo-stats-and-non-weapons-rejected-without-writes",
                     "offline-partial-and-full-item-deletion-with-safety-backups",
                     "retained-backup",
                     "atomic-restore-with-safety-backup",
@@ -2559,8 +2722,13 @@ internal static partial class Program
                     "truncated-blueprint-leaves-target-unchanged",
                     "offline-currency-write-with-safety-backup",
                     "offline-water-container-fills-with-safety-backups",
+                    "offline-main-quest-unlock-with-backup-and-absent-quest-rejection",
+                    "offline-trainer-unlock-preserves-skills-and-other-contracts-with-backup",
+                    "offline-all-six-testing-stations-preserve-higher-progress-repeat-backup-and-restore",
                     "offline-specialization-max-with-rewards",
                     "offline-specialization-lowering-preserves-rewards-and-backup",
+                    "retail-all-five-track-targets-preserve-other-tracks",
+                    "retail-sabotage-77-reset-preserves-rewards-and-journeys",
                     "invalid-specialization-edit-leaves-save-unchanged",
                     "read-only-solo-diagnostics-excludes-identities-and-paths",
                     "offline-track-reward-reset-preserves-levels-other-tracks-and-journeys",
@@ -2571,8 +2739,12 @@ internal static partial class Program
                     "offline-solo-npe-completion",
                     "offline-enable-all-skills-preserves-unknowns",
                     "offline-exact-progression-points",
+                    "offline-character-xp-preserves-bonuses-and-spent-intel",
+                    "character-xp-reduction-protects-allocated-skills-and-original-save",
                     "progression-compatible-schema-accepted",
-                    "progression-schema-mismatch-fails-closed",
+                    "unrelated-schema-changes-allow-inspection-and-verified-write",
+                    "unrelated-schema-data-preserved",
+                    "missing-required-column-leaves-save-unchanged",
                     "invalid-restore-leaves-target-unchanged"
                 }
             };
@@ -2795,11 +2967,14 @@ internal static partial class Program
         var inventories = hasPlayerState
             ? ReadInventoryDestinations(connection, catalog)
             : Array.Empty<InventoryDestination>();
+        var displayInventories = hasPlayerState
+            ? inventories.Concat(ReadCharacterEquipment(connection)).ToArray()
+            : inventories;
         var inventoryItems = hasPlayerState
-            ? ReadInventoryItemGroups(connection, inventories, catalog)
+            ? ReadInventoryItemGroups(connection, displayInventories, catalog)
             : Array.Empty<InventoryItemGroup>();
         var rangedWeapons = hasPlayerState
-            ? ReadRangedWeapons(connection, inventories, catalog)
+            ? ReadRangedWeapons(connection, displayInventories, catalog)
             : Array.Empty<RangedWeapon>();
         var hasCurrencies = ScalarLong(
             connection,
@@ -2859,11 +3034,10 @@ internal static partial class Program
 
         var schemaFingerprint = Convert.ToHexString(
             SHA256.HashData(Encoding.UTF8.GetBytes(schema.ToString()))).ToLowerInvariant();
-        if (adapter is not null && !adapter.SchemaFingerprints.Contains(schemaFingerprint))
-        {
-            throw new InvalidDataException(
-                $"Solo adapter '{adapter.Id}' schema mismatch: expected one of {string.Join(", ", adapter.SchemaFingerprints.Order())}, found {schemaFingerprint}.");
-        }
+        // Keep the whole-database fingerprint for diagnostics. Unrelated game
+        // tables/columns are not a compatibility contract for DST operations.
+        // Queries and mutation verification validate the fields each operation
+        // actually uses; mutations run on a temporary database before restore.
 
         return new Inspection(
             Ok: true,
@@ -2884,7 +3058,8 @@ internal static partial class Program
             RangedWeapons: rangedWeapons,
             Currencies: currencies,
             Fillables: fillables,
-            Progression: progression);
+            Progression: progression,
+            Cosmetics: ReadCosmeticOwnership(connection, inventoryItems));
     }
 
     private static InventoryDestination[] ReadInventoryDestinations(
@@ -3111,16 +3286,23 @@ internal static partial class Program
                 var displayName = result.TryGetValue(property.Name, out var existing)
                     ? existing.DisplayName
                     : property.Name;
-                result[property.Name] = new CatalogRule(stackMax, volume, hasVolume, displayName);
+                var category = value.TryGetProperty("category", out var categoryElement)
+                    ? categoryElement.GetString() ?? string.Empty : string.Empty;
+                var schematic = value.TryGetProperty("is_schematic", out var schematicElement)
+                    && schematicElement.ValueKind == JsonValueKind.True;
+                result[property.Name] = new CatalogRule(stackMax, volume, hasVolume, displayName, category, schematic);
             }
         }
         foreach (var (templateId, stackMax) in KnownStackLimits)
         {
-            if (result.TryGetValue(templateId, out var rule))
+            if (result.TryGetValue(templateId, out var rule)
+                && (!document.RootElement.TryGetProperty("items", out var catalogItems)
+                    || !catalogItems.TryGetProperty(templateId, out var catalogItem)
+                    || !catalogItem.TryGetProperty("stack_max", out _)))
             {
                 result[templateId] = rule with
                 {
-                    StackMax = Math.Max(rule.StackMax, stackMax)
+                    StackMax = stackMax
                 };
             }
         }
@@ -3250,7 +3432,6 @@ internal static partial class Program
             FROM items
             JOIN inventories ON inventories.id = items.inventory_id
             WHERE inventories.actor_id = $pawn
-              AND json_type(items.stats, '$.FFillableItemStats[1]') = 'object'
               AND (
                   lower(items.template_id) LIKE '%literjon%'
                   OR lower(items.template_id) LIKE '%dewpack%'
@@ -3359,18 +3540,13 @@ internal static partial class Program
         command.CommandText = """
             SELECT items.id,
                    items.template_id,
-                   CAST(json_extract(
-                       items.stats,
-                       '$.FWeaponItemStats[1].CurrentAmmo'
-                   ) AS INTEGER),
+                   json(items.stats),
                    inventories.id,
                    inventories.actor_id,
                    inventories.inventory_type
             FROM items
             JOIN inventories ON inventories.id = items.inventory_id
             WHERE json_valid(items.stats)
-              AND json_type(items.stats, '$.FWeaponItemStats[1].CurrentAmmo')
-                  IN ('integer', 'real')
             ORDER BY LOWER(items.template_id), items.id;
             """;
         using var reader = command.ExecuteReader();
@@ -3384,6 +3560,8 @@ internal static partial class Program
                 continue;
             }
             var templateId = reader.GetString(1);
+            if (!TryReadWeaponAmmo(reader.GetString(2), templateId, catalog, out var ammo))
+                continue;
             var displayName = catalog is not null
                 && catalog.TryGetValue(templateId, out var rule)
                 ? rule.DisplayName
@@ -3398,7 +3576,7 @@ internal static partial class Program
                 DestinationLabel: destinationLabel,
                 TemplateId: templateId,
                 DisplayName: displayName,
-                CurrentAmmo: reader.GetInt64(2)));
+                CurrentAmmo: ammo));
         }
         return results.ToArray();
     }
@@ -3523,7 +3701,8 @@ internal static partial class Program
         RangedWeapon[] RangedWeapons,
         CurrencyBalances Currencies,
         FillableItem[] Fillables,
-        ProgressionSummary Progression);
+        ProgressionSummary Progression,
+        CosmeticOwnership Cosmetics);
 
     private sealed record WrappedDatabase(
         uint WrapperVersion,
@@ -3572,7 +3751,9 @@ internal static partial class Program
         int StackMax,
         double Volume,
         bool HasVolume,
-        string DisplayName);
+        string DisplayName,
+        string Category = "",
+        bool IsSchematic = false);
 
     private sealed record CurrencyBalances(
         long Solari,

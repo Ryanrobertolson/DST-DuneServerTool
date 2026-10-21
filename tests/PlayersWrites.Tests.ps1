@@ -1,4 +1,4 @@
-# Tests pure-function helpers in PlayersWrites.ps1 and GameplayPlayers.ps1.
+﻿# Tests pure-function helpers in PlayersWrites.ps1 and GameplayPlayers.ps1.
 # No DB / network — all in-memory.
 
 BeforeAll {
@@ -147,12 +147,13 @@ Describe 'Resolve-DuneRepairDurabilityTarget' -Tag 'Pure' {
     It 'keeps no-current empty durability blocks untouched' {
         Resolve-DuneRepairDurabilityTarget -CatalogMax 0 -ItemMax 0 -ItemCurrent 0 -ItemDecayedMax 0 -HasCurrent $false | Should -Be 0
     }
-    It 'repairs current-only zero or low durability items to 100' {
-        Resolve-DuneRepairDurabilityTarget -CatalogMax 0 -ItemMax 0 -ItemCurrent 0 -ItemDecayedMax 0 -HasCurrent $true | Should -Be 100
-        Resolve-DuneRepairDurabilityTarget -CatalogMax 0 -ItemMax 0 -ItemCurrent 50 -ItemDecayedMax 0 -HasCurrent $true | Should -Be 100
+    It 'does not invent a maximum from only a current durability value' {
+        Resolve-DuneRepairDurabilityTarget -CatalogMax 0 -ItemMax 0 -ItemCurrent 0 -ItemDecayedMax 0 -HasCurrent $true | Should -Be 0
+        Resolve-DuneRepairDurabilityTarget -CatalogMax 0 -ItemMax 0 -ItemCurrent 50 -ItemDecayedMax 0 -HasCurrent $true | Should -Be 0
     }
-    It 'rounds current-only values between 100 and 200 up to 200' {
-        Resolve-DuneRepairDurabilityTarget -CatalogMax 0 -ItemMax 0 -ItemCurrent 150 -ItemDecayedMax 0 -HasCurrent $true | Should -Be 200
+    It 'preserves an exact known maximum without rounding to an invented cap' {
+        Resolve-DuneRepairDurabilityTarget -CatalogMax 150 -ItemMax 0 -ItemCurrent 50 -ItemDecayedMax 0 -HasCurrent $true | Should -Be 150
+        Resolve-DuneRepairDurabilityTarget -CatalogMax 0 -CatalogKnown $true -ItemMax 0 -ItemCurrent 0 -ItemDecayedMax 100 -HasCurrent $true | Should -Be 0
     }
     It 'preserves known higher catalog or item caps' {
         Resolve-DuneRepairDurabilityTarget -CatalogMax 400 -ItemMax 0 -ItemCurrent 50 -ItemDecayedMax 0 -HasCurrent $true | Should -Be 400
@@ -279,6 +280,43 @@ Describe 'Invoke-DunePlayerGiveItemsBulk overflow' -Tag 'Pure' {
         $script:batchArgs | Should -BeNullOrEmpty
         $script:liveArgs.AllowOverflow | Should -BeFalse
         $script:liveArgs.Template | Should -Be 'Ammo'
+    }
+
+    It 'rejects a mixed online package with a Grade override before sending any items' {
+        Mock Invoke-DunePlayerGiveItem { throw 'SQL must not run for an online player' }
+        $r = Invoke-DunePlayerGiveItemsBulk -Ip '1.2.3.4' -PawnId 24 -Items @(
+            @{ template = 'Ammo'; qty = 10; quality = 0 },
+            @{ template = 'Stillsuit_Unique_Armored_06_Top'; qty = 1; quality = 5 }
+        )
+        $r.ok | Should -BeFalse
+        $r.error | Should -Match 'Grade requires the player to be offline'
+        $script:batchArgs | Should -BeNullOrEmpty
+        $script:liveArgs | Should -BeNullOrEmpty
+        Should -Invoke Invoke-DunePlayerGiveItem -Times 0
+    }
+
+    It 'never falls back to SQL when the online player cannot be resolved' {
+        Mock Resolve-DuneFlsIdOrError { return @{ ok = $false; error = 'Player lookup failed.' } }
+        Mock Invoke-DunePlayerGiveItem { throw 'SQL must not run for an online player' }
+        $r = Invoke-DunePlayerGiveItemsBulk -Ip '1.2.3.4' -PawnId 24 -Items @(
+            @{ template = 'Stillsuit_Unique_Armored_06_Top'; qty = 1; quality = 0 }
+        )
+        $r.ok | Should -BeFalse
+        $r.error | Should -Be 'Player lookup failed.'
+        Should -Invoke Invoke-DunePlayerGiveItem -Times 0
+    }
+
+    It 'preserves the Mk6 template and Grade 5 for an offline grant' {
+        Mock Test-DunePlayerOffline { return @{ ok = $true } }
+        Mock Invoke-DunePlayerGiveItem { return @{ ok = $true; message = 'Saved offline.' } }
+        $r = Invoke-DunePlayerGiveItemsBulk -Ip '1.2.3.4' -PawnId 24 -Items @(
+            @{ template = 'Stillsuit_Unique_Armored_06_Top'; qty = 1; quality = 5 }
+        )
+        $r.ok | Should -BeTrue
+        $r.results[0].path | Should -Be 'sql'
+        Should -Invoke Invoke-DunePlayerGiveItem -Times 1 -ParameterFilter {
+            $Template -eq 'Stillsuit_Unique_Armored_06_Top' -and $Quality -eq 5
+        }
     }
 }
 
@@ -1120,5 +1158,154 @@ Describe 'Get-DuneTeleportDestinationById' -Tag 'Pure' {
     }
     It 'returns $null for an unknown id' {
         Get-DuneTeleportDestinationById -Id 'atlantis' | Should -BeNullOrEmpty
+    }
+}
+
+
+Describe 'Invoke-DunePlayerGrantBuildingSets' {
+    BeforeEach {
+        $script:online = 'Online'; $script:playerAccount = 20; $script:playersOk = $true
+        $script:owned = @('OwnedSet'); $script:ownershipOk = $true; $script:flsOk = $true
+        $script:batchOk = $true; $script:batchTemplates = @(); $script:batchCalls = 0; $script:flsCalls = 0
+        function global:Get-DunePlayersLive { @{ ok=$script:playersOk; error='status unavailable'; players=@(@{id=10;account_id=$script:playerAccount;online_status=$script:online}) } }
+        function global:Get-DuneBuildingSetGrantCatalog { @(@{template='OwnedSet'},@{template='MissingSet'}) }
+        function global:Get-DunePlayerOwnedCosmeticsLive { @{ok=$script:ownershipOk;error='ownership unavailable';owned=$script:owned} }
+        function global:Resolve-DuneFlsIdOrError { $script:flsCalls++; @{ok=$script:flsOk;fls_id='verified-player';error='missing FLS'} }
+        function global:Invoke-DuneRmqAddItemsToInventoryBatch {
+            param($FlsId,$ItemNames,$SpacingMilliseconds)
+            $script:batchCalls++; $script:batchTemplates=@($ItemNames)
+            $FlsId | Should -Be 'verified-player'; $SpacingMilliseconds | Should -Be 200
+            @{ok=$script:batchOk;message='transport failed'}
+        }
+    }
+    AfterEach {
+        foreach ($name in @('Get-DunePlayersLive','Get-DuneBuildingSetGrantCatalog','Get-DunePlayerOwnedCosmeticsLive','Resolve-DuneFlsIdOrError','Invoke-DuneRmqAddItemsToInventoryBatch')) {
+            Remove-Item "function:global:$name" -ErrorAction SilentlyContinue
+        }
+    }
+    It 'sends only missing tokens as one paced batch to one resolved FLS identity' {
+        $r=Invoke-DunePlayerGrantBuildingSets -Ip fixture -PawnId 10 -AccountId 20
+        $r.ok | Should -BeTrue; $r.already_owned | Should -Be 1; $r.granted | Should -Be 0; $r.submitted | Should -Be 1
+        $script:batchCalls | Should -Be 1; $script:flsCalls | Should -Be 1
+        $script:batchTemplates | Should -Be @('MissingSet')
+        $r.message | Should -Match 'does not confirm every unlock activated'
+    }
+    It 'skips persisted unlocks and pending inventory tokens case-insensitively' {
+        $script:owned=@('ownedset','missingSET')
+        $r=Invoke-DunePlayerGrantBuildingSets -Ip fixture -PawnId 10 -AccountId 20
+        $r.ok | Should -BeTrue; $r.requested | Should -Be 0; $r.granted | Should -Be 0
+        $script:batchCalls | Should -Be 0; $script:flsCalls | Should -Be 0
+    }
+    It 'refuses offline, logging out and unknown states' {
+        foreach ($state in @('Offline','LoggingOut','Unknown','')) {
+            $script:online=$state
+            (Invoke-DunePlayerGrantBuildingSets -Ip fixture -PawnId 10 -AccountId 20).ok | Should -BeFalse
+        }
+        $script:batchCalls | Should -Be 0
+    }
+    It 'refuses an account/pawn mismatch' {
+        $script:playerAccount=99
+        (Invoke-DunePlayerGrantBuildingSets -Ip fixture -PawnId 10 -AccountId 20).ok | Should -BeFalse
+        $script:batchCalls | Should -Be 0
+    }
+    It 'fails closed when live status, ownership or FLS cannot be verified' {
+        $script:playersOk=$false
+        (Invoke-DunePlayerGrantBuildingSets -Ip fixture -PawnId 10 -AccountId 20).ok | Should -BeFalse
+        $script:playersOk=$true; $script:ownershipOk=$false
+        (Invoke-DunePlayerGrantBuildingSets -Ip fixture -PawnId 10 -AccountId 20).ok | Should -BeFalse
+        $script:ownershipOk=$true; $script:flsOk=$false
+        (Invoke-DunePlayerGrantBuildingSets -Ip fixture -PawnId 10 -AccountId 20).ok | Should -BeFalse
+        $script:batchCalls | Should -Be 0
+    }
+    It 'reports uncertain partial delivery without claiming unlocks or retrying' {
+        $script:batchOk=$false
+        $r=Invoke-DunePlayerGrantBuildingSets -Ip fixture -PawnId 10 -AccountId 20
+        $r.ok | Should -BeFalse; $r.granted | Should -Be 0
+        $r.error | Should -Match 'Some tokens may have arrived'
+        $script:batchCalls | Should -Be 1
+    }
+}
+
+Describe 'Invoke-DunePlayerGrantSkins <Kind>' -ForEach @(@{Kind='armor'},@{Kind='weapon'},@{Kind='vehicle'},@{Kind='dyes'}) {
+    BeforeEach {
+        $script:online = 'Online'; $script:playerAccount = 20; $script:playersOk = $true
+        $script:owned = @('OwnedSet'); $script:ownershipOk = $true; $script:flsOk = $true
+        $script:batchOk = $true; $script:batchTemplates = @(); $script:batchCalls = 0; $script:flsCalls = 0
+        function global:Get-DunePlayersLive { @{ ok=$script:playersOk; error='status unavailable'; players=@(@{id=10;account_id=$script:playerAccount;online_status=$script:online}) } }
+        function global:Get-DuneSkinGrantCatalog { @(@{template='OwnedSet'},@{template='MissingSet'}) }
+        function global:Get-DunePlayerOwnedCosmeticsLive { @{ok=$script:ownershipOk;error='ownership unavailable';owned=$script:owned} }
+        function global:Resolve-DuneFlsIdOrError { $script:flsCalls++; @{ok=$script:flsOk;fls_id='verified-player';error='missing FLS'} }
+        function global:Invoke-DuneRmqAddItemsToInventoryBatch {
+            param($FlsId,$ItemNames,$SpacingMilliseconds)
+            $script:batchCalls++; $script:batchTemplates=@($ItemNames)
+            $FlsId | Should -Be 'verified-player'; $SpacingMilliseconds | Should -Be 200
+            @{ok=$script:batchOk;message='transport failed'}
+        }
+    }
+    AfterEach {
+        foreach ($name in @('Get-DunePlayersLive','Get-DuneSkinGrantCatalog','Get-DunePlayerOwnedCosmeticsLive','Resolve-DuneFlsIdOrError','Invoke-DuneRmqAddItemsToInventoryBatch')) {
+            Remove-Item "function:global:$name" -ErrorAction SilentlyContinue
+        }
+    }
+    It 'sends only missing tokens as one paced batch to one resolved FLS identity' {
+        $r=Invoke-DunePlayerGrantSkins -Ip fixture -PawnId 10 -AccountId 20 -Kind $Kind
+        $r.ok | Should -BeTrue; $r.already_owned | Should -Be 1; $r.granted | Should -Be 0; $r.submitted | Should -Be 1
+        $script:batchCalls | Should -Be 1; $script:flsCalls | Should -Be 1
+        $script:batchTemplates | Should -Be @('MissingSet')
+        $r.message | Should -Match 'does not confirm every unlock activated'
+    }
+    It 'skips persisted unlocks and pending inventory tokens case-insensitively' {
+        $script:owned=@('ownedset','missingSET')
+        $r=Invoke-DunePlayerGrantSkins -Ip fixture -PawnId 10 -AccountId 20 -Kind $Kind
+        $r.ok | Should -BeTrue; $r.requested | Should -Be 0; $r.granted | Should -Be 0
+        $script:batchCalls | Should -Be 0; $script:flsCalls | Should -Be 0
+    }
+    It 'refuses offline, logging out and unknown states' {
+        foreach ($state in @('Offline','LoggingOut','Unknown','')) {
+            $script:online=$state
+            (Invoke-DunePlayerGrantSkins -Ip fixture -PawnId 10 -AccountId 20 -Kind $Kind).ok | Should -BeFalse
+        }
+        $script:batchCalls | Should -Be 0
+    }
+    It 'refuses an account/pawn mismatch' {
+        $script:playerAccount=99
+        (Invoke-DunePlayerGrantSkins -Ip fixture -PawnId 10 -AccountId 20 -Kind $Kind).ok | Should -BeFalse
+        $script:batchCalls | Should -Be 0
+    }
+    It 'fails closed when live status, ownership or FLS cannot be verified' {
+        $script:playersOk=$false
+        (Invoke-DunePlayerGrantSkins -Ip fixture -PawnId 10 -AccountId 20 -Kind $Kind).ok | Should -BeFalse
+        $script:playersOk=$true; $script:ownershipOk=$false
+        (Invoke-DunePlayerGrantSkins -Ip fixture -PawnId 10 -AccountId 20 -Kind $Kind).ok | Should -BeFalse
+        $script:ownershipOk=$true; $script:flsOk=$false
+        (Invoke-DunePlayerGrantSkins -Ip fixture -PawnId 10 -AccountId 20 -Kind $Kind).ok | Should -BeFalse
+        $script:batchCalls | Should -Be 0
+    }
+    It 'reports uncertain partial delivery without claiming unlocks or retrying' {
+        $script:batchOk=$false
+        $r=Invoke-DunePlayerGrantSkins -Ip fixture -PawnId 10 -AccountId 20 -Kind $Kind
+        $r.ok | Should -BeFalse; $r.granted | Should -Be 0
+        $r.error | Should -Match 'Some tokens may have arrived'
+        $script:batchCalls | Should -Be 1
+    }
+}
+
+Describe 'Player item editor pagination' -Tag 'Pure' {
+    BeforeEach {
+        $script:detailQueries = @()
+        function global:Invoke-DuneSqlQuery {
+            param($Ip, $Sql, $ReadOnly, $MaxRows, $TimeoutSec)
+            $script:detailQueries += $Sql
+            return @{ ok = $true; columns = @('id'); rows = @() }
+        }
+    }
+    AfterEach { Remove-Item function:global:Invoke-DuneSqlQuery -ErrorAction SilentlyContinue }
+    It 'limits the selected player SQL to one page and a lookahead row' {
+        $result = Get-DunePlayerDetailLive -Ip '127.0.0.1' -PawnId 20001 -ControllerId 30001 -InventoryOffset 28
+        $result.ok | Should -BeTrue
+        $script:detailQueries[0] | Should -Match 'inv.actor_id = 20001::bigint'
+        $script:detailQueries[0] | Should -Match 'ORDER BY i.template_id, i.id'
+        $script:detailQueries[0] | Should -Match 'LIMIT 29 OFFSET 28'
+        $script:detailQueries[0] | Should -Match "AND \(i.template_id !~\* 'Emote\|\^\(D_\)\?Contract'"
     }
 }

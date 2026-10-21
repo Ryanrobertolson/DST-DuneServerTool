@@ -1,3 +1,5 @@
+import { api } from '../api/client'
+import { useSoloInstallation } from '../hooks/useInstallationMode'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link, useNavigate, useLocation, useSearch } from '../router'
@@ -28,6 +30,7 @@ type Props = {
 // sidebar collapse toggle.
 export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = true }: Props) {
   const { canAccessOwnerSurfaces } = usePortalAccess()
+  const soloOnly = useSoloInstallation()
   const navigate = useNavigate()
   const location = useLocation()
   const [open, setOpen] = useState<MenuKey | null>(null)
@@ -58,6 +61,25 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
   // null = not loaded yet / route unavailable on older backends.
   const [consoleState, setConsoleState] = useState<ConsoleState | null>(null)
   const [consoleBusy, setConsoleBusy] = useState(false)
+  const [skipIntro, setSkipIntro] = useState<boolean | null>(null)
+  const [launchPreferenceBusy, setLaunchPreferenceBusy] = useState(false)
+  const [launchPreferenceError, setLaunchPreferenceError] = useState('')
+  useEffect(() => {
+    if (!local) return
+    void api<{skipIntro: boolean}>('/api/game/launch-preferences')
+      .then(value => setSkipIntro(value.skipIntro)).catch(() => setSkipIntro(null))
+  }, [local, open])
+  const toggleSkipIntro = async () => {
+    setLaunchPreferenceBusy(true)
+    setLaunchPreferenceError('')
+    try {
+      const value = await api<{skipIntro: boolean}>('/api/game/launch-preferences', {
+        method: 'POST', body: JSON.stringify({skipIntro: !skipIntro}),
+      })
+      setSkipIntro(value.skipIntro)
+    } catch (error) { setLaunchPreferenceError(error instanceof Error ? error.message : String(error)) }
+    finally { setLaunchPreferenceBusy(false) }
+  }
 
   // Diagnostics-bundle result, surfaced so the user always learns where the
   // ZIP landed (Desktop vs. %APPDATA% fallback) or why it couldn't be built —
@@ -253,6 +275,7 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
     local: isLocalViewer(),
     windows: isWindowsViewer(),
     canAccessOwnerSurfaces,
+    soloOnly,
   })
   const mobileGroups = GROUP_ORDER.map(group => ({
     key: group,
@@ -392,7 +415,7 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
               <Icon name="ExternalLink" size={11} className="text-text-dim mt-1" />
             </a>
             <a
-              href="https://coastal-ms.github.io/DST-DuneServerTool/remote"
+              href="https://duneservertool.com/remote"
               target="_blank"
               rel="noopener noreferrer"
               onClick={() => setOpen(null)}
@@ -440,6 +463,16 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
                 </span>
               </button>
             )}
+            {local && skipIntro !== null && (
+              <button type="button" role="menuitemcheckbox" aria-checked={skipIntro}
+                disabled={launchPreferenceBusy} onClick={() => { void toggleSkipIntro() }}
+                className="w-full flex items-start gap-2 px-2.5 py-1.5 rounded text-sm text-text hover:bg-surface-2 text-left disabled:opacity-60">
+                <Icon name={skipIntro ? 'CheckSquare' : 'Square'} size={14} className="mt-0.5" />
+                <span><span className="block">Skip intro / splash screens</span>
+                  <span className="block text-[11px] text-text-dim">Applies to every Dune launch from DST</span></span>
+              </button>
+            )}
+            {launchPreferenceError && <p role="alert" className="px-2.5 text-xs text-danger">{launchPreferenceError}</p>}
             {local && autostart && autostart.available && (
               <button
                 type="button"
@@ -457,10 +490,10 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
                   <span className="block">Run at Windows startup</span>
                   <span className="block text-[11px] text-text-dim">
                     {autostart.enabled
-                      ? 'Enabled — server keeps running when you close this window'
+                      ? 'Enabled — DST keeps running when you close this window'
                       : service?.enabled
                         ? 'Disabled — closing removes DST; background service stays online'
-                        : 'Disabled — closing this window stops the server'}
+                        : soloOnly ? 'Disabled — closing this window stops DST' : 'Disabled — closing this window stops the server'}
                   </span>
                 </span>
                 {autostart.enabled && (
@@ -502,7 +535,7 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
                 className="w-full flex items-start gap-2 px-2.5 py-1.5 rounded text-sm text-text-muted hover:text-text hover:bg-surface-2 transition-colors text-left disabled:opacity-60 disabled:cursor-wait"
                 title={
                   consoleState.visible && !consoleState.minimized
-                    ? 'Hide the backend PowerShell console window. The server keeps running — log output still goes to dune-server.log.'
+                    ? 'Hide the backend PowerShell console window. DST keeps running — log output still goes to dune-server.log.'
                     : 'Bring the backend PowerShell console window to the foreground so you can watch the server work in real time.'
                 }
               >
@@ -518,7 +551,7 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
                       ? (consoleState.minimized
                           ? 'Currently minimized — click to restore to a visible window'
                           : 'Currently visible — click to hide')
-                      : 'Currently hidden — click to reveal the live server output'}
+                      : 'Currently hidden — click to reveal the live DST output'}
                   </span>
                 </span>
               </button>
@@ -550,6 +583,9 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
         <span>Supporters</span>
       </Link>
 
+      {local && <Link to="/widget" className="px-3 h-7 inline-flex items-center gap-1.5 rounded-md text-text-muted hover:text-text hover:bg-surface-2/80">
+        <Icon name="Monitor" size={14} />Widget mode
+      </Link>}
       {/* Community Discord + marketing site links, pushed to the far right of
           the menu bar. ml-auto on the first one consumes the remaining
           horizontal space so this pair sits flush right while the page groups
@@ -567,7 +603,7 @@ export function MenuBar({ sidebarCollapsed, onToggleSidebar, sidebarAvailable = 
         <Icon name="ExternalLink" size={11} className="text-text-dim" />
       </a>
       <a
-        href="https://coastal-ms.github.io/DST-DuneServerTool/"
+        href="https://duneservertool.com/"
         target="_blank"
         rel="noopener noreferrer"
         onMouseEnter={() => { if (open !== null) setOpen(null) }}

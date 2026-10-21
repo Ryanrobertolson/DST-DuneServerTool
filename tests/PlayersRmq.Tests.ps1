@@ -1,4 +1,4 @@
-# Tests pure helper behavior in PlayersRmq.ps1.
+﻿# Tests pure helper behavior in PlayersRmq.ps1.
 
 BeforeAll {
     . (Join-Path $PSScriptRoot '_TestHelpers.ps1')
@@ -7,6 +7,20 @@ BeforeAll {
 }
 
 Describe 'Resolve-DuneStackMax' -Tag 'Pure' {
+    It 'honors restored stack metadata for wire and ammunition' {
+        Resolve-DuneStackMax -Ip fixture -Template WeldingMaterial | Should -Be 500
+        Resolve-DuneStackMax -Ip fixture -Template RocketAmmo | Should -Be 250
+        Resolve-DuneStackMax -Ip fixture -Template Napalm | Should -Be 1000
+    }
+    It 'uses existing stack room before demanding another inventory slot' -ForEach @(@{Quantity=50;Fits=$true},@{Quantity=51;Fits=$false}) {
+        $script:stackCapacityQueries=0
+        Mock Invoke-DuneSqlQuery {
+            $script:stackCapacityQueries++
+            if($script:stackCapacityQueries -eq 1){return @{ok=$true;columns=@('inv_id','max_slots','max_vol');rows=@(,@('1','1','-1'))}}
+            return @{ok=$true;columns=@('t','ss','quality','augmented','vov');rows=@(,@('WeldingMaterial','450','0','false','-1'))}
+        }
+        (Test-DuneInventoryCapacity -Ip fixture -PawnId 10 -Template WeldingMaterial -Quantity $Quantity).ok | Should -Be $Fits
+    }
     BeforeEach {
         function global:Invoke-DuneSqlQuery {
             return @{ ok = $true; rows = @(@{ s = '0' }) }
@@ -22,8 +36,8 @@ Describe 'Resolve-DuneStackMax' -Tag 'Pure' {
         Resolve-DuneStackMax -Ip '1.2.3.4' -Template 'CopperBar' -Quality 0 | Should -Be 500
     }
 
-    It 'treats Light Darts as one stack per 500 items' {
-        Resolve-DuneStackMax -Ip '1.2.3.4' -Template 'Ammo' -Quality 0 | Should -Be 500
+    It 'treats Light Darts as one stack per 1000 items' {
+        Resolve-DuneStackMax -Ip '1.2.3.4' -Template 'Ammo' -Quality 0 | Should -Be 1000
     }
 
     It 'treats Iodine Pills as one stack per 20 items' {
@@ -174,8 +188,9 @@ Describe 'Invoke-DuneVehicleSpawnLive' -Tag 'Pure' {
     }
 
     It 'resolves the current transform and sends the vehicle to that location' {
+        function global:Get-DuneRegisTankSupport { param($Ip,$ActorId); @{enabled=$true} }
         $r = Invoke-DuneVehicleSpawnLive -Ip '1.2.3.4' -ActorId 42 `
-            -VehicleId 'Tank' -ActorClass '/Game/Test/BP_Tank.BP_Tank_C' `
+            -VehicleId 'Tank' -ActorClass '/Game/Dune/Systems/Vehicles/Blueprints/GroundVehicles/BP_Tank_CHOAM.BP_Tank_CHOAM_C' `
             -TemplateName 'T6_CombatFire' -Persistent $true -VerificationDelaySeconds 0
 
         $r.ok | Should -BeTrue
@@ -193,17 +208,40 @@ Describe 'Invoke-DuneVehicleSpawnLive' -Tag 'Pure' {
         $r.vehicle_survived | Should -BeTrue
     }
 
-    It 'fails when Funcom removes the vehicle after accepting the command' {
+    It 'reports accepted but unverified when the database observation cannot confirm the vehicle' {
+        function global:Get-DuneRegisTankSupport { param($Ip,$ActorId); @{enabled=$true} }
         $script:spawnSurvives = $false
 
         $r = Invoke-DuneVehicleSpawnLive -Ip '1.2.3.4' -ActorId 42 `
-            -VehicleId 'Tank' -ActorClass '/Game/Test/BP_Tank.BP_Tank_C' `
+            -VehicleId 'Tank' -ActorClass '/Game/Dune/Systems/Vehicles/Blueprints/GroundVehicles/BP_Tank_CHOAM.BP_Tank_CHOAM_C' `
             -TemplateName 'T6_CombatFire' -Persistent $true -VerificationDelaySeconds 0
 
-        $r.ok | Should -BeFalse
+        $r.ok | Should -BeTrue
         $r.permission_repaired | Should -BeTrue
         $r.vehicle_survived | Should -BeFalse
-        $r.error | Should -Match 'did not survive'
+        $r.verification_pending | Should -BeTrue
+        $r.message | Should -Match 'before granting another'
+    }
+    It 'waits past the old ten-poll window without issuing a second spawn' {
+        function global:Get-DuneRegisTankSupport { param($Ip,$ActorId); @{enabled=$true} }
+        $script:delayedRepairCount=0
+        function global:Invoke-DuneSqlQuery {
+            param($Ip,$Sql,$ReadOnly,$MaxRows,$TimeoutSec)
+            if ($Sql -match 'WITH candidate AS') {
+                $script:delayedRepairCount++
+                if ($script:delayedRepairCount -lt 12) {return @{ok=$true;columns=@('permission_actor_id');rows=@()}}
+                return @{ok=$true;columns=@('permission_actor_id');rows=@(,@('8001'))}
+            }
+            if ($Sql -match 'AS controller_id') {return @{ok=$true;columns=@('controller_id','x','y','z','qx','qy','qz','qw');rows=@(,@('99','10.5','20.25','30.75','0','0','0','1'))}}
+            if ($Sql -match 'AS max_id') {return @{ok=$true;columns=@('max_id');rows=@(,@('8000'))}}
+            return @{ok=$true;columns=@('vehicle_id');rows=@(,@('8001'))}
+        }
+        Mock Start-Sleep {}
+        $result=Invoke-DuneVehicleSpawnLive -Ip '1.2.3.4' -ActorId 42 -VehicleId 'Tank' -ActorClass '/Game/Dune/Systems/Vehicles/Blueprints/GroundVehicles/BP_Tank_CHOAM.BP_Tank_CHOAM_C' -TemplateName 'T6_CombatDart' -Persistent $true -VerificationDelaySeconds 0
+        $result.ok | Should -BeTrue
+        $result.vehicle_survived | Should -BeTrue
+        $script:delayedRepairCount | Should -Be 12
+        $script:spawnArgs.TemplateName | Should -Be 'T6_CombatDart'
     }
 
     It 'rejects transient spawns because they cannot receive durable ownership' {

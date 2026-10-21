@@ -1,4 +1,4 @@
-BeforeAll {
+﻿BeforeAll {
     . (Join-Path $PSScriptRoot '_TestHelpers.ps1')
     . (Join-Path $PSScriptRoot '_PostgresFixture.ps1')
     Import-DstLib 'Database.ps1'
@@ -87,8 +87,8 @@ AfterAll {
 
 Describe 'Shared Inventory Explorer read model' -Tag 'Pure' {
     It 'keeps the default page size when limit is omitted or malformed' {
-        (Get-DuneInventoryLimit -Value '') | Should -Be 100
-        (Get-DuneInventoryLimit -Value 'not-a-number') | Should -Be 100
+        (Get-DuneInventoryLimit -Value '') | Should -Be 28
+        (Get-DuneInventoryLimit -Value 'not-a-number') | Should -Be 28
         (Get-DuneInventoryLimit -Value '0') | Should -Be 1
         (Get-DuneInventoryLimit -Value '501') | Should -Be 500
     }
@@ -303,14 +303,15 @@ Describe 'Shared Inventory Explorer read model' -Tag 'Pure' {
     }
 
     It 'projects names-only catalog entries with null sortable metadata' {
-        $templateId = 'HarkSandbike_MeshCustomization'
-        $metadata = Get-DuneInventoryCatalogMetadataJson | ConvertFrom-Json
-        $entry = $metadata.PSObject.Properties[$templateId.ToLowerInvariant()].Value
-
-        $entry.name | Should -Be (Get-DuneGameplayItemName -TemplateId $templateId)
-        $entry.name | Should -Not -Be $templateId
-        $entry.tier | Should -BeNullOrEmpty
-        $entry.volume | Should -BeNullOrEmpty
+        $templateId = 'NamesOnlyFixture'
+        $script:DuneGameplayItemNames[$templateId] = 'Names-only fixture'
+        try {
+            $metadata = Get-DuneInventoryCatalogMetadataJson | ConvertFrom-Json
+            $entry = $metadata.PSObject.Properties[$templateId.ToLowerInvariant()].Value
+            $entry.name | Should -Be 'Names-only fixture'
+            $entry.tier | Should -BeNullOrEmpty
+            $entry.volume | Should -BeNullOrEmpty
+        } finally { $script:DuneGameplayItemNames.Remove($templateId) }
     }
 
     It 'validates entity types and supports exact demo scopes' {
@@ -908,7 +909,7 @@ INSERT INTO dune.items (id, template_id, stack_size, quality_level, stats, inven
 
         $cte = Get-DuneInventoryFilteredCteSql
         $cte | Should -Match "template_id IN \(SELECT jsonb_array_elements_text\(p\.catalog_ids::jsonb\)\)"
-        $cte | Should -Match "r\.template_id !~\* 'Emote\|Gesture'"
+        $cte | Should -Match "r\.template_id !~\* 'Emote\|Gesture\|\^\(D_\)\?Contract'"
         $cte | Should -Match "CASE inv\.inventory_type WHEN 30 THEN 'Bank Storage' ELSE 'Backpack' END"
     }
 
@@ -972,7 +973,7 @@ ORDER BY $($sort.sql)
         $sql | Should -Match 'SUM\(stack_size\)'
         $sql | Should -Match 'COUNT\(DISTINCT entity_type'
         $sql | Should -Match 'grouped\.total_volume DESC NULLS LAST, grouped\.sort_name ASC, grouped\.template_id ASC'
-        $sql | Should -Match "r\.template_id !~\* 'Emote\|Gesture'"
+        $sql | Should -Match "r\.template_id !~\* 'Emote\|Gesture\|\^\(D_\)\?Contract'"
     }
 
     It 'keeps inventory data read-only while allowing derived-cache refresh' {

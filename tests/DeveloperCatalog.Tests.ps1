@@ -1,4 +1,4 @@
-BeforeAll {
+﻿BeforeAll {
     . (Join-Path $PSScriptRoot '_TestHelpers.ps1')
     Import-DstLib 'Catalog.ps1'
     Import-DstLib 'Gameplay.ps1'
@@ -15,7 +15,7 @@ BeforeAll {
 }
 
 Describe 'Developer template catalog coverage' -Tag 'Catalog' {
-    It 'exposes every developer template' {
+    It 'preserves non-tech developer entries across item and cosmetic grants' {
         $itemIds = [System.Collections.Generic.HashSet[string]]::new(
             [System.StringComparer]::OrdinalIgnoreCase
         )

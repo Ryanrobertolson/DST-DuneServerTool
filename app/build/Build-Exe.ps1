@@ -1,4 +1,4 @@
-# Build-Exe.ps1 - Compiles app/DuneServer.ps1 into DuneServer.exe via ps2exe.
+﻿# Build-Exe.ps1 - Compiles app/DuneServer.ps1 into DuneServer.exe via ps2exe.
 #
 # Output: app/build/output/DuneServer.exe
 #
@@ -35,7 +35,7 @@
 param(
     # Product/file version. A prerelease suffix defaults artifact identity to
     # prerelease; stable product stamps can use -Prerelease for a test artifact.
-    [string]$Version = '15.2.5',
+    [string]$Version = '16.5.4',
     [string]$BuildCommit = '',
     [string]$BuildTag = '',
     [switch]$Prerelease,
@@ -102,7 +102,7 @@ Write-Host "Compiling DuneServer.exe (v$Version; prerelease=$([bool]$Prerelease)
 
 # Critical flags (v6.1.7):
 #   -noConsole=$false : console-subsystem EXE so child kubectl/ssh/etc. inherit
-#                       a console (no per-child window-flash). Script minimizes
+#                       a console (no per-child window-flash). Script hides
 #                       its own console at startup so it never visually intrudes.
 #   -STA              : required for System.Windows.Forms.MessageBox
 #   -iconFile         : taskbar / file explorer icon (also used for the EXE)

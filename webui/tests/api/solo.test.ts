@@ -36,6 +36,16 @@ function last(): FetchCall {
 }
 
 describe('Solo Mode API contracts', () => {
+  it('sends character XP separately from faction progression with a selected-profile guard', async () => {
+    await solo.setSoloCharacterXp('set', 100000, 'profile-token')
+    expect(last()).toEqual({ url: '/api/solo/progression/character-xp', method: 'PUT',
+      body: { action: 'set', amount: 100000, expectedProfileToken: 'profile-token', confirm: 'SET SOLO CHARACTER XP' } })
+  })
+  it('targets the selected main quest with the offline confirmation and profile token', async () => {
+    await solo.unlockSoloMainQuest('DA_MQ_AssassinsHandbook', 'profile-token')
+    expect(last()).toEqual({ url: '/api/solo/progression/main-quest/unlock', method: 'POST',
+      body: { quest: 'DA_MQ_AssassinsHandbook', expectedProfileToken: 'profile-token', confirm: 'UNLOCK SOLO MAIN QUEST' } })
+  })
   it('discovers profiles before connecting a selected root', async () => {
     await solo.discoverSolo('C:\\Solo\\Saved')
     expect(last()).toEqual({
@@ -43,6 +53,11 @@ describe('Solo Mode API contracts', () => {
       method: 'POST',
       body: { path: 'C:\\Solo\\Saved' },
     })
+  })
+
+  it('requests automatic discovery for the selected Xbox platform', async () => {
+    await solo.discoverSolo('', 'xbox')
+    expect(last()).toEqual({ url: '/api/solo/discover', method: 'POST', body: { path: '', platform: 'xbox' } })
   })
 
   it('connects a selected data root and optional profile', async () => {
@@ -250,4 +265,9 @@ it('exports diagnostics for the exact connected profile and sends an explicit sp
   expect(last()).toEqual({ url: '/api/solo/progression/specializations', method: 'PUT', body: { track: 'Crafting', level: 37, expectedProfileToken: 'profile-token', confirm: 'SET SOLO SPECIALIZATION' } })
   await solo.resetSoloSpecializationRewards('Crafting', 'profile-token')
   expect(last()).toEqual({ url: '/api/solo/progression/specializations/reset-rewards', method: 'POST', body: { track: 'Crafting', expectedProfileToken: 'profile-token', confirm: 'RESET SOLO SPECIALIZATION REWARDS' } })
+})
+
+it('unlocks the selected trainer for the exact connected Solo profile', async () => {
+  await solo.unlockSoloTrainer('Mentat', 'xbox-profile-token')
+  expect(last()).toEqual({ url: '/api/solo/progression/trainer/unlock', method: 'POST', body: { job: 'Mentat', expectedProfileToken: 'xbox-profile-token', confirm: 'UNLOCK SOLO TRAINER' } })
 })

@@ -1,3 +1,4 @@
+import { useSearch } from '../../../router'
 // v11.5.6 — Player section panels. One component per section nav entry
 // (Stats / Specs / Tags / History / Inventory / Actions). All sections take
 // a common props shape: the selected player + a `canWrite` flag (live DB)
@@ -8,12 +9,17 @@
 // re-fetch when `refreshKey` changes.
 
 import { useCallback, useEffect, useId, useMemo, useState, type ReactElement, type ReactNode } from 'react'
+import { RegisTankControls } from './RegisTankControls'
+import { CodexOwnership } from '../../../components/CodexOwnership'
+import { api } from '../../../api/client'
 import { Icon } from '../../../components/Icon'
+import { COSMETIC_LICENSE_NOTICE } from '../../../util/cosmeticEntitlements'
+import { SharedInventoryExplorer } from '../../../components/inventory/SharedInventoryExplorer'
 import { ItemPicker } from '../../../components/ItemPicker'
 import { AugmentPicker } from '../../../components/AugmentPicker'
 import { TagPicker } from '../../../components/TagPicker'
 import {
-  applySpecLevel, awardCharXp, awardIntel, setSpecLevel, preparePatternUpgrading, cheatScript, cleanPlayerInventory,
+  applySpecLevel, awardCharXp, awardIntel, setSpecLevel, cheatScript, cleanPlayerInventory,
   applyProgressionPreset, getProgressionPresets,
   progressionUnlock, progressionReverse,
   deleteAccount, deleteInventoryItem, deleteTutorials,
@@ -29,11 +35,11 @@ import {
   setFactionTier, setSkillPoints,
   setStarterClass, spawnVehicle, teleportToPlayer, teleportToLocation, setRespawn, getTeleportDestinations, getPlayers, updatePlayerTags, wipeCodex, resetFaction, snapshotBuilds, getFreshStartSnapshots, restoreBuilds, grantAllSkills,
   chatWhisper, isValidTemplateId, getItemCatalog, getCosmeticsCatalog, getPlayerOwnedCosmetics, filterCosmeticsCatalog, getHouseSwatchCosmetics, type CosmeticEntry,
-  parseTcnoPackageText, grantHouseSwatches, type HouseSwatchKind,
+  grantReviewedCustomization, getReviewedGrantCounts, parseTcnoPackageText, grantHouseSwatches, grantBuildingSets, getBuildingSetCosmetics, grantSkins, getSkinCosmetics, type HouseSwatchKind,
   giveItems, getItemPackages, saveItemPackage, deleteItemPackage,
   getLandsraadOverview, getLandsraadPlayerContributions, setLandsraadContribution,
   getPlayerJourneyNodes, completeJourneyNode, resetJourneyNode,
-  getTrainerCatalog, getTrainerStatus, unlockTrainer, resetTrainerSkills,
+  getTrainerCatalog, getTrainerStatus, unlockTrainer, resetTrainerSkills, unlockTestingStations,
   getMainQuestCatalog, unlockMainQuest,
   getContracts, completeContract,
   getVehicleKitCatalog,
@@ -50,8 +56,14 @@ import {
 import { fmtNum, fmtSolari } from '../shared'
 import { useCommandDeck } from '../../../hooks/useCommandDeck'
 import { CommandCategoryPages } from '../../commands/CommandCategoryPages'
+import { usePortalAccess } from '../../../auth/portalAccess'
 
-type Flash = (msg: string, kind?: 'ok' | 'err') => void
+// These controls administer the server/world or other identities, rather than
+// the linked character. The backend independently denies their endpoints.
+const PLAYER_HIDDEN_ACTIONS = new Set(['regis-tanks', 'spawn-vehicle', 'funcom-spawn-vehicle', 'refuel-vehicle',
+  'teleport', 'whisper', 'cheat-script', 'dev-scripts', 'fresh-start', 'unlock-testing-stations'])
+
+type Flash = (msg: string, kind?: 'ok' | 'err' | 'info') => void
 
 interface SectionProps {
   player: Player
@@ -258,17 +270,12 @@ export function SpecsSection({ player, canWrite, demo, refreshKey, flash, onChan
                 }}
                 onApplyLevel={(level) => {
                   const patternNote = name === 'Crafting' && level >= 52
-                    ? '\n\nPattern Upgrading will be left unclaimed. The player must purchase it in-game after logging in so the Grade 2-5 schematic recipes are created.'
+                    ? '\n\nPattern Upgrading includes the Grade 2–5 schematic-pattern recipes.'
                     : ''
                   if (window.confirm(`Set ${name} to level ${level} and apply every ${name} specialization reward available through that level for ${player.name}?\n\nThe player must be fully offline because skill-point rewards update character state. Existing rewards are preserved. Rewards above level ${level} are not removed. The change appears in-game after a full re-login.${patternNote}`)) {
                     void run(() => applySpecLevel(player.controller_id, name, level), 'Apply level')
                   }
                 }}
-                onRepairPatternUpgrading={name === 'Crafting' ? () => {
-                  if (window.confirm(`Prepare Pattern Upgrading for in-game repurchase by ${player.name}?\n\nUse this only when Pattern Upgrading appears claimed but the Grade 2-5 schematic recipes are missing. The player must be fully offline. This removes only the Pattern Upgrading claim; after logging in, the player must purchase it again in Crafting specializations.`)) {
-                    void run(() => preparePatternUpgrading(player.controller_id), 'Prepare Pattern Upgrading')
-                  }
-                } : undefined}
               />
             )
           })}
@@ -280,11 +287,10 @@ export function SpecsSection({ player, canWrite, demo, refreshKey, flash, onChan
 
 const SPEC_TRACK_ORDER = ['Combat', 'Crafting', 'Exploration', 'Gathering', 'Sabotage']
 
-function SpecRow({ name, track, canWrite, busy, onGrantMax, onReset, onSetLevel, onApplyLevel, onRepairPatternUpgrading }: {
+function SpecRow({ name, track, canWrite, busy, onGrantMax, onReset, onSetLevel, onApplyLevel }: {
   name: string; track: SpecTrackFull | undefined; canWrite: boolean; busy: boolean
   onGrantMax: () => void; onReset: () => void
   onSetLevel: (level: number) => void; onApplyLevel: (level: number) => void
-  onRepairPatternUpgrading?: () => void
 }) {
   const xp = track?.xp ?? 0
   const level = Math.round(track?.level ?? 0)
@@ -335,13 +341,6 @@ function SpecRow({ name, track, canWrite, busy, onGrantMax, onReset, onSetLevel,
               <button className="btn-secondary" disabled={busy || !valid} title={`Set level and apply ${name} rewards available through that level`} onClick={() => onApplyLevel(parsed)}>
                 <Icon name="Sparkles" size={13} /> Apply level
               </button>
-              {onRepairPatternUpgrading && (
-                <button className="btn-secondary text-warning" disabled={busy}
-                  title="Remove only the Pattern Upgrading claim so it can be purchased in-game and create its recipes"
-                  onClick={onRepairPatternUpgrading}>
-                  <Icon name="Wrench" size={13} /> Repair Pattern
-                </button>
-              )}
               <button className="btn-secondary" disabled={busy} title="Grant max level for this track" onClick={onGrantMax}>
                 <Icon name="ChevronsUp" size={13} /> Max
               </button>
@@ -642,7 +641,7 @@ interface ActionDef {
   offlineOnly?: boolean   // requires player to be offline (DB write the game caches in memory)
   experimental?: boolean  // unverified — may not take effect in-game; shown with an EXPERIMENTAL badge
   fields?: ActionField[]
-  custom?: 'give-item' | 'grant-reward' | 'whisper' | 'spawn-vehicle' | 'funcom-spawn-vehicle' | 'quick-presets' | 'vehicle-kit' | 'give-package' | 'cheat-scripts' | 'dev-scripts' | 'unlock-trainers' | 'unlock-mainquest' | 'complete-contract' | 'progression-unlock' | 'refuel-vehicle' | 'starter-class' | 'teleport-player' | 'teleport-location' | 'set-respawn' | 'reset-faction' | 'grant-cosmetic' | 'grant-house-swatches' | 'grant-buildable-swatches' | 'fresh-start'
+  custom?: 'codex' | 'regis-tanks' | 'give-item' | 'grant-reward' | 'whisper' | 'spawn-vehicle' | 'funcom-spawn-vehicle' | 'quick-presets' | 'vehicle-kit' | 'give-package' | 'cheat-scripts' | 'dev-scripts' | 'unlock-trainers' | 'unlock-mainquest' | 'complete-contract' | 'progression-unlock' | 'refuel-vehicle' | 'starter-class' | 'teleport-player' | 'teleport-location' | 'set-respawn' | 'reset-faction' | 'grant-cosmetic' | 'grant-house-swatches' | 'grant-buildable-swatches' | 'grant-building-sets' | 'grant-armor-skins' | 'grant-weapon-skins' | 'grant-vehicle-skins' | 'grant-all-dyes' | 'fresh-start'
   balance?: 'solari' | 'scrip' | 'intel'  // show the player's current balance read-only above the form
   confirm?: (p: Player) => string  // confirm message; if returns '' no prompt
   doubleConfirm?: boolean // also requires a typed "i acknowledge" prompt inside run()
@@ -651,6 +650,20 @@ interface ActionDef {
 }
 
 const ACTIONS: ActionDef[] = [
+  { id: 'regis-tanks', group: 'Vehicle', label: 'Regis Tanks', icon: 'Truck', liveOnly: true, custom: 'regis-tanks',
+    run: () => Promise.resolve({ message: '' }) },
+  { id: 'observed-schematic-recipes', group: 'Items', label: 'Grant All Schematic Recipes (717)', icon: 'BookOpen', offlineOnly: true, experimental: true,
+    rowNote: 'Grant observed crafting recipe entries directly. Existing recipes and remaining uses are preserved; this does not deliver inventory items.',
+    confirm: p => `Grant 717 observed schematic recipe entries to ${p.name}? Existing recipe uses will be preserved. A backup is recommended before granting. Check crafting in-game after login.\n\n${COSMETIC_LICENSE_NOTICE}`,
+    run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedSchematicRecipes') },
+  { id: 'observed-character-swatches', group: 'Items', label: 'Grant All Character Swatches (311)', icon: 'Palette', offlineOnly: true, experimental: true,
+    rowNote: 'Save the observed swatch IDs directly to this character. Existing unlocks are preserved; individual in-game availability varies.',
+    confirm: p => `Grant 311 character swatch IDs to ${p.name}? A backup is recommended before granting.\n\n${COSMETIC_LICENSE_NOTICE}`,
+    run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedCharacterSwatches') },
+  { id: 'observed-gear-appearances', group: 'Items', label: 'Grant All Gear Appearances (401)', icon: 'Palette', offlineOnly: true, experimental: true,
+    rowNote: 'Save the observed armor and weapon appearance IDs directly to this character. Individual in-game availability varies.',
+    confirm: p => `Grant 401 gear appearance IDs to ${p.name}? A backup is recommended before granting.\n\n${COSMETIC_LICENSE_NOTICE}`,
+    run: p => grantReviewedCustomization(p.id, p.controller_id, p.account_id, 'ObservedGearAppearances') },
   // ----- Currency -----
   { id: 'give-solari', group: 'Currency', label: 'Give Solari', icon: 'Coins', balance: 'solari',
     fields: [{ key: 'amount', label: 'Amount', type: 'number', placeholder: '10000' }],
@@ -695,12 +708,27 @@ const ACTIONS: ActionDef[] = [
   { id: 'unlock-trainers', group: 'Progression', label: 'Unlock Trainers', icon: 'GraduationCap', custom: 'unlock-trainers',
     rowNote: 'Complete a skill-trainer quest line + grant its skill tree — separated by trainer',
     run: () => Promise.resolve({ message: '' }) },
+  { id: 'unlock-testing-stations', group: 'Progression', label: 'Testing Stations', icon: 'Milestone', offlineOnly: true,
+    rowNote: 'Unlock selectable difficulties for one station or all six. Fresh backup; existing higher progress preserved. Faction requirements still apply.',
+    fields: [{ key: 'station', label: 'Station', type: 'select', options: [
+      { value: 'all', label: 'All six stations' },
+      { value: 'DA_Dgn_024_Darkness', label: 'Station 24 — Darkness' },
+      { value: 'DA_Dgn_089_Radiation', label: 'Station 89 — Radiation' },
+      { value: 'DA_Dgn_136_Fire', label: 'Station 136 — Fire' },
+      { value: 'DA_Dgn_152_Electric', label: 'Station 152 — Electric' },
+      { value: 'DA_Dgn_195_Poison', label: 'Station 195 — Poison' },
+      { value: 'DA_Dgn_Pit', label: 'The Quarry' },
+    ] }],
+    confirm: p => `Unlock the selected Testing Station difficulties for ${p.name}? DST will verify a fresh backup and record completion progress. The character must be fully offline. Choose difficulty in-game; faction requirements still apply.`,
+    run: (p, v) => unlockTestingStations(p.id, p.controller_id, p.account_id, v.station || 'all') },
   { id: 'unlock-main-quest', group: 'Progression', label: 'Unlock Main Quest', icon: 'Flag', custom: 'unlock-mainquest',
     rowNote: 'Complete an entire main-quest story line',
     run: () => Promise.resolve({ message: '' }) },
   { id: 'complete-contract', group: 'Progression', label: 'Complete Contract', icon: 'Check', custom: 'complete-contract', offlineOnly: true,
     rowNote: 'Force-complete a stuck / in-flight contract — writes its completion tags and dismisses the active contract item',
     run: () => Promise.resolve({ message: '' }) },
+  { id: 'codex', group: 'Progression', label: 'Codex', icon: 'BookOpen', custom: 'codex',
+    rowNote: 'View owned and missing lore fragments.', run: () => Promise.resolve({ message: '' }) },
   { id: 'reset-progression', group: 'Progression', label: 'Reset Progression (live)', icon: 'RotateCcw', liveOnly: true,
     rowNote: 'Single confirmation required',
     confirm: p => `Reset ALL progression for ${p.name}? Cannot be undone.\n\n` +
@@ -757,13 +785,24 @@ const ACTIONS: ActionDef[] = [
   { id: 'grant-cosmetic', group: 'Items', label: 'Grant Cosmetic / Building Set', icon: 'Shirt', custom: 'grant-cosmetic',
     rowNote: 'Private-server unlock only; does not grant account ownership or availability elsewhere.',
     run: () => Promise.resolve({ message: '' }) },
+  { id: 'grant-building-sets', group: 'Items', label: 'All Building Sets', icon: 'Blocks', custom: 'grant-building-sets', liveOnly: true,
+    rowNote: 'Delivers missing building set tokens in one batch. Online required; existing unlocks are preserved.',
+    run: () => Promise.resolve({ message: '' }) },
+  { id: 'grant-armor-skins', group: 'Items', label: 'All Armor Skins', icon: 'Shirt', custom: 'grant-armor-skins', liveOnly: true,
+    rowNote: 'Delivers missing armor and suit skin tokens. Online required; existing unlocks are preserved.', run: () => Promise.resolve({ message: '' }) },
+  { id: 'grant-weapon-skins', group: 'Items', label: 'All Weapon Skins', icon: 'Sword', custom: 'grant-weapon-skins', liveOnly: true,
+    rowNote: 'Delivers missing weapon skin tokens. Online required; existing unlocks are preserved.', run: () => Promise.resolve({ message: '' }) },
+  { id: 'grant-vehicle-skins', group: 'Items', label: 'All Vehicle Skins', icon: 'Truck', custom: 'grant-vehicle-skins', liveOnly: true,
+    rowNote: 'Request missing vehicle appearances. Saved unlocks and held tokens are skipped.', run: () => Promise.resolve({ message: '' }) },
+  { id: 'grant-all-dyes', group: 'Items', label: 'All Dyes', icon: 'Palette', custom: 'grant-all-dyes', liveOnly: true,
+    rowNote: 'Request every missing dye token, including dyes outside the House Swatches subset.', run: () => Promise.resolve({ message: '' }) },
   { id: 'grant-house-swatches', group: 'Items', label: 'All House Swatches', icon: 'Palette', custom: 'grant-house-swatches', liveOnly: true,
     rowNote: 'Online required. Delivery starts immediately; remain online until the activation cascade starts and completely stops (about a minute).',
     run: () => Promise.resolve({ message: '' }) },
   { id: 'grant-buildable-swatches', group: 'Items', label: 'Buildable House Swatches', icon: 'PaintBucket', custom: 'grant-buildable-swatches', liveOnly: true,
     rowNote: 'Online required. Delivers only the Buildables/Placeables House Swatch tokens through the live game.',
     run: () => Promise.resolve({ message: '' }) },
-  { id: 'repair-gear', group: 'Items', label: 'Repair All Items', icon: 'Wrench',
+  { id: 'repair-gear', group: 'Items', label: 'Repair backpack & worn items', icon: 'Wrench',
     run: p => repairGear(p.id) },
   { id: 'repair-orphaned-building-pieces', group: 'Items', label: 'Repair Orphaned Building Pieces', icon: 'Wrench',
     rowNote: 'Fixes a 2026-09-22 Funcom patch bug: old Gunner/Sentinel building-set pieces can crash the construction tool. Only affects characters that unlocked that set before the patch. Player must be offline.',
@@ -789,8 +828,8 @@ const ACTIONS: ActionDef[] = [
     confirm: p => `Give vehicle parts to ${p.name}'s inventory? They'll need to assemble at a Vehicle Assembly. Works online or offline.`,
     run: () => Promise.resolve({ message: '' }) },
   { id: 'funcom-spawn-vehicle', group: 'Vehicle', label: 'Funcom Spawn Vehicle', icon: 'CarFront', custom: 'funcom-spawn-vehicle', liveOnly: true, experimental: true,
-    rowNote: 'Sends Funcom’s persistent SpawnVehicleAt command and assigns owner permission. Unconfirmed; create a fresh backup before testing.',
-    confirm: p => `Send Funcom's unconfirmed live vehicle-spawn command at ${p.name}?\n\nThe player must be online and a fresh backup must exist before testing.`,
+    rowNote: 'Sends the vehicle-spawn command at the online player and assigns owner permission.',
+    confirm: p => `Spawn a vehicle at ${p.name}?\n\nThe player must be online and a fresh backup must exist.`,
     run: () => Promise.resolve({ message: '' }) },
   { id: 'refuel-vehicle', group: 'Vehicle', label: 'Refuel Vehicle', icon: 'Fuel', custom: 'refuel-vehicle',
     run: () => Promise.resolve({ message: '' }) },
@@ -885,6 +924,7 @@ const ACTION_CATEGORIES = [
 const ITEMS_GROUP: ActionGroup = 'Items'
 
 export function ActionsSection({ player, canWrite, demo, flash, onChanged, onFlush }: SectionProps) {
+  const { isPlayer } = usePortalAccess()
   const contextual = useCommandDeck()
   const [openId, setOpenId] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -919,7 +959,8 @@ export function ActionsSection({ player, canWrite, demo, flash, onChanged, onFlu
     setBusy(true)
     try {
       const r = await exec()
-      flash(r.message || `${def.label} done.`, 'ok')
+      const requestOnly = ['grant-cosmetic', 'grant-house-swatches', 'grant-buildable-swatches', 'grant-building-sets', 'grant-armor-skins', 'grant-weapon-skins', 'grant-vehicle-skins', 'grant-all-dyes'].includes(def.custom || '')
+      flash(r.message || (requestOnly ? `${def.label} request submitted.` : `${def.label} done.`), requestOnly ? 'info' : 'ok')
       // Mark a deferred refresh; custom forms decide whether successful input resets.
       onChanged()
       return true
@@ -939,12 +980,13 @@ export function ActionsSection({ player, canWrite, demo, flash, onChanged, onFlu
       Currency: [], Progression: [], Items: [], Vehicle: [], Live: [], Identity: [], Danger: [],
     }
     for (const a of ACTIONS) {
+      if (isPlayer && PLAYER_HIDDEN_ACTIONS.has(a.id)) continue
       // Items is rendered inside InventorySection — skip here.
       if (a.group === ITEMS_GROUP) continue
       map[a.group].push(a)
     }
     return map
-  }, [])
+  }, [isPlayer])
 
   if (!canWrite) {
     return (
@@ -981,7 +1023,7 @@ export function ActionsSection({ player, canWrite, demo, flash, onChanged, onFlu
     <div className="space-y-4">
       {!hasLiveSession && (
         <div className="card p-2.5 text-xs text-text-muted border-l-2 border-warning flex items-center gap-2">
-          <Icon name="WifiOff" size={12} /> Player is offline — actions marked "LIVE REQ'D" need the player online (RMQ + an online or mid-logout player) to take effect.
+          <Icon name="WifiOff" size={12} /> Player is offline. Actions marked "Online" require an active player session.
         </div>
       )}
 
@@ -994,11 +1036,13 @@ export function ActionsSection({ player, canWrite, demo, flash, onChanged, onFlu
               {group === 'Danger' && <Icon name="AlertTriangle" size={11} className="text-error" />}
               {group}
             </div>
-            <div className="space-y-1.5">
+            <div className="player-manage-grid">
               {acts.map(a => (
-                <ActionRow key={a.id} def={a} player={player} busy={busy} stats={stats}
+                <div key={a.id} data-expanded={openId === a.id ? 'true' : undefined}>
+                <ActionRow def={a} player={player} busy={busy} stats={stats}
                   open={openId === a.id} danger={group === 'Danger'}
                   onToggle={() => openAction(a.id)} runAction={runAction} />
+                </div>
               ))}
             </div>
           </div>
@@ -1025,6 +1069,20 @@ function ActionRow({ def, player, busy, stats, open, danger, onToggle, runAction
   runAction: (def: ActionDef, exec: () => Promise<{ message: string }>) => Promise<boolean>
 }) {
   const disabled = busy
+  const [grantCounts, setGrantCounts] = useState<{total: number; owned: number; remaining: number} | null>(null)
+  const [grantCountsLoading, setGrantCountsLoading] = useState(false)
+  const selection = ({'observed-character-swatches':'ObservedCharacterSwatches','observed-gear-appearances':'ObservedGearAppearances','observed-schematic-recipes':'ObservedSchematicRecipes'} as Record<string,string>)[def.id]
+  useEffect(() => {
+    if (!selection || busy) return
+    let current = true
+    setGrantCounts(null)
+    setGrantCountsLoading(true)
+    getReviewedGrantCounts(player.id, player.controller_id, player.account_id, selection)
+      .then(counts => { if (current) setGrantCounts(counts) })
+      .catch(() => { if (current) setGrantCounts(null) })
+      .finally(() => { if (current) setGrantCountsLoading(false) })
+    return () => { current = false }
+  }, [selection, player.id, player.controller_id, player.account_id, busy])
   // Read-only "current balance" note shown above currency actions.
   const balanceNote = (() => {
     if (!def.balance || !stats) return null
@@ -1043,21 +1101,26 @@ function ActionRow({ def, player, busy, stats, open, danger, onToggle, runAction
     <div className="card overflow-hidden">
       <button type="button"
         aria-expanded={open}
-        className={`w-full flex items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors ${disabled ? 'opacity-50 cursor-not-allowed' : 'hover:bg-surface-2'} ${danger ? 'text-error' : 'text-text'}`}
+        className={`w-full min-h-14 flex items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors ${disabled ? 'opacity-50 cursor-not-allowed' : 'hover:bg-surface-2'} ${danger ? 'text-error' : 'text-text'}`}
         disabled={disabled}
         onClick={onToggle}
         title={def.liveOnly ? 'Requires player to be online' : def.offlineOnly ? 'Requires player to be offline — the game caches this value in memory while online and overwrites it on logout' : undefined}>
         <Icon name={def.icon} size={14} className={`shrink-0 ${danger ? 'text-error' : 'text-text-dim'}`} />
-        <span className="flex-1 min-w-0 font-medium">{def.label}</span>
+        <span className="flex-1 min-w-0">
+          <span className="font-medium break-words">{def.label}</span>
+          {selection && <span className="block text-xs text-text-muted">{grantCounts ? `${grantCounts.owned}/${grantCounts.total} owned · ${grantCounts.remaining} remaining` : grantCountsLoading ? 'Checking character unlocks…' : 'Character counts unavailable'}</span>}
+        </span>
+          <span className="inline-flex shrink-0 items-center gap-2 text-[10px] font-medium text-text-muted">
         {def.experimental && (
-          <span className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-accent/20 text-accent border border-accent/50 shrink-0" title="Experimental — may not take effect in-game">EXPERIMENTAL</span>
+          <span className="text-accent" title="Experimental — may not take effect in-game">Experimental</span>
         )}
         {def.liveOnly && (
-          <span className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-warning/20 text-warning border border-warning/50 shrink-0">LIVE REQ'D</span>
+          <span title="Requires player online">Online</span>
         )}
         {def.offlineOnly && (
-          <span className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-info/20 text-info border border-info/50 shrink-0">OFFLINE REQ'D</span>
+          <span title="Requires player offline">Offline</span>
         )}
+          </span>
         <Icon name={open ? 'ChevronDown' : 'ChevronRight'} size={14} className="shrink-0 text-text-dim" />
       </button>
       {open && (
@@ -1082,6 +1145,11 @@ function ActionRow({ def, player, busy, stats, open, danger, onToggle, runAction
           ) : def.custom === 'whisper' ? (
             <WhisperForm busy={busy}
               onSubmit={msg => runAction(def, () => chatWhisper(String(player.id), msg))} />
+          ) : def.custom === 'regis-tanks' ? (
+            <RegisTankControls actorId={player.id} online={(player.online_status || '').toLowerCase() === 'online'} busy={busy}
+              onGrant={template => runAction(def, () => api<{ message: string }>('/api/gameplay/vehicles/regis-tanks', {
+                method: 'POST', body: JSON.stringify({ actor_id: player.id, template_name: template }),
+              }))} />
           ) : def.custom === 'funcom-spawn-vehicle' ? (
             <FuncomSpawnVehicleForm busy={busy}
               onSubmit={(vehicle, templateName, persistent) => runAction(def, () =>
@@ -1174,12 +1242,16 @@ function ActionRow({ def, player, busy, stats, open, danger, onToggle, runAction
               })} />
           ) : def.custom === 'fresh-start' ? (
             <FreshStartForm busy={busy} player={player} runAction={runAction} />
+          ) : def.custom === 'codex' ? (
+            <CodexOwnership key={player.account_id} path={`/api/gameplay/players/codex?account_id=${player.account_id}`}
+              grant={{ path: '/api/gameplay/players/codex/grant', body: { account_id: player.account_id },
+                disabled: busy || player.online_status !== 'Offline', reason: 'The character must be fully Offline before granting codex fragments.' }} />
           ) : def.custom === 'give-package' ? (
             <GivePackageForm busy={busy} playerName={player.name}
               onGive={(items, pkgName, overflow) => runAction(def, async () => {
-                await giveItems(player.id, items, overflow)
-                const n = items.length
-                return { message: `Gave package "${pkgName}" — ${n} item${n === 1 ? '' : 's'} to ${player.name}.` }
+                const r = await giveItems(player.id, items, overflow)
+                if (Number(r.result?.failures || 0) > 0) throw new Error(r.message)
+                return { message: `Package "${pkgName}": ${r.message}` }
               })} />
           ) : def.custom === 'grant-cosmetic' ? (
             <GrantCosmeticForm busy={busy} playerName={player.name} accountId={player.account_id}
@@ -1192,16 +1264,20 @@ function ActionRow({ def, player, busy, stats, open, danger, onToggle, runAction
                 })
                 return succeeded
               }} />
-          ) : def.custom === 'grant-house-swatches' || def.custom === 'grant-buildable-swatches' ? (
-            <GrantHouseSwatchesForm busy={busy} playerName={player.name} accountId={player.account_id}
-              kind={def.custom === 'grant-buildable-swatches' ? 'placeables' : 'all'}
+          ) : def.custom === 'grant-house-swatches' || def.custom === 'grant-buildable-swatches' || def.custom === 'grant-building-sets' || def.custom === 'grant-armor-skins' || def.custom === 'grant-weapon-skins' || def.custom === 'grant-vehicle-skins' || def.custom === 'grant-all-dyes' ? (
+            <GrantUnlockTokensForm busy={busy} playerName={player.name} accountId={player.account_id}
+              kind={def.custom === 'grant-all-dyes' ? 'dyes' : def.custom === 'grant-vehicle-skins' ? 'vehicle' : def.custom === 'grant-armor-skins' ? 'armor' : def.custom === 'grant-weapon-skins' ? 'weapon' : def.custom === 'grant-building-sets' ? 'building-sets' : def.custom === 'grant-buildable-swatches' ? 'placeables' : 'all'}
               playerOnline={(player.online_status || '').toLowerCase() === 'online'}
               onGrant={async () => {
                 let succeeded = false
                 await runAction(def, async () => {
-                  const r = await grantHouseSwatches(player.id, player.account_id, def.custom === 'grant-buildable-swatches' ? 'placeables' : 'all')
+                  const r = def.custom === 'grant-building-sets'
+                    ? await grantBuildingSets(player.id, player.account_id)
+                    : def.custom === 'grant-armor-skins' || def.custom === 'grant-weapon-skins' || def.custom === 'grant-vehicle-skins' || def.custom === 'grant-all-dyes'
+                      ? await grantSkins(player.id, player.account_id, def.custom === 'grant-all-dyes' ? 'dyes' : def.custom === 'grant-vehicle-skins' ? 'vehicle' : def.custom === 'grant-armor-skins' ? 'armor' : 'weapon')
+                    : await grantHouseSwatches(player.id, player.account_id, def.custom === 'grant-buildable-swatches' ? 'placeables' : 'all')
                   succeeded = true
-                  return { message: r.message || `House Swatches updated for ${player.name}.` }
+                  return { message: r.message || `Unlock token delivery submitted for ${player.name}.` }
                 })
                 return succeeded
               }} />
@@ -1445,7 +1521,10 @@ function GrantCosmeticForm({ busy, playerName, accountId, onGrant }: {
   const [filter, setFilter] = useState('')
   const [sel, setSel] = useState('')
   const [owned, setOwned] = useState<Set<string> | null>(null)
-  const [showOwned, setShowOwned] = useState(false)
+  const [unlocked, setUnlocked] = useState<Set<string>>(new Set())
+  const [pending, setPending] = useState<Set<string>>(new Set())
+  const [showOwned, setShowOwned] = useState(true)
+  const [showExcluded, setShowExcluded] = useState(false)
   const [ownershipWarning, setOwnershipWarning] = useState('')
   useEffect(() => {
     let alive = true
@@ -1462,6 +1541,8 @@ function GrantCosmeticForm({ busy, playerName, accountId, onGrant }: {
       .then(r => {
         if (!alive) return
         setOwned(new Set((r.owned || []).map(id => id.toLowerCase())))
+        setUnlocked(new Set((r.unlocked || []).map(id => id.toLowerCase())))
+        setPending(new Set((r.pending || []).map(id => id.toLowerCase())))
         if (r.liveError) setOwnershipWarning(`Ownership unavailable: ${r.liveError}. Showing the full catalog.`)
       })
       .catch(e => {
@@ -1473,12 +1554,13 @@ function GrantCosmeticForm({ busy, playerName, accountId, onGrant }: {
   }, [accountId])
   const matches = useMemo(() => {
     const list = catalog || []
-    const available = showOwned || !owned ? list : list.filter(e => !owned.has(e.template.toLowerCase()))
+    const eligible = showExcluded ? list : list.filter(e => !e.bulk_exclusion)
+    const available = showOwned || !owned ? eligible : eligible.filter(e => !owned.has(e.template.toLowerCase()))
     return filterCosmeticsCatalog(available, filter)
-  }, [catalog, filter, owned, showOwned])
-  const ownedCatalogCount = useMemo(
-    () => (catalog && owned ? catalog.filter(e => owned.has(e.template.toLowerCase())).length : 0),
-    [catalog, owned],
+  }, [catalog, filter, owned, showOwned, showExcluded])
+  const unlockedCatalogCount = useMemo(
+    () => (catalog ? catalog.filter(e => unlocked.has(e.template.toLowerCase())).length : 0),
+    [catalog, unlocked],
   )
   const groups = useMemo(() => {
     const m = new Map<string, CosmeticEntry[]>()
@@ -1493,9 +1575,9 @@ function GrantCosmeticForm({ busy, playerName, accountId, onGrant }: {
 
   return (
     <div className="space-y-3">
-      <p className="text-[11px] text-text-dim">Delivers the unlock item to {playerName}'s inventory (online: instant; offline: next login). The unlock applies when acquired in-game.</p>
+      <p className="text-[11px] text-text-dim">Delivers the unlock item to {playerName}'s inventory (online: instant; offline: next login). Check in-game whether the item activates the unlock.</p>
       <div className="rounded-lg bg-warning/10 border border-warning/40 p-3 text-warning text-xs leading-relaxed">
-        <p>Some entries may be account-entitlement content. Granting one here only unlocks it for this character on this private server; it does not grant account ownership or make it available on official or other servers.</p>
+        <p>{COSMETIC_LICENSE_NOTICE} Delivering a token or finding a saved unlock record does not confirm in-game usability or grant account ownership.</p>
         <p className="mt-2">
           Developer, test, placeholder, and Polar entries are experimental. Some have no working unlock action or are missing from retail game assets, so they may remain ordinary inventory items and do nothing. Some developer unlock items appear to register only when added to the inventory while the player is offline, then processed on next login. PowerTester is a Funcom account permission that private servers cannot grant; enabling <span className="font-mono">dw.PlayerProgressionUnlockEnabled</span> does not provide it.
         </p>
@@ -1508,30 +1590,34 @@ function GrantCosmeticForm({ busy, playerName, accountId, onGrant }: {
               setShowOwned(e.target.checked)
               if (!e.target.checked && sel && owned.has(sel.toLowerCase())) setSel('')
             }} />
-          Show already owned
+          Show saved records and held tokens
         </span>
-        <span>{ownedCatalogCount} server-detected owned / {catalog.length - ownedCatalogCount} available</span>
+        <span>{unlockedCatalogCount} saved unlock records / {catalog.filter(e => pending.has(e.template.toLowerCase()) && !unlocked.has(e.template.toLowerCase())).length} held tokens</span>
       </label>
+      <p className="text-xs text-text-dim">This picker includes all customization categories, crafting stations and utilities. Its remaining count is not a count of failed bulk grants.</p>
+      <label className="flex items-center gap-2 text-xs text-text-dim"><input type="checkbox" checked={showExcluded} onChange={e => { setShowExcluded(e.target.checked); setSel('') }} />Show tokens excluded from bulk grants</label>
       <input type="text" value={filter} disabled={busy} placeholder="Contains search: name, id, or group…"
         onChange={e => setFilter(e.target.value)} className={selectCls} />
       <select value={sel} disabled={busy} className={selectCls} onChange={e => setSel(e.target.value)} size={1}>
         <option value="">Select a cosmetic or building set… ({matches.length})</option>
         {groups.map(([g, items]) => (
           <optgroup key={g} label={`${g} (${items.length})`}>
-            {items.map(e => <option key={e.template} value={e.template}>{e.name}</option>)}
+            {items.map(e => <option key={e.template} value={e.template}>{e.name}{e.bulk_exclusion ? ' — Excluded from bulk' : unlocked.has(e.template.toLowerCase()) ? ' — Unlock record saved' : pending.has(e.template.toLowerCase()) ? ' — Token held' : ''}</option>)}
           </optgroup>
         ))}
       </select>
       {chosen && <p className="text-[11px] font-mono text-text-dim truncate">{chosen.template}</p>}
+      {chosen?.bulk_exclusion && <p className="text-xs text-warning">{chosen.bulk_exclusion}</p>}
       <button className="btn-primary w-full" disabled={busy || !sel}
         onClick={async () => {
           if (!chosen) return
           if (await onGrant(chosen.template, chosen.name)) {
-            setOwned(current => {
-              const next = new Set(current)
-              next.add(chosen.template.toLowerCase())
-              return next
-            })
+            try {
+              const ownership = await getPlayerOwnedCosmetics(accountId)
+              setOwned(new Set((ownership.owned || []).map(id => id.toLowerCase())))
+              setUnlocked(new Set((ownership.unlocked || []).map(id => id.toLowerCase())))
+              setPending(new Set((ownership.pending || []).map(id => id.toLowerCase())))
+            } catch { setOwnershipWarning('Request submitted; unlock status could not be refreshed. Check in-game before retrying.') }
             setSel('')
           }
         }}>
@@ -1541,19 +1627,32 @@ function GrantCosmeticForm({ busy, playerName, accountId, onGrant }: {
   )
 }
 
-function GrantHouseSwatchesForm({ busy, playerName, accountId, kind, playerOnline, onGrant }: {
+function GrantUnlockTokensForm({ busy, playerName, accountId, kind, playerOnline, onGrant }: {
   busy: boolean
   playerName: string
   accountId: number
-  kind: HouseSwatchKind
+  kind: HouseSwatchKind | 'building-sets' | 'armor' | 'weapon' | 'vehicle' | 'dyes'
   playerOnline: boolean
   onGrant: () => Promise<boolean>
 }) {
   const [catalog, setCatalog] = useState<CosmeticEntry[] | null>(null)
   const [owned, setOwned] = useState<Set<string> | null>(null)
+  const [unlocked, setUnlocked] = useState<Set<string>>(new Set())
+  const [pending, setPending] = useState<Set<string>>(new Set())
+  const [catalogFilter, setCatalogFilter] = useState('')
   const [err, setErr] = useState<string | null>(null)
   const [ownershipWarning, setOwnershipWarning] = useState('')
   const [activationQueued, setActivationQueued] = useState(false)
+  const [manualRefreshing, setManualRefreshing] = useState(false)
+  const [refreshRequest, setRefreshRequest] = useState(0)
+  const [refreshFeedback, setRefreshFeedback] = useState<{ error: boolean; message: string } | null>(null)
+  const [requestSubmitted, setRequestSubmitted] = useState(false)
+  const [submittedTokens, setSubmittedTokens] = useState<Set<string>>(new Set())
+  const buildingSets = kind === 'building-sets'
+  const skins = kind === 'armor' || kind === 'weapon' || kind === 'vehicle' || kind === 'dyes'
+  const bulkUnlocks = buildingSets || skins
+  const label = skins ? (kind === 'armor' ? 'Armor Skins' : kind === 'vehicle' ? 'Vehicle Skins' : kind === 'dyes' ? 'Dyes' : 'Weapon Skins') : buildingSets ? 'Building Sets' : kind === 'placeables' ? 'Buildable House Swatches' : 'House Swatches'
+  const tokenLabel = skins ? (kind === 'armor' ? 'Armor Skin' : kind === 'vehicle' ? 'Vehicle Skin' : kind === 'dyes' ? 'Dye' : 'Weapon Skin') : buildingSets ? 'Building Set' : kind === 'placeables' ? 'Buildable House Swatch' : 'House Swatch'
 
   useEffect(() => {
     let alive = true
@@ -1562,7 +1661,9 @@ function GrantHouseSwatchesForm({ busy, playerName, accountId, kind, playerOnlin
         if (!alive) return
         setCatalog(entries)
         setOwned(new Set((ownership.owned || []).map(id => id.toLowerCase())))
-        if (ownership.liveError) setOwnershipWarning(`Ownership unavailable: ${ownership.liveError}. The full House Swatch set will be offered.`)
+        setUnlocked(new Set((ownership.unlocked || []).map(id => id.toLowerCase())))
+        setPending(new Set((ownership.pending || []).map(id => id.toLowerCase())))
+        if (ownership.liveError) setOwnershipWarning(`Ownership unavailable: ${ownership.liveError}. Ownership will be checked again before delivery.`)
       })
       .catch(e => {
         if (!alive) return
@@ -1571,86 +1672,166 @@ function GrantHouseSwatchesForm({ busy, playerName, accountId, kind, playerOnlin
     return () => { alive = false }
   }, [accountId])
 
-  const houseSwatches = useMemo(() => getHouseSwatchCosmetics(catalog || [], kind), [catalog, kind])
-  const missingHouseSwatches = useMemo(
-    () => houseSwatches.filter(entry => !owned?.has(entry.template.toLowerCase())),
-    [houseSwatches, owned],
+  const tokens = useMemo(() => kind === 'building-sets'
+    ? getBuildingSetCosmetics(catalog || [])
+    : kind === 'armor' || kind === 'weapon' || kind === 'vehicle' || kind === 'dyes' ? getSkinCosmetics(catalog || [], kind)
+    : getHouseSwatchCosmetics(catalog || [], kind), [catalog, kind])
+  const missingTokens = useMemo(
+    () => tokens.filter(entry => !owned?.has(entry.template.toLowerCase()) && !submittedTokens.has(entry.template.toLowerCase())),
+    [tokens, owned, submittedTokens],
   )
-  const label = kind === 'placeables' ? 'Buildable House Swatches' : 'House Swatches'
-  const tokenLabel = kind === 'placeables' ? 'Buildable House Swatch' : 'House Swatch'
+  const browseEntries = useMemo(() => (catalog || []).filter(e => buildingSets
+    ? e.group.startsWith('Building Sets - ')
+    : skins ? e.group === (kind === 'armor' ? 'Armor & Suit Sets' : kind === 'vehicle' ? 'Vehicle Skins' : kind === 'dyes' ? 'Swatches (Dyes)' : 'Weapon Skins') : false), [catalog, buildingSets, skins, kind])
 
   useEffect(() => {
-    if (!activationQueued || houseSwatches.length === 0) return
+    if ((!activationQueued && !manualRefreshing) || tokens.length === 0) return
 
+    const manual = manualRefreshing
     let alive = true
+    const timeoutMs = manual ? 5000 : 10000
+    const deadline = Date.now() + timeoutMs
+    const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
+    const deadlineTimer = setTimeout(() => {
+      alive = false
+      controller.abort()
+      if (timer) clearTimeout(timer)
+      setActivationQueued(false)
+      if (manual) {
+        setManualRefreshing(false)
+        setRefreshFeedback({ error: true, message: 'Status refresh timed out. Counts were not updated. Try again.' })
+      } else {
+        setOwnershipWarning('Unlocks are still processing. Use Refresh unlock status; check held tokens and overflow before granting again.')
+      }
+    }, timeoutMs)
     const refreshOwnership = async () => {
       try {
-        const ownership = await getPlayerOwnedCosmetics(accountId)
+        const ownership = await getPlayerOwnedCosmetics(accountId, controller.signal)
         if (!alive) return
+        if (ownership.liveError) throw new Error(ownership.liveError)
         const nextOwned = new Set((ownership.owned || []).map(id => id.toLowerCase()))
+        const nextUnlocked = new Set((ownership.unlocked || []).map(id => id.toLowerCase()))
         setOwned(nextOwned)
-        if (houseSwatches.every(entry => nextOwned.has(entry.template.toLowerCase()))) {
+        setUnlocked(nextUnlocked)
+        const nextPending = new Set((ownership.pending || []).map(id => id.toLowerCase()))
+        setPending(nextPending)
+        if (manual) {
+          clearTimeout(deadlineTimer)
+          const unlockedCount = tokens.filter(entry => nextUnlocked.has(entry.template.toLowerCase())).length
+          const heldCount = (bulkUnlocks ? browseEntries : tokens).filter(entry => nextPending.has(entry.template.toLowerCase()) && !nextUnlocked.has(entry.template.toLowerCase())).length
+          setOwnershipWarning('')
+          setManualRefreshing(false)
+          setRefreshFeedback({ error: false, message: `Status refreshed: ${unlockedCount}/${tokens.length} unlocked · ${heldCount} held tokens.` })
+          return
+        }
+        if (tokens.every(entry => nextUnlocked.has(entry.template.toLowerCase()))) {
           setActivationQueued(false)
           setOwnershipWarning('')
+          return
+        }
+        if (bulkUnlocks && Date.now() >= deadline) {
+          setActivationQueued(false)
+          setOwnershipWarning(`Some ${buildingSets ? 'building sets' : 'skins'} are still processing. Check unlocks, inventory and dropped tokens before retrying.`)
           return
         }
         timer = setTimeout(() => void refreshOwnership(), 2000)
       } catch (e) {
         if (!alive) return
+        if (manual) {
+          clearTimeout(deadlineTimer)
+          setManualRefreshing(false)
+          setRefreshFeedback({ error: true, message: `Status refresh failed. Counts were not updated: ${e instanceof Error ? e.message : String(e)}` })
+          return
+        }
         setOwnershipWarning(`Could not refresh activation progress: ${e instanceof Error ? e.message : String(e)}`)
+        if (bulkUnlocks && Date.now() >= deadline) {
+          setActivationQueued(false)
+          return
+        }
         timer = setTimeout(() => void refreshOwnership(), 5000)
       }
     }
 
-    timer = setTimeout(() => void refreshOwnership(), 2000)
+    if (manual) void refreshOwnership()
+    else timer = setTimeout(() => void refreshOwnership(), 500)
     return () => {
       alive = false
+      controller.abort()
       if (timer) clearTimeout(timer)
+      clearTimeout(deadlineTimer)
     }
-  }, [accountId, activationQueued, houseSwatches])
+  }, [accountId, activationQueued, manualRefreshing, tokens, buildingSets, bulkUnlocks, refreshRequest, browseEntries])
 
   if (err) return <ErrorBox msg={err} />
-  if (!catalog || !owned) return <div className="text-sm text-text-dim flex items-center gap-2"><Icon name="Loader2" size={13} className="animate-spin" /> Loading House Swatches and player ownership...</div>
+  if (!catalog || !owned) return <div className="text-sm text-text-dim flex items-center gap-2"><Icon name="Loader2" size={13} className="animate-spin" /> Loading {label} and player ownership...</div>
 
   return (
     <div className="space-y-3">
       <div className="flex items-start justify-between gap-3">
         <div className="text-xs text-text-dim leading-relaxed">
-          Delivers verified physical {label} tokens through Funcom's live RMQ item command. Tokens use backpack slots; forced overflow drops excess tokens beside the player.
+          Delivers missing {label} tokens through the live game. Tokens use backpack slots; forced overflow drops excess tokens beside the player.
         </div>
         <span className="text-[11px] text-text-dim whitespace-nowrap">
-          {houseSwatches.length - missingHouseSwatches.length}/{houseSwatches.length} detected
+          {bulkUnlocks ? `${tokens.filter(e => unlocked.has(e.template.toLowerCase())).length}/${tokens.length} unlocked · ${browseEntries.filter(e => pending.has(e.template.toLowerCase()) && !unlocked.has(e.template.toLowerCase())).length} held tokens` : `${tokens.length - missingTokens.length}/${tokens.length} detected`}
         </span>
       </div>
       <div className="rounded-lg bg-warning/10 border border-warning/40 p-3 text-warning text-xs leading-relaxed">
-        Online required. Delivery starts immediately, then Dune activates each token in a cascade. Remain online until the notifications start and completely stop, usually about a minute. DST skips persisted unlocks and tokens still in the player's inventory. Forced overflow drops excess tokens beside the player; Funcom does not link those loot bags back to a player, so pick up any overflow tokens before running this action again.
+        Online required. Dune processes supported tokens after delivery{bulkUnlocks ? '; larger batches can take several minutes' : ', usually about a minute'}. DST skips persisted unlocks and tokens still in the player's inventory. Held tokens are not unlocked; some have no working research action. Forced overflow drops excess tokens beside the player; pick up any overflow before running this action again.
       </div>
+      <p className="text-xs text-text-muted">{COSMETIC_LICENSE_NOTICE}</p>
+      {buildingSets && <div className="text-xs text-text-dim">Includes building sets, individual pieces and decor. Crafting stations, developer patents and entries without an item form are excluded. Some sets may not unlock because of Funcom's game-side limitations. Delivery does not guarantee activation or account entitlement.</div>}
+      {skins && <div className="text-xs text-text-dim">Includes {kind === 'armor' ? 'armor, suits, masks and helmets' : kind === 'vehicle' ? 'vehicle appearances' : kind === 'dyes' ? 'all catalog dyes' : 'weapon appearances'} from the cosmetic catalog. Some entries may not unlock because of Funcom's game-side limitations. Delivery does not guarantee activation. Unlocks apply to this private server character, not account purchases.</div>}
       {ownershipWarning && <div className="text-xs text-warning">{ownershipWarning}</div>}
+      {requestSubmitted && <p className="text-xs text-text-dim">Grant requests submitted. Game processing may take longer; the counts below show saved unlocks and held tokens. No additional grants are sent by status checks.</p>}
+      {bulkUnlocks && <details className="text-xs text-text-dim">
+        <summary className="cursor-pointer">Browse {label} and unlock status (includes already unlocked)</summary>
+        <input aria-label="Search unlock catalog" value={catalogFilter} onChange={e => setCatalogFilter(e.target.value)} placeholder="Search name or item ID" className="w-full my-2 px-3 py-2 rounded-lg bg-surface-2 border border-border" />
+        <div className="max-h-60 overflow-y-auto space-y-2">
+          {filterCosmeticsCatalog(browseEntries, catalogFilter).map(e => {
+            const id = e.template.toLowerCase()
+            const status = unlocked.has(id) ? 'Unlocked on character' : pending.has(id) ? 'Token held' : submittedTokens.has(id) ? 'Request submitted' : 'Unlock not detected'
+            return <div key={e.template} className="border-b border-border pb-2"><div>{e.name}</div><div>{status}{e.bulk_exclusion ? ` · ${e.bulk_exclusion}` : buildingSets && !e.bulk_building_set ? ' · Excluded from bulk delivery' : ''}</div></div>
+          })}
+        </div>
+      </details>}
       {!playerOnline && <div className="text-xs text-warning">Player must be online to receive {label} tokens.</div>}
       <button
         type="button"
         className="btn-primary w-full"
-        disabled={busy || !playerOnline || missingHouseSwatches.length === 0 || activationQueued}
+        disabled={busy || !playerOnline || missingTokens.length === 0}
         title={!playerOnline ? 'Player must be online' : undefined}
         onClick={async () => {
           if (!window.confirm(
-            `Deliver ${missingHouseSwatches.length} missing ${tokenLabel} token${missingHouseSwatches.length === 1 ? '' : 's'} to ${playerName}?\n\n` +
-            'Online required. Delivery starts immediately. Remain online until the activation notifications start and completely stop, usually about a minute.\n\nDST forces overflow, so excess tokens drop beside the player. Pick up all dropped tokens before running this action again.'
+            `Deliver ${missingTokens.length} missing ${tokenLabel} token${missingTokens.length === 1 ? '' : 's'} to ${playerName}?\n\n` +
+            (bulkUnlocks ? `Some ${buildingSets ? 'sets' : 'skins'} may not unlock because of Funcom's game-side limitations. Delivery does not guarantee activation.\n\n` : '') +
+            'Online required. Delivery starts immediately. Remain online until the activation notifications stop.\n\nDST forces overflow, so excess tokens drop beside the player. Pick up all dropped tokens before running this action again.'
           )) return
           if (await onGrant()) {
+            setSubmittedTokens(current => new Set([...current, ...missingTokens.map(e => e.template.toLowerCase())]))
+            setRequestSubmitted(true)
             setActivationQueued(true)
           }
         }}
       >
         {busy
           ? <><Icon name="Loader2" size={13} className="animate-spin" /> Delivering {label} tokens...</>
-          : activationQueued
-            ? <><Icon name="Loader2" size={13} className="animate-spin" /> Activation cascade running — remain online</>
-          : missingHouseSwatches.length === 0
-            ? <><Icon name="Check" size={13} /> All {label} detected</>
-            : <><Icon name="Palette" size={13} /> Deliver {missingHouseSwatches.length} missing {tokenLabel} tokens</>}
+          : missingTokens.length === 0
+            ? <>No new {label} tokens to request — see unlock status</>
+            : <><Icon name={buildingSets ? "Blocks" : skins ? (kind === 'armor' ? "Shirt" : kind === 'vehicle' ? "Truck" : kind === 'dyes' ? "Palette" : "Sword") : "Palette"} size={13} /> Deliver {missingTokens.length} missing {tokenLabel} tokens</>}
       </button>
+      <button type="button" className="btn-secondary w-full active:scale-[0.99]" disabled={busy || manualRefreshing} aria-busy={manualRefreshing} onClick={() => {
+        setActivationQueued(false)
+        setRefreshFeedback(null)
+        setManualRefreshing(true)
+        setRefreshRequest(current => current + 1)
+      }}>
+        <Icon name={manualRefreshing ? 'Loader2' : 'RefreshCw'} size={13} className={manualRefreshing ? 'animate-spin' : undefined} />
+        {manualRefreshing ? 'Refreshing status…' : 'Refresh unlock status'}
+      </button>
+      {refreshFeedback && <p role="status" aria-live="polite" className={`text-xs flex items-center gap-2 ${refreshFeedback.error ? 'text-warning' : 'text-text-dim'}`}>
+        <Icon name={refreshFeedback.error ? 'TriangleAlert' : 'Check'} size={13} /> {refreshFeedback.message}
+      </p>}
     </div>
   )
 }
@@ -1781,6 +1962,7 @@ export function GivePackageForm({ busy, giveDisabled = false, playerName, target
   showOverflow?: boolean
   onGive: (items: GiveItemEntry[], pkgName: string, allowOverflow: boolean) => void
 }) {
+  const { isPlayer } = usePortalAccess()
   const giveLabel = targetLabel ?? playerName ?? 'player'
   const [packages, setPackages] = useState<ItemPackage[]>([])
   const [loading, setLoading]   = useState(true)
@@ -1958,7 +2140,7 @@ export function GivePackageForm({ busy, giveDisabled = false, playerName, target
                     className="w-full px-3 py-2 rounded-lg bg-surface-2 border border-border text-text text-sm focus:outline-none focus:ring-2 focus:ring-ibad focus:border-ibad/50" />
                 </div>
                 <div>
-                  <label className="block text-[11px] uppercase tracking-wider text-text-dim mb-1">Tier — Mk1-Mk6 (0-5)</label>
+                  <label className="block text-[11px] uppercase tracking-wider text-text-dim mb-1">Grade override (0 = default, 1–5 = custom)</label>
                   <input type="number" min={0} max={5} value={row.quality} disabled={saving}
                     onChange={e => setDraftRows(rows => rows.map((r, j) => j === i ? { ...r, quality: e.target.value } : r))}
                     className="w-full px-3 py-2 rounded-lg bg-surface-2 border border-border text-text text-sm focus:outline-none focus:ring-2 focus:ring-ibad focus:border-ibad/50" />
@@ -2010,7 +2192,7 @@ export function GivePackageForm({ busy, giveDisabled = false, playerName, target
                 <li key={i} className="flex items-center gap-2">
                   <Icon name="Box" size={11} className="shrink-0 text-text-dim/70" />
                   <span className="flex-1 min-w-0 truncate font-mono">{it.template}</span>
-                  <span className="shrink-0">x{it.qty}{it.quality ? ` · Mk${it.quality + 1}` : ''}</span>
+                  <span className="shrink-0">x{it.qty}{it.quality ? ` · Grade ${it.quality}` : ' · Default grade'}</span>
                 </li>
               ))}
             </ul>
@@ -2019,13 +2201,14 @@ export function GivePackageForm({ busy, giveDisabled = false, playerName, target
       )}
       {err && <div className="text-xs text-error">{err}</div>}
       {showOverflow && selected && <OverflowToggle checked={overflow} disabled={busy || saving} onChange={setOverflow} />}
+      {selected && <p className="text-xs text-text-dim">The item template determines its Mk tier. Custom Grade overrides require the player to be offline.</p>}
       {selected && (
         <button className="btn-primary w-full" disabled={busy || saving || giveDisabled}
           onClick={() => onGive(selected.items, selected.name, overflow)}>
           {busy ? <Icon name="Loader2" size={13} className="animate-spin" /> : <Icon name="Check" size={13} />} Give to {giveLabel}
         </button>
       )}
-      <div className="grid grid-cols-4 gap-2">
+      {!isPlayer && <div className="grid grid-cols-4 gap-2">
         <button className="btn-secondary" disabled={busy || saving} onClick={startNew}>
           <Icon name="Plus" size={13} /> New
         </button>
@@ -2038,7 +2221,7 @@ export function GivePackageForm({ busy, giveDisabled = false, playerName, target
         <button className="btn-secondary" disabled={busy || saving || !selected} onClick={() => void remove()}>
           {saving ? <Icon name="Loader2" size={13} className="animate-spin" /> : <Icon name="Trash2" size={13} />} Delete
         </button>
-      </div>
+      </div>}
     </div>
   )
 }
@@ -2705,10 +2888,20 @@ function ProgressionUnlockForm({ busy, onUnlock, onReverse }: {
 function ItemsActionBlock({ player, canWrite, flash, onChanged, onFlush }: {
   player: Player; canWrite: boolean; flash: Flash; onChanged: () => void; onFlush?: () => void
 }) {
+  const { isPlayer } = usePortalAccess()
   const [openId, setOpenId] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
-  const acts = useMemo(() => ACTIONS.filter(a => a.group === ITEMS_GROUP), [])
+  const acts = useMemo(() => {
+    const first = ['give-item', 'give-vehicle-kit', 'give-package', 'grant-cosmetic', 'repair-gear', 'max-augment-attributes']
+    const rank = (action: ActionDef) => {
+      const priority = first.indexOf(action.id)
+      if (priority >= 0) return priority
+      return action.experimental ? 8 : action.liveOnly ? 7 : 6
+    }
+    return ACTIONS.filter(a => a.group === ITEMS_GROUP && (!isPlayer || !PLAYER_HIDDEN_ACTIONS.has(a.id)))
+      .sort((a, b) => rank(a) - rank(b))
+  }, [isPlayer])
 
   if (!canWrite || acts.length === 0) return null
 
@@ -2725,7 +2918,8 @@ function ItemsActionBlock({ player, canWrite, flash, onChanged, onFlush }: {
     setBusy(true)
     try {
       const r = await exec()
-      flash(r.message || `${def.label} done.`, 'ok')
+      const requestOnly = ['grant-cosmetic', 'grant-house-swatches', 'grant-buildable-swatches', 'grant-building-sets', 'grant-armor-skins', 'grant-weapon-skins', 'grant-vehicle-skins', 'grant-all-dyes'].includes(def.custom || '')
+      flash(r.message || (requestOnly ? `${def.label} request submitted.` : `${def.label} done.`), requestOnly ? 'info' : 'ok')
       onChanged()
       return true
     } catch (e) {
@@ -2737,13 +2931,18 @@ function ItemsActionBlock({ player, canWrite, flash, onChanged, onFlush }: {
   }
 
   return (
-    <div className="player-manage-grid mb-2">
-      {acts.map(a => (
+    <div className="space-y-3 mb-2">
+      {[0, 1, 2].map(tier => {
+        const items = acts.filter(action => (action.experimental ? 2 : action.liveOnly ? 1 : 0) === tier)
+        return items.length > 0 && <div key={tier} className="player-manage-grid player-items-grid">
+      {items.map(a => (
         <div key={a.id} data-expanded={openId === a.id ? 'true' : undefined}>
           <ActionRow def={a} player={player} busy={busy} stats={null}
             open={openId === a.id} onToggle={() => openAction(a.id)} runAction={runAction} />
         </div>
       ))}
+        </div>
+      })}
     </div>
   )
 }
@@ -2768,8 +2967,50 @@ export function ManagePlayerSection({ player, canWrite, flash, onChanged, onFlus
 import { getPlayerDetail, type InventoryItem, type PlayerDetailResponse } from '../../../api/gameplay'
 import { qualityClass } from '../shared'
 
-export function InventorySection({ player, canWrite, demo, refreshKey, flash, onChanged, onFlush }: SectionProps) {
+export function InventorySection(props: SectionProps) {
+  const [repairing, setRepairing] = useState(false)
+  const [repairRevision, setRepairRevision] = useState(0)
+  const online = (props.player.online_status || '').toLowerCase() === 'online'
+  const [view, setView] = useState<'items' | 'storage' | 'tools'>(() => new URLSearchParams(window.location.search).get('scope_type') === 'storage' || new URLSearchParams(window.location.search).get('location_type') === 'storage' ? 'storage' : 'items')
+  const inventorySearch = useSearch()
+  useEffect(() => {
+    const params = new URLSearchParams(inventorySearch)
+    if (params.get('scope_type') === 'storage' || params.get('location_type') === 'storage') setView('storage')
+  }, [inventorySearch])
+  const selectedPlayer = useMemo(() => ({ id: props.player.id, name: props.player.name }), [props.player.id, props.player.name])
+  return <div className="space-y-4">
+    <div role="tablist" aria-label="Player inventory" className="flex flex-wrap gap-2">
+      {([['items', 'Backpack & bank'], ['storage', 'Storage containers'], ['tools', 'Item tools']] as const).map(([id, label]) =>
+        <button key={id} role="tab" aria-selected={view === id} className={view === id ? 'btn-primary' : 'btn-secondary'} onClick={() => {
+          const url = new URL(window.location.href)
+          for (const key of ['scope_type', 'scope_id', 'location_type', 'location_id', 'q']) url.searchParams.delete(key)
+          window.history.replaceState(null, '', url)
+          window.dispatchEvent(new PopStateEvent('popstate'))
+          setView(id)
+        }}>{label}</button>)}
+    </div>
+    {view !== 'storage' && props.canWrite && !props.demo && <div className="flex flex-wrap items-center gap-3">
+      <button type="button" className="btn-secondary" disabled={repairing || online}
+        title={online ? 'Player must be offline before repairing backpack and equipped gear.' : 'Repairs this player’s backpack, equipped armor and equipped weapons only.'}
+        onClick={async () => {
+          setRepairing(true)
+          try {
+            const result = await repairGear(props.player.id)
+            props.flash(result.message, 'ok'); setRepairRevision(value => value + 1); props.onChanged()
+          } catch(reason) { props.flash(reason instanceof Error ? reason.message : String(reason), 'err') }
+          finally { setRepairing(false) }
+        }}><Icon name="Wrench" size={14} />{repairing ? 'Repairing…' : 'Repair backpack & worn items'}</button>
+      <span className="text-xs text-text-dim">Backpack and equipped gear only. Player must be offline.</span>
+    </div>}
+    {view === 'tools' ? <PlayerItemToolsSection key={props.player.id} {...props} refreshKey={props.refreshKey + repairRevision} /> : <SharedInventoryExplorer key={`${props.player.id}:${view}`}
+      selectedPlayer={selectedPlayer} demoMode={props.demo} refreshKey={props.refreshKey + repairRevision} entityTypes={view === 'storage' ? ['storage'] : ['player']}
+      title={view === 'storage' ? 'Storage containers' : 'Backpack & bank'} />}
+  </div>
+}
+
+export function PlayerItemToolsSection({ player, canWrite, demo, refreshKey, flash, onChanged, onFlush }: SectionProps) {
   const contextual = useCommandDeck()
+  const [inventoryPage, setInventoryPage] = useState(0)
   const [detail, setDetail] = useState<PlayerDetailResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState<string | null>(null)
@@ -2782,12 +3023,12 @@ export function InventorySection({ player, canWrite, demo, refreshKey, flash, on
   useEffect(() => {
     let alive = true
     setLoading(true); setErr(null)
-    getPlayerDetail(player.id, player.controller_id, demo)
+    getPlayerDetail(player.id, player.controller_id, demo, inventoryPage * 28, 'item')
       .then(r => { if (alive) setDetail(r) })
       .catch(e => { if (alive) setErr(e instanceof Error ? e.message : String(e)) })
       .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [player.id, player.controller_id, demo, refreshKey, tick])
+  }, [player.id, player.controller_id, demo, refreshKey, tick, inventoryPage])
 
   useEffect(() => {
     let alive = true
@@ -2837,6 +3078,11 @@ export function InventorySection({ player, canWrite, demo, refreshKey, flash, on
   return (
     <div className="space-y-4">
       {!contextual && <div className="flex items-center justify-end">{refreshButton}</div>}
+      <div className="flex items-center gap-3" aria-label="Item editor pages">
+        <button className="btn-secondary" disabled={loading || inventoryPage === 0} onClick={() => setInventoryPage(page => page - 1)}>Previous</button>
+        <span>Page {inventoryPage + 1} · Showing {groups.gear.length} inventory {groups.gear.length === 1 ? 'item' : 'items'}</span>
+        <button className="btn-secondary" disabled={loading || !detail?.inventory_has_more} onClick={() => setInventoryPage(page => page + 1)}>Next</button>
+      </div>
       {!demo && <ReserveRecoveryCard
         preview={reserve}
         error={reserveErr}
@@ -2849,12 +3095,47 @@ export function InventorySection({ player, canWrite, demo, refreshKey, flash, on
         playerId={player.id}
         toolbar={contextual ? refreshButton : undefined}
         canWrite={canWrite} busy={busy} run={run} isOnline={isOnline} />
-      <ItemList title={`Emotes (${fmtNum(groups.emotes.length)})`} icon="Smile" items={groups.emotes} collapsed
-        playerId={player.id} canWrite={canWrite} busy={busy} run={run} isOnline={isOnline} />
-      <ItemList title={`Contract items (${fmtNum(groups.contracts.length)})`} icon="FileText" items={groups.contracts} collapsed
-        playerId={player.id} canWrite={canWrite} busy={busy} run={run} isOnline={isOnline} />
+      <AuxiliaryInventoryList key={`${player.id}:emote`} kind="emote" player={player} demo={demo} refreshKey={`${refreshKey}:${tick}`}
+        canWrite={canWrite} busy={busy} run={run} isOnline={isOnline} />
+      <AuxiliaryInventoryList key={`${player.id}:contract`} kind="contract" player={player} demo={demo} refreshKey={`${refreshKey}:${tick}`}
+        canWrite={canWrite} busy={busy} run={run} isOnline={isOnline} />
     </div>
   )
+}
+
+function AuxiliaryInventoryList({kind, player, demo, refreshKey, canWrite, busy, run, isOnline}: {
+  kind: 'emote' | 'contract'; player: Player; demo: boolean; refreshKey: string; canWrite: boolean; busy: boolean; isOnline: boolean
+  run: (fn: () => Promise<{message:string}>, label:string) => Promise<boolean>
+}) {
+  const [open,setOpen] = useState(false)
+  const [page,setPage] = useState(0)
+  const [detail,setDetail] = useState<PlayerDetailResponse | null>(null)
+  const [loading,setLoading] = useState(false)
+  const [error,setError] = useState('')
+  useEffect(() => {
+    if (!open) return
+    let alive = true
+    setLoading(true); setError(''); setDetail(null)
+    getPlayerDetail(player.id,player.controller_id,demo,page * 28,kind)
+      .then(value => { if(alive) setDetail(value) })
+      .catch(reason => { if(alive) setError(reason instanceof Error ? reason.message : String(reason)) })
+      .finally(() => { if(alive) setLoading(false) })
+    return () => { alive = false }
+  },[open,player.id,player.controller_id,demo,page,kind,refreshKey])
+  const items = (detail?.inventory ?? []).filter(item => item.kind === kind)
+  const title = kind === 'emote' ? 'Emotes' : 'Contract items'
+  return <ItemList title={`${title}${detail ? ` (${items.length})` : ''}`} icon={kind === 'emote' ? 'Smile' : 'FileText'}
+    items={items} playerId={player.id} canWrite={canWrite} busy={busy} run={run} isOnline={isOnline}
+    expanded={open} onToggle={() => setOpen(value => !value)}
+    extra={<div className="space-y-2 mb-2">
+      {loading && <Loading label={`Loading ${title.toLowerCase()}…`} />}
+      {error && <ErrorBox msg={error} />}
+      {detail && <div className="flex items-center gap-3 text-xs">
+        <button className="btn-secondary" disabled={loading || page === 0} onClick={() => setPage(value => value - 1)}>Previous {title.toLowerCase()}</button>
+        <span>Page {page + 1}</span>
+        <button className="btn-secondary" disabled={loading || !detail.inventory_has_more} onClick={() => setPage(value => value + 1)}>Next {title.toLowerCase()}</button>
+      </div>}
+    </div>} />
 }
 
 function ReserveRecoveryCard({ preview, error, canWrite, busy, player, run }: {
@@ -2946,20 +3227,23 @@ function ReserveRecoveryCard({ preview, error, canWrite, busy, player, run }: {
   )
 }
 
-function ItemList({ title, icon, items, playerId, canWrite, busy, run, collapsed, extra, isOnline, toolbar }: {
+function ItemList({ title, icon, items, playerId, canWrite, busy, run, collapsed, extra, isOnline, toolbar, expanded, onToggle }: {
   title: string; icon: string; items: InventoryItem[]; canWrite: boolean; busy: boolean
   playerId: number
   run: (fn: () => Promise<{ message: string }>, label: string) => Promise<boolean>
   collapsed?: boolean
+  expanded?: boolean
+  onToggle?: () => void
   extra?: React.ReactNode
   toolbar?: React.ReactNode
   isOnline: boolean
 }) {
   const contextual = useCommandDeck()
-  const [open, setOpen] = useState(!collapsed)
+  const [localOpen, setOpen] = useState(!collapsed)
+  const open = expanded ?? localOpen
   const [editingId, setEditingId] = useState<number | null>(null)
   if (collapsed && items.length === 0) return null
-  const heading = <button type="button" onClick={() => setOpen(o => !o)} aria-expanded={open}
+  const heading = <button type="button" onClick={() => { if (onToggle) onToggle(); else setOpen(o => !o) }} aria-expanded={open}
         className="flex w-full items-center gap-2 text-xs uppercase tracking-wider text-text-dim hover:text-text mb-2">
         <Icon name={open ? 'ChevronDown' : 'ChevronRight'} size={13} />
         <Icon name={icon} size={13} />
@@ -3052,7 +3336,7 @@ function ItemList({ title, icon, items, playerId, canWrite, busy, run, collapsed
                         <AmmoEditor item={it} playerId={playerId} busy={busy} run={run} isOnline={isOnline} onClose={() => setEditingId(null)} />
                       )}
                       {it.durability !== 'N/A' && (
-                        <DurabilityEditor item={it} busy={busy} run={run} isOnline={isOnline} onClose={() => setEditingId(null)} />
+                        <DurabilityEditor key={`${it.id}:${it.durability}:${it.max_durability}`} item={it} busy={busy} run={run} isOnline={isOnline} onClose={() => setEditingId(null)} />
                       )}
                       {hasWater && (
                         <WaterEditor item={it} busy={busy} run={run} onClose={() => setEditingId(null)} />

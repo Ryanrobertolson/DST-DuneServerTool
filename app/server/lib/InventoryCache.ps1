@@ -114,7 +114,15 @@ function Invoke-DuneInventoryOccurrenceCachePage {
             cursorSource = 'cache'
             generation = [string]$result.generation
             freshness = ConvertTo-DuneInventoryCacheFreshness -Result $result
-            items = @($result.data.items)
+            items = @(foreach ($item in @($result.data.items)) {
+                if ($item.templateId -and $item.metadata) {
+                    $rule = Get-DuneGameplayItemRule -TemplateId ([string]$item.templateId)
+                    $maximum = [Math]::Max(0, [double]$rule.max_durability)
+                    if ($item.metadata -is [System.Collections.IDictionary]) { $item.metadata['baseMaxDurability'] = $maximum }
+                    else { $item.metadata | Add-Member -NotePropertyName baseMaxDurability -NotePropertyValue $maximum -Force }
+                }
+                $item
+            })
             players = @($result.data.players)
             locations = @($result.data.locations)
             selectedPlayerValid = [bool]$result.data.selectedPlayerValid
@@ -134,6 +142,18 @@ function Invoke-DuneInventoryOccurrenceCachePage {
 }
 
 function Invoke-DuneInventoryCacheRefresh {
+    param([int]$TimeoutSec = 120)
+
+    # Page visits and explicit refreshes share the complete refresh, not just
+    # its database query. Simultaneous clients must not repeat item projection
+    # and cache replacement after waiting for the same source read.
+    return Invoke-DunePlatformSingleFlight -Key 'inventory:page-refresh' `
+        -TimeoutSec $TimeoutSec -ResultReuseSec 1 -Script {
+            Invoke-DuneInventoryCacheRefreshCore -TimeoutSec $TimeoutSec
+        }
+}
+
+function Invoke-DuneInventoryCacheRefreshCore {
     param([int]$TimeoutSec = 120)
 
     $sourceKey = 'inventory.snapshot'

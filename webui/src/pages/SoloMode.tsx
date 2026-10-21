@@ -1,8 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon } from '../components/Icon'
+import { RESPAWN_SETTING_GUIDANCE } from '../util/respawnSettingGuidance'
 import { PageHeader } from '../components/PageHeader'
 import { CollapsibleCard } from '../components/CollapsibleCard'
 import { ItemPicker } from '../components/ItemPicker'
+import { SoloMods } from '../components/solo/SoloMods'
+import { SoloLiveMap } from '../components/solo/SoloLiveMap'
+import { SoloDeck } from '../components/solo/SoloDeck'
+import { SoloRegisTanks } from '../components/solo/SoloRegisTanks'
+import { SoloFactionProgression } from '../components/solo/SoloFactionProgression'
+import { SoloCharacterXp } from '../components/solo/SoloCharacterXp'
+import { CodexOwnership } from '../components/CodexOwnership'
+import { SoloJourneyCompletion } from '../components/solo/SoloJourneyCompletion'
+import { SoloNumericSettingInput } from '../components/solo/SoloNumericSettingInput'
+import { WickMaps } from './WickMaps'
 import { AugmentPicker } from '../components/AugmentPicker'
 import {
   SoloInventoryExplorer,
@@ -22,20 +33,32 @@ import {
   completeSoloFindTheFremen,
   completeSoloNpe,
   enableSoloAllSkills,
+  unlockSoloTrainer,
+  unlockSoloTestingStations,
   exportSoloBlueprint,
   exportSoloDiagnostics,
   setSoloSpecialization,
   resetSoloSpecializationRewards,
   grantSoloItems,
+  grantSoloUnlocks,
+  grantSoloReviewedCustomization,
+  type SoloUnlockKind,
+  type SoloCosmeticOwnership,
   importSoloBlueprint,
   maxSoloAugmentAttributes,
   restoreSoloBackup,
   saveSoloConsoleSettings,
+  saveSoloBlueprintSettings,
+  type SoloBlueprintSettings,
   saveSoloSettings,
   setSoloWeaponAmmo,
+  repairSoloEquipment,
   setSoloCurrencies,
   setSoloProgressionPoints,
+  setSoloFactionProgression,
+  setSoloCharacterXp,
   maxSoloSpecializations,
+  unlockSoloMainQuest,
   type SoloBackup,
   type SoloBackupsResponse,
   type SoloConsoleSettingsResponse,
@@ -46,6 +69,7 @@ import {
   type SoloProfile,
   type SoloRuntime,
   type SoloSavedBlueprint,
+  type SoloSetting,
   type SoloSettingsResponse,
   type SoloStatus,
 } from '../api/solo'
@@ -53,6 +77,9 @@ import {
   downloadBlueprintFile,
   filterCosmeticsCatalog,
   getCosmeticsCatalog,
+  getBuildingSetCosmetics,
+  getSkinCosmetics,
+  getHouseSwatchCosmetics,
   getVehicleKitCatalog,
   type BlueprintFile,
   type AugmentSelection,
@@ -63,15 +90,19 @@ import {
 } from '../api/gameplay'
 import { pickLocalFolder } from '../util/pathPicker'
 import { soloSaveFolder } from '../util/soloSaveFolder'
+import { COSMETIC_LICENSE_NOTICE } from '../util/cosmeticEntitlements'
 
-type Tab = 'overview' | 'settings' | 'backups' | 'character' | 'inventory' | 'progression'
+type Tab = 'overview' | 'settings' | 'mods' | 'backups' | 'character' | 'inventory' | 'progression' | 'dd-map' | 'steam-deck'
 const TABS: Array<{ id: Tab; label: string; icon: string }> = [
   { id: 'overview', label: 'Overview', icon: 'LayoutGrid' },
   { id: 'settings', label: 'Settings', icon: 'SlidersHorizontal' },
+  { id: 'mods', label: 'Solo mods', icon: 'Package' },
   { id: 'backups', label: 'Backups', icon: 'ArchiveRestore' },
   { id: 'character', label: 'Character', icon: 'UserRound' },
   { id: 'inventory', label: 'Inventory', icon: 'Package' },
   { id: 'progression', label: 'Progression', icon: 'ChartNoAxesCombined' },
+  { id: 'dd-map', label: 'DD Map', icon: 'Map' },
+  { id: 'steam-deck', label: 'Steam Deck', icon: 'Gamepad2' },
 ]
 
 export const SOLO_FIRST_USE_STEPS = [
@@ -148,6 +179,7 @@ const SOLO_BOOLEAN_SETTINGS = new Set([
 const SOLO_INTEGER_SETTINGS = new Set([
   'FiefdomLimit',
   'MaxLandclaimSegments',
+  'PlayerInventoryStartingSize',
 ])
 
 const SOLO_SELECT_SETTINGS: Record<string, SoloSettingOption[]> = {
@@ -168,6 +200,16 @@ const SOLO_SELECT_SETTINGS: Record<string, SoloSettingOption[]> = {
     { value: 'NeverAllowOtherPlayers', label: 'Never allow other players' },
     { value: 'AlwaysAllowOtherPlayers', label: 'Always allow other players' },
   ],
+}
+
+export function getPendingSoloSettingChanges(entries: SoloSetting[], draft: Record<string, string>): Record<string, string> {
+  const changed: Record<string, string> = {}
+  for (const entry of entries) {
+    if (SOLO_READ_ONLY_SETTINGS.has(entry.key) || SOLO_HIDDEN_SETTINGS.has(entry.key)) continue
+    const next = draft[entry.key] ?? ''
+    if (next !== entry.value || (entry.needsApply && next !== '')) changed[entry.key] = next
+  }
+  return changed
 }
 
 export function getSoloSettingControl(key: string): SoloSettingControl {
@@ -250,7 +292,7 @@ const SETTING_GROUPS: Array<{ title: string; keys: string[] }> = [
       'DifficultyLevel', 'GatheringAmount', 'CraftingCost',
       'WaterExtractionRate', 'CraftingTimeMultiplier', 'BuildingCostMultiplier',
       'ResourceRespawnSpeed', 'LootRespawnSpeed', 'FuelBurnTimeMultiplier',
-      'InventoryVolumeMultiplier',
+      'InventoryVolumeMultiplier', 'PlayerInventoryStartingSize',
     ],
   },
   {
@@ -325,7 +367,7 @@ function StatusPill({ ok, children }: { ok: boolean; children: React.ReactNode }
 }
 
 export const SOLO_COSMETIC_ENTITLEMENT_WARNING =
-  'Grants apply only to this Solo save. They do not create Funcom account ownership or unlock content on official servers.'
+  'Grants apply only to this Solo character. They do not create Funcom account ownership.'
 
 export function groupSoloCosmetics(
   catalog: CosmeticEntry[],
@@ -382,11 +424,15 @@ export function SoloCosmeticGrantCard({
   disabled,
   loadCatalog = getCosmeticsCatalog,
   onGrant,
+  onBulkGrant,
+  ownership,
 }: {
   busy: boolean
   disabled: boolean
   loadCatalog?: () => Promise<CosmeticEntry[]>
   onGrant: (templateId: string, label: string) => Promise<void>
+  onBulkGrant?: (kind: SoloUnlockKind, label: string) => Promise<void>
+  ownership?: SoloCosmeticOwnership
 }) {
   const [catalog, setCatalog] = useState<CosmeticEntry[] | null>(null)
   const [catalogError, setCatalogError] = useState('')
@@ -409,15 +455,28 @@ export function SoloCosmeticGrantCard({
   const matches = useMemo(() => groups.flatMap(([, entries]) => entries), [groups])
   const chosen = matches.find(entry => entry.template === selected)
   const controlsDisabled = disabled || busy
+  const owned = new Set((ownership?.owned ?? []).map(id => id.toLowerCase()))
+  const pending = new Set((ownership?.pending ?? []).map(id => id.toLowerCase()))
+  const saved = new Set((ownership?.unlocked ?? []).map(id => id.toLowerCase()))
+  const bulkGroups: Array<[SoloUnlockKind, string, CosmeticEntry[]]> = [
+    ['building-sets', 'All Building Sets', getBuildingSetCosmetics(catalog ?? [])],
+    ['armor', 'All Armor Skins', getSkinCosmetics(catalog ?? [], 'armor')],
+    ['weapon', 'All Weapon Skins', getSkinCosmetics(catalog ?? [], 'weapon')],
+    ['vehicle', 'All Vehicle Skins', getSkinCosmetics(catalog ?? [], 'vehicle')],
+    ['dyes', 'All Dyes', getSkinCosmetics(catalog ?? [], 'dyes')],
+    ['house', 'House Swatches', getHouseSwatchCosmetics(catalog ?? [])],
+    ['placeables', 'Buildable House Swatches', getHouseSwatchCosmetics(catalog ?? [], 'placeables')],
+  ]
 
   return (
     <div className="card p-5 xl:col-span-2">
       <h3 className="font-semibold mb-1">Grant Cosmetic / Building Set</h3>
       <p className="text-xs text-text-muted mb-4">
-        Delivers one unlock item to the Solo backpack for processing on next login.
+        Delivers unlock tokens to the Solo backpack for processing on next login. Bulk grants use available slots; log in, exit, and repeat for remaining tokens.
       </p>
       <div className="rounded border border-warning/30 bg-warning/5 p-3 mb-4 text-xs text-text-muted">
-        {SOLO_COSMETIC_ENTITLEMENT_WARNING} Some developer or entitlement entries may remain ordinary inventory items and do nothing. Owned-state detection is not available for Solo yet, so the full catalog is shown and duplicate grants are possible.
+        <p>{COSMETIC_LICENSE_NOTICE}</p>
+        <p className="mt-2">{SOLO_COSMETIC_ENTITLEMENT_WARNING} Saved unlocks do not guarantee in-game usability. Bulk grants skip saved unlocks and held tokens; new tokens are processed on next login.</p>
       </div>
       {catalogError ? (
         <div className="text-xs text-danger">Cosmetics catalog failed to load: {catalogError}</div>
@@ -427,6 +486,14 @@ export function SoloCosmeticGrantCard({
         </div>
       ) : (
         <>
+          {onBulkGrant && <div className="grid sm:grid-cols-2 gap-2 mb-4">
+            {bulkGroups.map(([kind, label, entries]) => {
+              const missing = entries.filter(entry => !owned.has(entry.template.toLowerCase())).length
+              return <button key={kind} className="btn-secondary" disabled={controlsDisabled || !ownership?.available || missing === 0}
+                onClick={() => void onBulkGrant(kind, label)}>{label} ({missing} missing)</button>
+            })}
+            {!ownership?.available && <p className="text-xs text-warning sm:col-span-2">{ownership?.error || 'Reconnect and validate the save to check unlock ownership.'}</p>}
+          </div>}
           <input
             type="text"
             value={query}
@@ -452,6 +519,8 @@ export function SoloCosmeticGrantCard({
             ))}
           </select>
           {chosen && <p className="text-[11px] font-mono text-text-dim truncate mt-2">{chosen.template}</p>}
+          {chosen && pending.has(chosen.template.toLowerCase()) && <p className="text-xs text-text-muted mt-2">Unlock token already held in inventory. You can grant another token.</p>}
+          {chosen && !pending.has(chosen.template.toLowerCase()) && saved.has(chosen.template.toLowerCase()) && <p className="text-xs text-text-muted mt-2">Unlock record saved. You can grant another token if the game still reports it locked.</p>}
           <button
             className={`btn-primary w-full mt-4 justify-center ${SOLO_DISABLED_PRIMARY_CLASS}`}
             disabled={controlsDisabled || !chosen}
@@ -474,12 +543,17 @@ export function SoloMode() {
   const runtimeState = useApi<SoloRuntime>('/api/solo/runtime', { intervalMs: 3000 })
   const connected = statusState.data?.connected === true
   const activeProfileToken = statusState.data?.profileToken ?? ''
+  const [connectionRevision, setConnectionRevision] = useState(0)
   const settingsState = useApi<SoloSettingsResponse>('/api/solo/settings', { enabled: connected })
   const consoleSettingsState = useApi<SoloConsoleSettingsResponse>(
     '/api/solo/console-settings',
     { enabled: connected },
   )
   const backupsState = useApi<SoloBackupsResponse>('/api/solo/backups', { enabled: connected })
+  const blueprintSettingsState = useApi<SoloBlueprintSettings>(
+    `/api/solo/blueprint-settings?expectedProfileToken=${encodeURIComponent(activeProfileToken)}`,
+    { enabled: connected },
+  )
   const blueprintsState = useApi<{ ok: boolean; profileToken: string; blueprints: SoloSavedBlueprint[] }>(
     `/api/solo/blueprints?expectedProfileToken=${encodeURIComponent(activeProfileToken)}`,
     { enabled: connected && Boolean(activeProfileToken) },
@@ -487,6 +561,7 @@ export function SoloMode() {
   const [dataRoot, setDataRoot] = useState('')
   const [selectedDb, setSelectedDb] = useState('')
   const [discoveredProfiles, setDiscoveredProfiles] = useState<SoloProfile[]>([])
+  const [savePlatform, setSavePlatform] = useState<'auto' | 'steam' | 'xbox'>('auto')
   const [draft, setDraft] = useState<Record<string, string>>({})
   const [consoleDraft, setConsoleDraft] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState<string | null>(null)
@@ -508,7 +583,8 @@ export function SoloMode() {
   const [scripDraft, setScripDraft] = useState(0)
   const [skillPointsDraft, setSkillPointsDraft] = useState(0)
   const [intelDraft, setIntelDraft] = useState(0)
-  const [journeyAction, setJourneyAction] = useState<'fremen' | 'npe'>('fremen')
+  const [trainerJob, setTrainerJob] = useState('Swordmaster')
+  const [testingStation, setTestingStation] = useState('all')
   const initializedFromStatus = useRef(false)
 
   useEffect(() => {
@@ -581,13 +657,7 @@ export function SoloMode() {
     [settingsState.data],
   )
   const changedSettings = useMemo(() => {
-    const changed: Record<string, string> = {}
-    for (const entry of settingsState.data?.entries ?? []) {
-      if (SOLO_READ_ONLY_SETTINGS.has(entry.key) || SOLO_HIDDEN_SETTINGS.has(entry.key)) continue
-      const next = draft[entry.key] ?? ''
-      if (next !== entry.value) changed[entry.key] = next
-    }
-    return changed
+    return getPendingSoloSettingChanges(settingsState.data?.entries ?? [], draft)
   }, [draft, settingsState.data])
   const changedConsoleSettings = useMemo(() => {
     const changed: Record<string, string> = {}
@@ -599,8 +669,8 @@ export function SoloMode() {
   }, [consoleDraft, consoleSettingsState.data])
 
   const scanPath = async (path: string) => {
-    const discovery = await discoverSolo(path)
-    setDataRoot(discovery.dataRoot)
+    const discovery = await discoverSolo(path, savePlatform)
+    setDataRoot(discovery.dataRoot || discovery.profiles.find(p => p.dbPath === discovery.suggestedDbPath)?.dataRoot || '')
     setDiscoveredProfiles(discovery.profiles)
     setSelectedDb(discovery.suggestedDbPath)
     return discovery
@@ -641,6 +711,7 @@ export function SoloMode() {
         return
       }
       const result = await connectSolo(discovery.dataRoot, dbPath)
+      setConnectionRevision(value => value + 1)
       setDataRoot(result.dataRoot)
       setSelectedDb(result.dbPath)
       setDiscoveredProfiles(result.profiles)
@@ -649,6 +720,7 @@ export function SoloMode() {
       await runtimeState.refresh()
       await settingsState.refresh()
       await consoleSettingsState.refresh()
+      await blueprintSettingsState.refresh()
       await backupsState.refresh()
     } catch (error) {
       setNotice({ kind: 'err', text: error instanceof Error ? error.message : String(error) })
@@ -680,10 +752,6 @@ export function SoloMode() {
       setNotice({ kind: 'err', text: validationError })
       return
     }
-    if (!window.confirm(
-      'Confirm Dune: Awakening is fully closed.\n\n'
-      + 'DST will retain a copy of ServerCustomSettings.ini, replace the file, and verify every changed value.',
-    )) return
     setBusy('settings')
     setNotice(null)
     try {
@@ -714,10 +782,6 @@ export function SoloMode() {
       return
     }
     if (Object.keys(changedConsoleSettings).length === 0) return
-    if (!window.confirm(
-      `Apply ${Object.keys(changedConsoleSettings).length} Retail Solo Engine.ini setting(s)?\n\n`
-      + 'Dune: Awakening must be fully closed. DST will retain Config\\Windows\\Engine.ini, write only the three allowlisted ConsoleVariables, and verify the result.',
-    )) return
 
     setBusy('console-settings')
     setNotice(null)
@@ -738,6 +802,22 @@ export function SoloMode() {
     } finally {
       setBusy(null)
     }
+  }
+
+  const changeBlueprintSettings = async (enabled: boolean) => {
+    if (!selectionMatchesActive || gameRunning) {
+      setNotice({ kind: 'err', text: 'Connect the selected Solo profile and close Dune: Awakening before changing blueprint settings.' })
+      return
+    }
+    setBusy('blueprint-settings')
+    setNotice(null)
+    try {
+      await saveSoloBlueprintSettings(enabled, activeProfileToken)
+      setNotice({ kind: 'ok', text: enabled ? 'Instant blueprint build settings saved and verified.' : 'Previous blueprint build settings restored and verified.' })
+      await Promise.all([blueprintSettingsState.refresh(), runtimeState.refresh()])
+    } catch (error) {
+      setNotice({ kind: 'err', text: error instanceof Error ? error.message : String(error) })
+    } finally { setBusy(null) }
   }
 
   const createBackup = async () => {
@@ -862,12 +942,6 @@ export function SoloMode() {
       setNotice({ kind: 'err', text: 'Choose a backpack or built storage destination.' })
       return false
     }
-    if (!window.confirm(
-      `Give ${label} to the ${targetLabel}?\n\n`
-      + 'Dune: Awakening must be fully closed. DST will retain the current game.db, '
-      + 'apply the item grant transactionally, run integrity and foreign-key checks, '
-      + 'replace the save atomically, and verify the result.',
-    )) return false
 
     setBusy('give-items')
     setNotice(null)
@@ -879,7 +953,7 @@ export function SoloMode() {
       )
       setNotice({
         kind: 'ok',
-        text: `${label} granted and verified. Previous save retained at ${result.safetyBackup}`,
+        text: `${label} granted to the ${targetLabel} and verified. Previous save retained at ${result.safetyBackup}`,
       })
       await Promise.all([statusState.refresh(), runtimeState.refresh(), backupsState.refresh()])
       return true
@@ -995,14 +1069,6 @@ export function SoloMode() {
       return
     }
     const label = blueprint.name || blueprintFileName || 'Unnamed blueprint'
-    if (!window.confirm(
-      `Import ${label} into the Solo backpack?\n\n`
-      + `This blueprint contains ${blueprint.instances.length} pieces, ${blueprint.placeables.length} placeables, `
-      + `and ${blueprint.pentashields.length} pentashields.\n\n`
-      + 'Dune: Awakening must be fully closed. DST will retain the current game.db, '
-      + 'write the blueprint transactionally, run integrity and foreign-key checks, '
-      + 'replace the save atomically, and verify the result.',
-    )) return
 
     setBusy('import-blueprint')
     setNotice(null)
@@ -1039,10 +1105,6 @@ export function SoloMode() {
     }
     const solari = Math.max(0, Math.min(2_000_000_000, Math.trunc(solariDraft || 0)))
     const scrip = Math.max(0, Math.min(2_000_000_000, Math.trunc(scripDraft || 0)))
-    if (!window.confirm(
-      `Set Solo balances to ${solari.toLocaleString()} Solari and ${scrip.toLocaleString()} Landsraad Scrip?\n\n`
-      + 'DST will retain the current game.db and verify both balances before replacing the save.',
-    )) return
     setBusy('currencies')
     setNotice(null)
     try {
@@ -1073,10 +1135,6 @@ export function SoloMode() {
       setNotice({ kind: 'err', text: 'Close Dune: Awakening completely before filling a Solo item.' })
       return
     }
-    if (!window.confirm(
-      `Fill ${label} to ${capacity.toLocaleString()} mL?\n\n`
-      + 'DST will retain the current game.db, update only this item, and verify the result.',
-    )) return
     setBusy(`fill:${itemId}`)
     setNotice(null)
     try {
@@ -1086,7 +1144,7 @@ export function SoloMode() {
       )
       setNotice({
         kind: 'ok',
-        text: `${label} filled and verified. Previous save retained at ${result.safetyBackup}`,
+        text: `${label} filled to ${capacity.toLocaleString()} mL and verified. Previous save retained at ${result.safetyBackup}`,
       })
       await Promise.all([statusState.refresh(), runtimeState.refresh(), backupsState.refresh()])
     } catch (error) {
@@ -1138,6 +1196,18 @@ export function SoloMode() {
     }
   }
 
+  const [repairContainer, setRepairContainer] = useState('')
+  const repairEquipment = async (destination = 'carried') => {
+    if (!canMutateActiveProfile || gameRunning || busy !== null) return
+    setBusy('repair-equipment'); setNotice(null)
+    try {
+      const result = await repairSoloEquipment(statusState.data?.profileToken ?? '', destination)
+      setNotice({kind: 'ok', text: `Repaired ${result.repaired} equipment item(s).${result.safetyBackup ? ` Backup: ${result.safetyBackup}` : ''}`})
+      await Promise.all([statusState.refresh(), runtimeState.refresh(), backupsState.refresh()])
+    } catch (error) { setNotice({kind: 'err', text: error instanceof Error ? error.message : String(error)}) }
+    finally { setBusy(null) }
+  }
+
   const setWeaponAmmo = async (itemId: number, label: string, ammo: number) => {
     if (!selectionMatchesActive) {
       setNotice({ kind: 'err', text: 'Connect and validate the selected Solo profile before changing weapon ammo.' })
@@ -1148,10 +1218,6 @@ export function SoloMode() {
       setNotice({ kind: 'err', text: 'Close Dune: Awakening completely before changing Solo weapon ammo.' })
       return
     }
-    if (!window.confirm(
-      `Set ${label} to ${ammo.toLocaleString()} loaded ammo?\n\n`
-      + 'DST will retain the current game.db, update only this ranged weapon, and verify the saved value.',
-    )) return
     setBusy(`ammo:${itemId}`)
     setNotice(null)
     try {
@@ -1177,11 +1243,6 @@ export function SoloMode() {
       setNotice({ kind: 'err', text: 'Close Dune: Awakening completely before changing Solo augments.' })
       return
     }
-    if (!window.confirm(
-      'Max every non-zero attribute roll on the Solo character’s carried augments?\n\n'
-      + 'This action preserves zero and non-numeric entries, excludes Developer Storage, '
-      + 'retains the current game.db, and verifies the write before replacing the save. Relog required.',
-    )) return
     setBusy('max-augments')
     setNotice(null)
     try {
@@ -1216,7 +1277,10 @@ export function SoloMode() {
       setNotice({ kind: 'err', text: 'Close Dune: Awakening completely before changing Solo progression.' })
       return
     }
-    if (!window.confirm(
+    if (key === 'testing-stations' && !window.confirm(
+      'Unlock the selected Testing Station difficulties? DST will back up the save and record completion progress. Choose your difficulty in-game; faction requirements still apply.',
+    )) return
+    if (key === 'reset-specialization-rewards' && !window.confirm(
       `${label}?\n\n`
       + 'This action retains the current game.db, writes one transaction, verifies progression semantics and SQLite integrity, then replaces the save atomically.',
     )) return
@@ -1247,10 +1311,6 @@ export function SoloMode() {
     }
     const skillPoints = Math.max(0, Math.min(2_000_000_000, Math.trunc(skillPointsDraft || 0)))
     const intel = Math.max(0, Math.min(2_000_000_000, Math.trunc(intelDraft || 0)))
-    if (!window.confirm(
-      `Set the Solo character to ${skillPoints.toLocaleString()} unspent skill points and ${intel.toLocaleString()} Intel?\n\n`
-      + 'DST will retain the current game.db, preserve all learned skills, write the exact requested balances, and verify them before replacing the save.',
-    )) return
     setBusy('progression:points')
     setNotice(null)
     try {
@@ -1284,7 +1344,10 @@ export function SoloMode() {
         actions={
           <button
             className="btn-secondary"
-            onClick={() => void Promise.all([statusState.refresh(), runtimeState.refresh()])}
+            onClick={() => void Promise.all([
+              statusState.refresh(), runtimeState.refresh(), settingsState.refresh(),
+              consoleSettingsState.refresh(), blueprintSettingsState.refresh(),
+            ])}
             disabled={statusState.loading}
           >
             <Icon name="RefreshCw" size={14} className={statusState.loading ? 'animate-spin' : ''} />
@@ -1376,12 +1439,32 @@ export function SoloMode() {
         id="solo-connection"
         title="Solo save connection"
         icon="FolderCog"
-        subtitle="Choose the Steam account folder containing the Solo save you want to edit."
+        subtitle="Find a Steam or Xbox app / Microsoft Store PC Solo save."
         summary={connected ? 'Connected' : 'Not connected'}
       >
         <div className="space-y-3">
+          <div className="flex gap-2 items-end">
+            <label className="block flex-1">
+              <span className="text-xs text-text-muted">Game platform</span>
+              <select className={`${SOLO_INPUT_CLASS} mt-1`} value={savePlatform} onChange={event => {
+                setSavePlatform(event.target.value as 'auto' | 'steam' | 'xbox')
+                setDataRoot(''); setSelectedDb(''); setDiscoveredProfiles([])
+              }}>
+                <option value="auto">Auto — Steam and Xbox PC</option>
+                <option value="steam">Steam</option>
+                <option value="xbox">Xbox app / Microsoft Store PC</option>
+              </select>
+            </label>
+            <button type="button" className="btn-secondary" disabled={busy !== null} onClick={() => {
+              setBusy('discover')
+              void scanPath('').then(result => setNotice({ kind: 'ok', text: `Found ${result.profiles.length} Solo saves. Select a save and connect.` }))
+                .catch(error => setNotice({ kind: 'err', text: error instanceof Error ? error.message : String(error) }))
+                .finally(() => setBusy(null))
+            }}>Find saves automatically</button>
+          </div>
+          {status?.channel === 'Xbox' && <p className="text-xs text-text-muted">Xbox save edits retain a complete WGS account backup and validate a staged copy before replacing the current save. Settings use Config\WinGDK. Close Dune before writing.</p>}
           <label className="block">
-            <span className="text-xs text-text-muted">Solo save folder (Steam account)</span>
+            <span className="text-xs text-text-muted">Solo save folder</span>
             <div className="flex gap-2 mt-1">
               <input
                 className={`${SOLO_INPUT_CLASS} font-mono text-xs flex-1`}
@@ -1399,19 +1482,23 @@ export function SoloMode() {
             </div>
           </label>
 
-          {discoveredProfiles.length > 1 && (
+          {discoveredProfiles.length > 0 && (
             <label className="block">
-              <span className="text-xs text-text-muted">Steam account / Solo profile</span>
+              <span className="text-xs text-text-muted">Account / Solo profile</span>
               <select
                 className={`${SOLO_INPUT_CLASS} mt-1`}
                 style={{ colorScheme: 'inherit' }}
                 value={selectedDb}
-                onChange={event => setSelectedDb(event.target.value)}
+                onChange={event => {
+                  setSelectedDb(event.target.value)
+                  const profile = discoveredProfiles.find(p => p.dbPath === event.target.value)
+                  if (profile?.dataRoot) setDataRoot(profile.dataRoot)
+                }}
               >
                 <option value="">Choose one save...</option>
                 {discoveredProfiles.map(profile => (
                   <option key={profile.dbPath} value={profile.dbPath}>
-                    {profile.channel === 'FLS_retail' ? 'Retail' : 'Legacy'} / {profile.id}
+                    {profile.platform === 'xbox' ? 'Xbox PC' : profile.channel === 'FLS_retail' ? 'Steam Retail' : 'Steam Legacy'} / {profile.id}
                   </option>
                 ))}
               </select>
@@ -1430,7 +1517,7 @@ export function SoloMode() {
         </div>
       </CollapsibleCard>
 
-      <div className="flex items-center gap-1 mb-5 border-b border-border overflow-x-auto">
+      <div className="flex items-center gap-1 mb-5 border-b border-border overflow-x-auto overflow-y-hidden">
         {TABS.map(item => (
           <button
             key={item.id}
@@ -1446,6 +1533,9 @@ export function SoloMode() {
         ))}
       </div>
 
+      {tab === 'mods' && <SoloMods connectionToken={`${activeProfileToken}:${connectionRevision}`} />}
+      {tab === 'dd-map' && <><SoloLiveMap connectionToken={`${activeProfileToken}:${connectionRevision}`} /><WickMaps embedded solo /></>}
+      {tab === 'steam-deck' && <SoloDeck />}
       {tab === 'overview' && (
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
           <div className="card p-5">
@@ -1497,6 +1587,28 @@ export function SoloMode() {
             <div className="card p-5 text-sm text-text-muted">Loading Solo settings...</div>
           ) : (
             <>
+              <CollapsibleCard id="solo-settings-blueprint-build" title="Blueprint building" icon="Wrench">
+                {blueprintSettingsState.error ? (
+                  <div className="text-sm text-danger">
+                    {blueprintSettingsState.error}
+                    <button className="btn-secondary ml-3" onClick={() => void blueprintSettingsState.refresh()}>Retry</button>
+                  </div>
+                ) : !blueprintSettingsState.data ? (
+                  <div className="text-sm text-text-muted">Loading blueprint settings...</div>
+                ) : !blueprintSettingsState.data.supported ? (
+                  <div className="text-sm text-text-muted">{status?.channel === 'Xbox' ? 'Xbox settings are unavailable in this preview while save synchronization is being tested.' : 'These controls require a verified Retail Solo profile.'}</div>
+                ) : (
+                  <div className="space-y-3">
+                    <p className="text-sm text-text-muted">Set blueprint piece build timers to zero. Your previous settings are saved for restoration. Close Dune: Awakening before making changes.</p>
+                    <div className="text-sm">Instant build settings: {blueprintSettingsState.data.enabled ? 'Enabled' : 'Not enabled'}</div>
+                    {blueprintSettingsState.data.conflict && <p className="text-sm text-warning">Blueprint settings changed outside DST. Restore previous settings will restore the saved blueprint timers and preserve unrelated settings. The current file is backed up first.</p>}
+                    <button className="btn-primary" disabled={!!busy || gameRunning || !selectionMatchesActive}
+                      onClick={() => void changeBlueprintSettings(!blueprintSettingsState.data?.canRestore)}>
+                      {busy === 'blueprint-settings' ? 'Saving...' : blueprintSettingsState.data.canRestore ? 'Restore previous settings' : 'Enable instant build'}
+                    </button>
+                  </div>
+                )}
+              </CollapsibleCard>
               <CollapsibleCard id="solo-settings-retail-engine" title="Retail Engine settings" icon="Gauge">
                 {consoleSettingsState.error ? (
                   <div className="rounded border border-danger/30 bg-danger/5 p-3 text-sm text-danger">
@@ -1513,25 +1625,34 @@ export function SoloMode() {
                   <div className="text-sm text-text-muted">Loading Retail Engine.ini settings...</div>
                 ) : !consoleSettingsState.data.supported ? (
                   <div className="rounded border border-warning/30 bg-warning/5 p-3 text-sm text-text-muted">
-                    These controls require a verified Retail <span className="font-mono">FLS_retail</span> profile.
+                    {status?.channel === 'Xbox' ? 'Xbox Engine settings are unavailable in this preview while platform configuration support is being verified.' : <>These controls require a verified Retail <span className="font-mono">FLS_retail</span> profile.</>}
                   </div>
                 ) : (
                   <div className="space-y-4">
                     <div className="rounded border border-warning/30 bg-warning/5 p-3 text-xs text-text-muted">
-                      Writes only <span className="font-mono">Config\Windows\Engine.ini</span> under the
-                      connected Retail Solo root. Sun Exposure, Maximum Vehicles Per Player and Shield
-                      Drops While Shooting are confirmed in Retail Solo.
+                      Writes only <span className="font-mono">{status?.channel === 'Xbox' ? 'Config\\WinGDK\\Engine.ini' : 'Config\\Windows\\Engine.ini'}</span> under the
+                      game settings directory. Unset vehicle controls do not change the file.
                     </div>
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
                       {consoleSettingsState.data.entries.map(entry => (
                         <div key={entry.key} className="block rounded border border-border bg-surface-2/40 p-3">
                           <span className="flex items-center justify-between gap-2 text-xs text-text-muted">
                             <span>{entry.label}</span>
-                            <span className={entry.status === 'Confirmed' ? 'text-success' : 'text-warning'}>
-                              {entry.status}
-                            </span>
                           </span>
-                          {entry.type === 'bool01' ? (
+                          {entry.key === 'dw.EnableBuildablePlacementAlwaysFilled' ? (
+                            <label className="flex items-center gap-2 mt-2 text-sm">
+                              <input
+                                type="checkbox"
+                                checked={(consoleDraft[entry.key] ?? entry.value) === '1'}
+                                disabled={!canMutateActiveProfile || gameRunning}
+                                onChange={event => setConsoleDraft(current => ({
+                                  ...current,
+                                  [entry.key]: event.target.checked ? '1' : '0',
+                                }))}
+                              />
+                              Skip hologram placement
+                            </label>
+                          ) : entry.type === 'bool01' ? (
                             <SoloBooleanControl
                               value={consoleDraft[entry.key] ?? entry.value}
                               on="1"
@@ -1544,15 +1665,18 @@ export function SoloMode() {
                               }))}
                             />
                           ) : (
-                            <input
-                              type="number"
+                            <SoloNumericSettingInput
+                              aria-label={entry.label}
+                              integer={entry.type === 'int'}
+                              precisionSource={entry.value}
+                              step={entry.type === 'float' ? 'any' : 1}
                               min={entry.min ?? undefined}
                               max={entry.max ?? undefined}
                               className={`${SOLO_INPUT_CLASS} mt-2 font-mono`}
                               value={consoleDraft[entry.key] ?? entry.value}
-                              onChange={event => setConsoleDraft(current => ({
+                              onValueChange={value => setConsoleDraft(current => ({
                                 ...current,
-                                [entry.key]: event.target.value,
+                                [entry.key]: value,
                               }))}
                               disabled={!canMutateActiveProfile || gameRunning}
                             />
@@ -1589,12 +1713,14 @@ export function SoloMode() {
                       const control = getSoloSettingControl(key)
                       const disabled = SOLO_READ_ONLY_SETTINGS.has(key)
                       const inputId = `solo-setting-${key}`
+                      const guidance = RESPAWN_SETTING_GUIDANCE[key]
                       const update = (next: string) => setDraft(current => ({ ...current, [key]: next }))
                       return (
                         <div key={key} className="block">
                           <label htmlFor={control.type === 'boolean' ? undefined : inputId} className="text-xs text-text-muted">
-                            {key}{disabled ? ' (set in game)' : ''}
+                            {guidance?.label ?? key}{disabled ? ' (set in game)' : ''}
                           </label>
+                          {guidance && <p className="mt-1 text-xs text-text-dim"><span className="font-mono">{key}</span> — {guidance.effect}</p>}
                           {control.type === 'boolean' ? (
                             <SoloBooleanControl
                               value={value}
@@ -1620,11 +1746,22 @@ export function SoloMode() {
                                 <option key={option.value} value={option.value}>{option.label}</option>
                               ))}
                             </select>
+                          ) : control.type === 'number' ? (
+                            <SoloNumericSettingInput
+                              id={inputId}
+                              integer={control.step === 1}
+                              precisionSource={settingsByKey.get(key)?.value ?? value}
+                              step={control.step}
+                              className={`${SOLO_INPUT_CLASS} mt-1 font-mono text-xs`}
+                              value={value}
+                              onValueChange={update}
+                              placeholder={settingsByKey.get(key)?.present ? '' : 'Not currently written'}
+                              disabled={disabled}
+                            />
                           ) : (
                             <input
                               id={inputId}
-                              type={control.type === 'number' ? 'number' : 'text'}
-                              step={control.type === 'number' ? control.step : undefined}
+                              type="text"
                               className={`${SOLO_INPUT_CLASS} mt-1 font-mono text-xs`}
                               value={value}
                               onChange={event => update(event.target.value)}
@@ -1642,7 +1779,7 @@ export function SoloMode() {
                 <div className="text-xs text-text-muted">
                   {gameRunning
                     ? 'Close Dune: Awakening before applying settings.'
-                    : `${Object.keys(changedSettings).length} changed setting(s). Apply creates a retained INI backup and verifies each change.`}
+                    : `${Object.keys(changedSettings).length} setting(s) need applying. Apply retains INI backups and verifies the required writes.`}
                 </div>
                 <button
                   className={`btn-primary shrink-0 ${SOLO_DISABLED_PRIMARY_CLASS}`}
@@ -1676,7 +1813,7 @@ export function SoloMode() {
                 <Icon name={busy === 'delete-selected' ? 'LoaderCircle' : 'Trash2'} size={14} className={busy === 'delete-selected' ? 'animate-spin' : ''} />
                 Delete selected ({selectedBackupPaths.size})
               </button>
-              <button className={`btn-primary ${SOLO_DISABLED_PRIMARY_CLASS}`} onClick={() => void createBackup()} disabled={!canMutateActiveProfile}>
+              <button className={`btn-primary ${SOLO_DISABLED_PRIMARY_CLASS}`} onClick={() => void createBackup()} disabled={!selectionMatchesActive || busy !== null || gameRunning}>
                 <Icon name={busy === 'backup' ? 'LoaderCircle' : 'Archive'} size={14} className={busy === 'backup' ? 'animate-spin' : ''} />
                 Create backup
               </button>
@@ -1825,7 +1962,7 @@ export function SoloMode() {
             </div>
             {(inspection?.fillables.length ?? 0) === 0 ? (
               <p className="text-sm text-text-muted">
-                No supported carried water container was found. Put a Literjon, Dewpack, or Decajon in the character inventory, exit fully, then Refresh.
+                No refillable water container was found in the connected character inventory. After adding a Literjon, Dewpack, or Decajon, click Refresh.
               </p>
             ) : (
               <div className="space-y-2">
@@ -1854,6 +1991,16 @@ export function SoloMode() {
       )}
       {tab === 'inventory' && (
         <div className="space-y-4">
+          <SoloRegisTanks connectionToken={`${activeProfileToken}:${connectionRevision}`} />
+          <button className="btn-secondary" disabled={!canMutateActiveProfile || gameRunning || busy !== null} onClick={() => void repairEquipment()}>Repair all carried equipment</button>
+          <div className="flex flex-wrap gap-2 items-center">
+            <label htmlFor="solo-repair-container">Repair a storage container</label>
+            <select id="solo-repair-container" value={repairContainer} disabled={!canMutateActiveProfile || gameRunning || busy !== null} onChange={event => setRepairContainer(event.target.value)}>
+              <option value="">Select a container</option>
+              {(inspection?.inventories ?? []).filter(inv => inv.kind === 'storage' || inv.kind === 'developer-storage').map(inv => <option key={inv.key} value={inv.key}>{inv.label} ({inv.itemRows} items)</option>)}
+            </select>
+            <button className="btn-secondary" disabled={!repairContainer || !canMutateActiveProfile || gameRunning || busy !== null} onClick={() => void repairEquipment(repairContainer)}>Repair contents</button>
+          </div>
           <SoloInventoryExplorer
             items={inspection?.inventoryItems ?? []}
             inventories={inspection?.inventories ?? []}
@@ -2062,6 +2209,9 @@ export function SoloMode() {
               <h3 className="font-semibold mb-1 flex items-center gap-2">
                 <Icon name="ScrollText" size={15} /> Import Base Blueprint
               </h3>
+              <a className="btn-secondary inline-flex items-center gap-2 mb-3" href="https://dune.layout.tools/" target="_blank" rel="noopener noreferrer">
+                <Icon name="ExternalLink" size={15} /> Blueprint Designer
+              </a>
               <p className="text-xs text-text-muted mb-4">
                 Import a portable DST blueprint into the connected Retail Solo save. DST retains the current save and verifies the result.
               </p>
@@ -2105,6 +2255,18 @@ export function SoloMode() {
 
             <SoloCosmeticGrantCard
               busy={busy === 'give-items'}
+              ownership={statusState.data?.cosmeticOwnership}
+              onBulkGrant={async (kind, label) => {
+                setBusy('give-items')
+                setNotice(null)
+                try {
+                  const result = await grantSoloUnlocks(kind, statusState.data?.profileToken ?? '')
+                  setNotice({ kind: 'ok', text: `${label}: ${result.submitted} tokens saved for next login; ${result.skipped} already saved or held.${result.remaining ? ` ${result.remaining} remain: log in to process tokens, exit, and grant again after freeing backpack slots.` : ''}${result.safetyBackup ? ` Previous save retained at ${result.safetyBackup}` : ''}` })
+                  await Promise.all([statusState.refresh(), runtimeState.refresh(), backupsState.refresh()])
+                } catch (error) {
+                  setNotice({ kind: 'err', text: error instanceof Error ? error.message : String(error) })
+                } finally { setBusy(null) }
+              }}
               disabled={
                 !canMutateActiveProfile
                 || gameRunning
@@ -2120,6 +2282,30 @@ export function SoloMode() {
                 )
               }}
             />
+
+            <div className="grid grid-cols-1 xl:grid-cols-3 gap-3 xl:col-span-2">
+            {[
+              { id: 'ObservedCharacterSwatches', label: 'Character Swatches (311)' },
+              { id: 'ObservedGearAppearances', label: 'Gear Appearances (401)' },
+              { id: 'ObservedSchematicRecipes', label: 'Schematic Recipes (717)' },
+            ].map(choice => <button key={choice.id} className="btn-primary w-full flex-col gap-1 py-3 justify-center text-center whitespace-normal" disabled={!canMutateActiveProfile || gameRunning || !!busy}
+              onClick={async () => {
+                if (!window.confirm(`Grant the reviewed ${choice.label}? A safety backup will be created.${choice.id === 'ObservedSchematicRecipes' ? ' This saves crafting recipes directly, not inventory items. Existing recipe uses are preserved.' : ''}\n\n${COSMETIC_LICENSE_NOTICE}`)) return
+                setBusy('reviewed-customization')
+                setNotice(null)
+                try {
+                  await grantSoloReviewedCustomization(statusState.data?.profileToken ?? '', choice.id)
+                  setNotice({ kind: 'ok', text: `${choice.label} saved. ${choice.id === 'ObservedSchematicRecipes' ? 'Open the game and check your crafting recipes. Existing recipe uses were preserved.' : 'Open the game and select the appearance or swatch in the customization menu.'}` })
+                  await Promise.all([statusState.refresh(), backupsState.refresh()])
+                } catch (error) { setNotice({ kind: 'err', text: error instanceof Error ? error.message : String(error) }) }
+                finally { setBusy(null) }
+              }}>
+              Grant All {choice.label} (experimental)
+              <span className="block text-xs font-normal">{statusState.data?.cosmeticOwnership?.reviewedCounts?.[choice.id]
+                ? `${statusState.data.cosmeticOwnership.reviewedCounts[choice.id].owned}/${statusState.data.cosmeticOwnership.reviewedCounts[choice.id].total} owned · ${statusState.data.cosmeticOwnership.reviewedCounts[choice.id].remaining} remaining`
+                : 'Character counts unavailable'}</span>
+            </button>)}
+            </div>
 
             <div className="card p-5 xl:col-span-2">
               <h3 className="font-semibold mb-1">Max Augment Attributes</h3>
@@ -2163,6 +2349,17 @@ export function SoloMode() {
       )}
       {tab === 'progression' && (
         <div className="space-y-4">
+          {activeProfileToken && selectionMatchesActive && <div>
+            <CodexOwnership key={activeProfileToken} profileToken={activeProfileToken}
+              grant={{ path: '/api/solo/codex/grant', body: { expectedProfileToken: activeProfileToken },
+                disabled: !canMutateActiveProfile || gameRunning, reason: 'Close Dune before granting codex fragments.' }}
+              path={`/api/solo/codex?profile=${encodeURIComponent(activeProfileToken)}`} />
+          </div>}
+          <SoloFactionProgression disabled={!canMutateActiveProfile || gameRunning || !!busy}
+            onRun={(faction, action, amount) => void runProgressionAction('faction', 'Solo faction change', token => setSoloFactionProgression(faction, action, amount, token))} />
+          <SoloCharacterXp disabled={!canMutateActiveProfile || gameRunning || !!busy}
+            currentXp={inspection?.progression.characterXp}
+            onRun={(action, amount) => void runProgressionAction('character-xp', 'Solo character XP change', token => setSoloCharacterXp(action, amount, token))} />
           <div className="card p-5">
             <h3 className="font-semibold mb-2">Solo diagnostics</h3>
             <p className="text-sm text-text-muted mb-3">Export a read-only report of save integrity, specializations, journey conditions and progression unlock flags for support. Account IDs, character names, inventory and local paths are excluded. Close the game first, then review the downloaded report before sharing it.</p>
@@ -2183,8 +2380,9 @@ export function SoloMode() {
             }}>Export Solo diagnostics</button>
           </div>
           <SoloSpecializationEditor
-            key={activeProfileToken}
+            key={`${activeProfileToken}:${inspection?.progression.specializations.map(track => `${track.trackType}:${track.level}`).join(',')}`}
             tracks={inspection?.progression.specializations ?? []}
+            legacyAdapter={status?.legacyAdapter}
             disabled={!canMutateActiveProfile || gameRunning || !!busy}
             onSet={(track, level) => void runProgressionAction('set-specialization', `Set ${track} to level ${level} (existing rewards stay unlocked; journey triggers are not replayed)`, token => setSoloSpecialization(track, level, token))}
             onResetRewards={track => void runProgressionAction('reset-specialization-rewards', `Reset ${track} reward claims so they can be purchased again in-game. Keep its level and XP. Remove its claimed skill-point bonus from unspent points; respec first if needed. No journey objectives are completed by this action`, token => resetSoloSpecializationRewards(track, token))}
@@ -2200,7 +2398,7 @@ export function SoloMode() {
               icon="Medal"
               title="Max specializations"
               description="Set all five tracks to level 100, grant all 205 rewards, and reconcile the 54 specialization skill points idempotently."
-              status={`${inspection?.progression.specializations.filter(track => track.level >= 100).length ?? 0}/5 tracks at 100 · ${inspection?.progression.purchasedRewards ?? 0}/205 unlocked rewards`}
+              status={`${countMaxSoloSpecializations(inspection?.progression.specializations ?? [], status?.legacyAdapter ?? false)}/5 tracks at 100 · ${inspection?.progression.purchasedRewards ?? 0}/205 unlocked rewards`}
               busy={busy === 'progression:specializations'}
               disabled={!canMutateActiveProfile || gameRunning}
               onRun={() => void runProgressionAction(
@@ -2209,55 +2407,45 @@ export function SoloMode() {
                 maxSoloSpecializations,
               )}
             />
+            <SoloJourneyCompletion disabled={!canMutateActiveProfile || gameRunning || !!busy}
+              busy={busy === 'progression:journey'} progression={inspection?.progression}
+              onRun={quest => void runProgressionAction('journey',
+                quest === 'npe' ? 'Complete Solo tutorial (NPE)' : 'Complete Solo main quest',
+                quest === 'npe' ? completeSoloNpe
+                  : quest === 'DA_MQ_FindTheFremen' ? completeSoloFindTheFremen
+                    : token => unlockSoloMainQuest(quest, token))} />
             <div className="card p-5 flex flex-col">
-              <div className="w-9 h-9 rounded-lg bg-accent/10 border border-accent/25 flex items-center justify-center text-accent-bright mb-3">
-                <Icon name="Route" size={17} />
-              </div>
-              <h2 className="font-semibold">Journey completion</h2>
-              <p className="text-sm text-text-muted mt-1">
-                Choose a progression path. Each selection keeps its own retained backup and verifies the resulting save.
-              </p>
-              <label className="mt-4">
-                <span className="text-xs text-text-muted">Progression path</span>
-                <select
-                  className={`${SOLO_INPUT_CLASS} mt-1`}
-                  value={journeyAction}
-                  onChange={event => setJourneyAction(event.target.value === 'npe' ? 'npe' : 'fremen')}
-                  disabled={!canMutateActiveProfile || gameRunning}
-                >
-                  <option value="fremen">Complete Find the Fremen</option>
-                  <option value="npe">Complete NPE</option>
-                </select>
-              </label>
-              <p className="text-xs text-text-muted mt-3 flex-1">
-                {journeyAction === 'npe'
-                  ? 'Complete the exact 140-node Solo tutorial catalog and apply the NPE completion tag, including the four Base Backup Tool objectives.'
-                  : 'Complete all 59 verified nodes, add 14 reward tags and five Fremkit recipes, then enable Prescience and the third ability slot.'}
-              </p>
-              <div className="rounded border border-border bg-surface-2/50 px-3 py-2 text-xs text-text-muted mt-4">
-                {journeyAction === 'npe'
-                  ? `${inspection?.progression.npeNodesComplete ?? 0}/${inspection?.progression.npeNodesTotal ?? 0} nodes · completion tag ${inspection?.progression.npeTagPresent ? 'present' : 'missing'}`
-                  : `${inspection?.progression.fremenNodesComplete ?? 0}/${inspection?.progression.fremenNodesTotal ?? 0} nodes · Prescience ${inspection?.progression.spiceSystemStatus === 'FullyEnabled' ? 'enabled' : 'locked'}`}
-              </div>
-              <button
-                className={`btn-primary w-full justify-center mt-4 ${SOLO_DISABLED_PRIMARY_CLASS}`}
-                disabled={!canMutateActiveProfile || gameRunning}
-                onClick={() => void runProgressionAction(
-                  journeyAction,
-                  journeyAction === 'npe' ? 'Complete Solo NPE' : 'Complete Find the Fremen',
-                  journeyAction === 'npe' ? completeSoloNpe : completeSoloFindTheFremen,
-                )}
-              >
-                <Icon name={busy === `progression:${journeyAction}` ? 'LoaderCircle' : 'Play'} size={14} className={busy === `progression:${journeyAction}` ? 'animate-spin' : ''} />
-                {busy === `progression:${journeyAction}`
-                  ? 'Applying...'
-                  : journeyAction === 'npe' ? 'Complete NPE' : 'Complete Find the Fremen'}
+              <h2 className="font-semibold">Testing Stations</h2>
+              <p className="text-sm text-text-muted mt-1 mb-3">Unlock selectable difficulties by recording completion progress. Choose your difficulty in-game; faction requirements still apply. Existing higher progress is preserved. Close Dune before applying.</p>
+              <label htmlFor="solo-testing-station" className="text-sm">Station</label>
+              <select id="solo-testing-station" className={`${SOLO_INPUT_CLASS} mt-1 mb-3`} value={testingStation} onChange={event => setTestingStation(event.target.value)} disabled={!canMutateActiveProfile || gameRunning || !!busy}>
+                <option value="all">All six stations</option>
+                <option value="DA_Dgn_024_Darkness">Station 24 — Darkness</option>
+                <option value="DA_Dgn_089_Radiation">Station 89 — Radiation</option>
+                <option value="DA_Dgn_136_Fire">Station 136 — Fire</option>
+                <option value="DA_Dgn_152_Electric">Station 152 — Electric</option>
+                <option value="DA_Dgn_195_Poison">Station 195 — Poison</option>
+                <option value="DA_Dgn_Pit">The Quarry</option>
+              </select>
+              <button className={`btn-primary ${SOLO_DISABLED_PRIMARY_CLASS}`} disabled={!canMutateActiveProfile || gameRunning || !!busy} onClick={() => void runProgressionAction('testing-stations', 'Unlock Solo Testing Stations', token => unlockSoloTestingStations(testingStation, token))}>
+                {busy === 'progression:testing-stations' ? 'Applying...' : 'Unlock difficulties'}
+              </button>
+            </div>
+            <div className="card p-5 flex flex-col">
+              <h2 className="font-semibold">Unlock Trainers</h2>
+              <p className="text-sm text-text-muted mt-1 mb-3">Complete the selected trainer's contracts and apply their reward tags and skill-tree unlocks. Takes effect next launch.</p>
+              <label htmlFor="solo-trainer" className="text-sm">Trainer</label>
+              <select id="solo-trainer" className={`${SOLO_INPUT_CLASS} mt-1 mb-3`} value={trainerJob} onChange={event => setTrainerJob(event.target.value)} disabled={!canMutateActiveProfile || gameRunning || !!busy}>
+                <option value="Swordmaster">Swordmaster</option><option value="Trooper">Trooper</option><option value="Mentat">Mentat</option><option value="BeneGesserit">Bene Gesserit</option><option value="Planetologist">Planetologist</option>
+              </select>
+              <button className={`btn-primary ${SOLO_DISABLED_PRIMARY_CLASS}`} disabled={!canMutateActiveProfile || gameRunning || !!busy} onClick={() => void runProgressionAction('trainer', 'Unlock Solo trainer', token => unlockSoloTrainer(trainerJob, token))}>
+                {busy === 'progression:trainer' ? 'Applying...' : 'Unlock trainer'}
               </button>
             </div>
             <ProgressionActionCard
               icon="Sparkles"
               title="Enable all skills"
-              description="Raise 143 approved skills to value 7, leave Bindu Sprint and Voice Ignore learnable, preserve unknown Solo keys, keep at least 20 unspent points, and raise Intel to 100."
+              description="Unlock all five trainers and raise 143 approved skills to value 7. Leave Bindu Sprint and Voice Ignore learnable, preserve unknown Solo keys, keep at least 20 unspent points, and raise Intel to 100."
               status={`${inspection?.progression.skillsAtSeven ?? 0}/143 enabled · ${inspection?.progression.unspentSkillPoints ?? 0} unspent · ${inspection?.progression.intel ?? 0} Intel`}
               busy={busy === 'progression:skills'}
               disabled={!canMutateActiveProfile || gameRunning}
@@ -2368,20 +2556,37 @@ function ProgressionActionCard({
   )
 }
 
-export function SoloSpecializationEditor({ tracks, disabled, onSet, onResetRewards }: {
+function soloSpecializationTracks(legacyAdapter: boolean) {
+  return [
+    { name: 'Combat', id: legacyAdapter ? 0 : 4 },
+    { name: 'Crafting', id: 1 },
+    { name: 'Exploration', id: legacyAdapter ? 2 : 3 },
+    { name: 'Gathering', id: legacyAdapter ? 3 : 2 },
+    { name: 'Sabotage', id: legacyAdapter ? 4 : 5 },
+  ]
+}
+
+export function countMaxSoloSpecializations(tracks: Array<{ trackType: number; level: number }>, legacyAdapter: boolean) {
+  return soloSpecializationTracks(legacyAdapter).filter(({ id }) =>
+    tracks.some(track => track.trackType === id && track.level >= 100),
+  ).length
+}
+
+export function SoloSpecializationEditor({ tracks, legacyAdapter = false, disabled, onSet, onResetRewards }: {
   tracks: Array<{ trackType: number; level: number }>
+  legacyAdapter?: boolean
   disabled: boolean
   onSet: (track: string, level: number) => void
   onResetRewards?: (track: string) => void
 }) {
   const [levels, setLevels] = useState<Record<string, string>>({})
-  const names = ['Combat', 'Crafting', 'Exploration', 'Gathering', 'Sabotage']
+  const tracksByName = soloSpecializationTracks(legacyAdapter)
   return <div className="card p-5">
     <h3 className="font-semibold mb-2">Specialization levels</h3>
     <p className="text-sm text-text-muted mb-3">Set an individual track from 0 to 100, including lowering a maxed track. Existing rewards and skill points are preserved. This does not replay journey objectives or grant missing cosmetic unlocks.</p>
     <p className="text-sm text-text-muted mb-3">To unlock a reward again for a journey, use Reset rewards for that track, set its level high enough using Set level, then buy the required reward in-game. Reset rewards keeps level and XP, clears reward claims, and removes their unspent skill-point bonus. Respec skills first if those points are spent. Max specializations grants the rewards again, so use Set level during recovery.</p>
-    <div className="space-y-3">{names.map((name, index) => {
-      const current = tracks.find(track => track.trackType === index)?.level ?? 0
+    <div className="space-y-3">{tracksByName.map(({ name, id }) => {
+      const current = tracks.find(track => track.trackType === id)?.level ?? 0
       const value = levels[name] ?? String(Math.floor(current))
       const valid = /^\d+$/.test(value) && Number(value) >= 0 && Number(value) <= 100
       return <div key={name} className="flex flex-wrap items-center gap-3">

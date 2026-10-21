@@ -1,6 +1,67 @@
 $script:DuneRetailServerSettingsSection = '/Script/DuneSandbox.UserServerCustomSettings'
-$script:DuneRetailServerSettingsFileBrowserPath = '/srv/Config/LinuxServer/ServerCustomSettings.ini'
+$script:DuneRetailServerSettingsFileBrowserPath = '/srv/UserSettings/UserServerCustomSettings.ini'
 $script:DuneRetailServerSettingsGamePath = '/home/dune/server/DuneSandbox/Saved/Config/LinuxServer/ServerCustomSettings.ini'
+
+function Get-DuneRetailStartupSyncPreferencePath {
+    Join-Path (Join-Path $env:APPDATA 'DuneServer') 'retail-startup-sync.json'
+}
+
+function Get-DuneRetailStartupSyncPreference {
+    $path=Get-DuneRetailStartupSyncPreferencePath
+    if(-not(Test-Path -LiteralPath $path)){return @{enabled=$true; injectionsApplied=$true; scope='Self-hosted battlegroup'}}
+    $preference=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    if($preference.enabled -isnot [bool]){throw 'Server Settings startup synchronization preference is invalid.'}
+    foreach ($field in @('injectionsApplied','cleanupPending')) {
+        if ($null -ne $preference.PSObject.Properties[$field] -and $preference.$field -isnot [bool]) {throw 'Server Settings startup synchronization preference is invalid.'}
+    }
+    $applied = if ($null -ne $preference.PSObject.Properties['injectionsApplied']) { [bool]$preference.injectionsApplied } else { [bool]$preference.enabled }
+    $pending = if ($null -ne $preference.PSObject.Properties['cleanupPending']) { [bool]$preference.cleanupPending } else { -not $preference.enabled }
+    return @{enabled=[bool]$preference.enabled; injectionsApplied=$applied; cleanupPending=$pending; scope='Self-hosted battlegroup'; changedAt=$preference.changedAt}
+}
+
+function Test-DuneConfigurationInjectionEnabled {
+    if ($script:DuneConfigurationExplicitApply) { return $true }
+    $state = Get-DuneRetailStartupSyncPreference
+    $applied = if ($state.ContainsKey('injectionsApplied')) { $state.injectionsApplied } else { $state.enabled }
+    return ($state.enabled -and $applied)
+}
+
+function Remove-DuneManagedSettingsYamlInjections {
+    param([Parameter(Mandatory)][string]$Ip)
+    # No INI writes: clear only names owned by DST, preserving all other exec
+    # commands and userIniConfig files.
+    $cleared = Set-V6ConsoleVariableOverrides -Ip $Ip -Names @() -Values @{} -ManagedNames (Get-DuneManagedStartupConsoleVariableKeyMap)
+    if (-not $cleared.Success) { throw 'DST startup YAML injections could not be cleared.' }
+    $snapshot = Get-DuneRetailServerSettingsSnapshot -Ip $Ip
+    if (-not $snapshot.available) { throw 'Server Settings ownership could not be inspected for YAML cleanup.' }
+    if ($snapshot.fileAuthority -and $snapshot.target.upstreamConfigured -and $snapshot.target.upstreamFileName -ceq 'ServerCustomSettings.ini') {
+        $bg = Get-V6Battlegroup -Ip $Ip
+        $path = '/spec/serverGroup/template/spec/global/userIniConfig/files/ServerCustomSettings.ini'
+        $value = $bg.Bg.spec.serverGroup.template.spec.global.userIniConfig.files.'ServerCustomSettings.ini'
+        $patch = @(
+            @{op='test';path='/metadata/resourceVersion';value=[string]$bg.Bg.metadata.resourceVersion}
+            @{op='test';path=$path;value=$value}
+            @{op='remove';path=$path}
+        ) | ConvertTo-Json -Depth 100 -Compress
+        $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($patch))
+        $result = (Invoke-V6Ssh -Ip $Ip -Cmd "base64 -d | sudo kubectl patch battlegroup '$($snapshot.target.battlegroup)' -n '$($snapshot.target.namespace)' --type=json --patch-file=/dev/stdin 2>&1" -StdinData $payload -TimeoutSec 30) -join "`n"
+        if ($result -notmatch '\bpatched\b') { throw 'DST settings YAML injection cleanup failed.' }
+        $verified = Get-V6Battlegroup -Ip $Ip
+        if ($null -ne $verified.Bg.spec.serverGroup.template.spec.global.userIniConfig.files.'ServerCustomSettings.ini') {throw 'DST YAML injection cleanup readback failed.'}
+    }
+    return @{ok=$true}
+}
+
+function Set-DuneRetailStartupSyncPreference([bool]$Enabled, [switch]$Applied, [switch]$CleanupPending) {
+    $path=Get-DuneRetailStartupSyncPreferencePath
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    $temp=$path+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+    try {
+        [IO.File]::WriteAllText($temp,(@{enabled=$Enabled; injectionsApplied=($Enabled -and [bool]$Applied); cleanupPending=[bool]$CleanupPending; changedAt=[DateTime]::UtcNow.ToString('o')}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temp -Destination $path -Force
+    } finally {if(Test-Path -LiteralPath $temp){Remove-Item -LiteralPath $temp -Force}}
+    return Get-DuneRetailStartupSyncPreference
+}
 
 $script:DuneRetailServerSettingGroups = [ordered]@{
     'World and economy' = @(
@@ -59,7 +120,7 @@ $script:DuneRetailServerLabels = @{
     CraftingTimeMultiplier = 'Crafting Time'
     BuildingCostMultiplier = 'Building Cost'
     ResourceRespawnSpeed = 'Resource Respawn Speed'
-    LootRespawnSpeed = 'Loot Respawn Speed'
+    LootRespawnSpeed = 'Loot Respawn Time'
     FuelBurnTimeMultiplier = 'Fuel Burn Time'
     InventoryVolumeMultiplier = 'Inventory Volume'
     PlayerDamageToPlayer = 'Player Damage to Players'
@@ -93,7 +154,7 @@ $script:DuneRetailServerLabels = @{
     FiefdomLimit = 'Maximum Sub-Fief Amount'
     BuildingPieceLimitMultiplier = 'Building Piece Limit'
     bBuildingInfiniteStability = 'Building Stability Limits'
-    BaseBackupToolTimeRestriction = 'Base Backup Tool Time Restriction'
+    BaseBackupToolTimeRestriction = 'Base Backup Window (hours)'
     LandsraadContributionMultiplier = 'Landsraad Contribution'
     LandsraadSpecializationXpMultiplier = 'Landsraad Specialization XP'
     LandsraadFactionStandingMultiplier = 'Landsraad Faction Standing'
@@ -413,9 +474,9 @@ function Get-DuneRetailServerSettingsTextSha256 {
 }
 
 function Get-DuneRetailServerSettingsSnapshot {
-    param([Parameter(Mandatory)][string]$Ip)
+    param([Parameter(Mandatory)][string]$Ip, $TargetOverride)
 
-    $target = Resolve-DuneRetailServerSettingsTarget -Ip $Ip
+    $target = if ($TargetOverride) { $TargetOverride } else { Resolve-DuneRetailServerSettingsTarget -Ip $Ip }
     if (-not $target.available) {
         return [ordered]@{
             available = $false
@@ -424,23 +485,11 @@ function Get-DuneRetailServerSettingsSnapshot {
             target = $target
         }
     }
-    if ($target.upstreamConfigured) {
-        $raw = [string]$target.upstreamContent
-        return [ordered]@{
-            available = $true
-            source = 'funcom-servergroup-user-ini-config'
-            authority = 'Funcom BattleGroup operator configuration'
-            raw = $raw
-            revision = Get-DuneRetailServerSettingsTextSha256 -Value $raw
-            modifiedAt = ''
-            bytes = [Text.Encoding]::UTF8.GetByteCount($raw)
-            target = $target
-        }
-    }
     Assert-DuneRetailKubernetesName -Value ([string]$target.pod) -Label 'pod name'
     $cmd = @"
 sudo kubectl exec -n '$($target.namespace)' '$($target.pod)' -- sh -lc '
 f="$($target.path)"
+if [ "`$(cat /srv/UserSettings/.dst-server-settings-file-authority-v1 2>/dev/null)" = file-authority-v1 ]; then echo __DST_FILE_AUTHORITY__; fi
 if [ ! -f "`$f" ]; then echo __DST_MISSING__; exit 0; fi
 echo __DST_META__
 stat -c "%Y|%s" "`$f"
@@ -450,13 +499,20 @@ base64 "`$f" | tr -d "\n"
 '
 "@
     $output = (Invoke-V6Ssh -Ip $Ip -Cmd $cmd -TimeoutSec 30) -join "`n"
+    $fileAuthority = $output -match '(?m)^__DST_FILE_AUTHORITY__$'
+    $output = $output -replace '(?m)^__DST_FILE_AUTHORITY__\r?\n?', ''
     if ($output -match '(?m)^__DST_MISSING__$') {
-        return [ordered]@{
-            available = $false
-            source = 'funcom-runtime-projection'
-            reason = "Funcom runtime file is missing: $($target.path)"
+        return Select-DuneRetailServerSettingsAuthority -FileAuthority $fileAuthority -Snapshot ([ordered]@{
+            available = $true
+            source = 'funcom-persistent-user-settings'
+            authority = 'Linux UserSettings/UserServerCustomSettings.ini'
+            fileExists = $false
+            raw = ''
+            revision = Get-DuneRetailServerSettingsTextSha256 -Value ''
+            bytes = 0
+            modifiedAt = ''
             target = $target
-        }
+        })
     }
     if ($output -notmatch '(?ms)^__DST_META__\s*\n([^\n]+)\n([0-9a-f]{64})\s*\n__DST_CONTENT__\s*\n([A-Za-z0-9+/=]*)\s*$') {
         throw 'Retail Server Settings returned an incomplete runtime-file response.'
@@ -472,10 +528,14 @@ base64 "`$f" | tr -d "\n"
     } catch {
         throw 'Retail Server Settings runtime file was not valid base64/UTF-8.'
     }
-    return [ordered]@{
+    if ((Get-DuneRetailServerSettingsTextSha256 -Value $raw) -cne $revision) {
+        throw 'Retail Server Settings file changed during read. Refresh and try again.'
+    }
+    return Select-DuneRetailServerSettingsAuthority -FileAuthority $fileAuthority -Snapshot ([ordered]@{
         available = $true
-        source = 'funcom-runtime-projection'
-        authority = 'Funcom-managed live server output'
+        source = 'funcom-persistent-user-settings'
+        authority = 'Linux UserSettings/UserServerCustomSettings.ini'
+        fileExists = $true
         raw = $raw
         revision = $revision
         modifiedAt = if ($modifiedEpoch -gt 0) {
@@ -485,11 +545,11 @@ base64 "`$f" | tr -d "\n"
         }
         bytes = $size
         target = $target
-    }
+    })
 }
 
 function Get-DuneRetailServerSettings {
-    param([Parameter(Mandatory)][string]$Ip)
+    param([Parameter(Mandatory)][string]$Ip, [switch]$ReadOperator)
 
     $snapshot = Get-DuneRetailServerSettingsSnapshot -Ip $Ip
     if (-not $snapshot.available) {
@@ -504,6 +564,18 @@ function Get-DuneRetailServerSettings {
         }
     }
     $raw = [string]$snapshot.raw
+    $operatorRevision = $null
+    if ($ReadOperator) {
+        if (-not $snapshot.target.upstreamConfigured -or [string]::IsNullOrWhiteSpace([string]$snapshot.target.upstreamContent)) {
+            throw 'No existing YAML Server Settings are configured to read.'
+        }
+        $raw = [string]$snapshot.target.upstreamContent
+        $operatorRevision = Get-DuneRetailServerSettingsTextSha256 -Value $raw
+        $snapshot.source = 'operator-import-draft'
+        $snapshot.authority = 'YAML settings draft (Save writes the Linux UserSettings file)'
+        $snapshot.bytes = [Text.Encoding]::UTF8.GetByteCount($raw)
+        $snapshot.modifiedAt = ''
+    }
     $parsed = ConvertFrom-DuneRetailServerSettingsRaw -Raw $raw
     return [ordered]@{
         available = $true
@@ -511,6 +583,9 @@ function Get-DuneRetailServerSettings {
         source = [string]$snapshot.source
         authority = [string]$snapshot.authority
         revision = [string]$snapshot.revision
+        operatorRevision = $operatorRevision
+        operatorMismatch = $snapshot.target.upstreamConfigured -and
+            (Get-DuneRetailServerSettingsTextSha256 -Value ([string]$snapshot.target.upstreamContent)) -cne [string]$snapshot.fileRevision
         modifiedAt = [string]$snapshot.modifiedAt
         bytes = [long]$snapshot.bytes
         observedAt = [DateTime]::UtcNow.ToString('o')
@@ -522,15 +597,15 @@ function Get-DuneRetailServerSettings {
         writeBehavior = [ordered]@{
             supported = $true
             requiresStoppedBattlegroup = $true
-            backup = 'Saved/Config/LinuxServer/ServerCustomSettings.ini.dstbak-<UTC timestamp>'
+            backup = 'Saved/UserSettings/UserServerCustomSettings.ini.dstbak-<UTC timestamp>'
         }
         applyBehavior = [ordered]@{
             mode = 'operator-mounted'
             restartRequired = $true
-            note = if ($snapshot.source -eq 'funcom-servergroup-user-ini-config') {
-                'Start the stopped battlegroup after saving. Funcom mounts the configured file into every game pod.'
+            note = if ($snapshot.needsMigration) {
+                'Existing YAML settings are preserved until they are backed up and migrated to the Linux UserSettings file on the next stopped-battlegroup Save or Start.'
             } else {
-                'Stop the battlegroup before saving, then start it. Funcom mounts the configured file into every game pod.'
+                'The Linux UserSettings file is authoritative. Start the stopped battlegroup to apply its values to the LinuxServer runtime file.'
             }
         }
     }
@@ -550,10 +625,18 @@ function ConvertTo-DuneRetailServerSettingsUpdatedRaw {
     foreach ($keyValue in $Updates.GetEnumerator()) {
         $key = [string]$keyValue.Key
         $definition = Get-DuneRetailServerSettingDefinition -Key $key
-        if (-not $definition -or -not $definition.editable) {
+        $value = ([string]$keyValue.Value).Trim()
+        # Default Settings explicitly requests Custom, and can seed an absent
+        # PvP mode. Preserve existing PvP rules and reject other preset writes.
+        $defaultUpdate = ($key -ceq 'DifficultyLevel' -and $value -ceq 'Custom') -or
+            ($key -ceq 'PVPMode' -and -not $present.ContainsKey($key) -and $value -ceq 'Limited')
+        if (-not $definition -or (-not $definition.editable -and -not $defaultUpdate)) {
             throw "Retail setting $key is not editable."
         }
-        $value = ([string]$keyValue.Value).Trim()
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            $normalized[$key] = $null
+            continue
+        }
         if (-not (Test-DuneRetailServerSettingValue -Definition $definition -Value $value)) {
             throw "Retail setting $key has an invalid $($definition.type) value."
         }
@@ -580,11 +663,16 @@ function ConvertTo-DuneRetailServerSettingsUpdatedRaw {
             $key = $Matches[2].Trim()
             $valueParts = Split-DuneRetailServerSettingValue -Content $Matches[3]
             if ($normalized.ContainsKey($key)) {
-                $parts[$index] = "$prefix$($valueParts.leading)$($normalized[$key])$($valueParts.trailing)"
+                if ($null -eq $normalized[$key]) {
+                    $parts[$index] = ''
+                    if ($index + 1 -lt $parts.Length) { $parts[$index + 1] = '' }
+                } else {
+                    $parts[$index] = "$prefix$($valueParts.leading)$($normalized[$key])$($valueParts.trailing)"
+                }
             }
         }
     }
-    $missing = @($normalized.Keys | Where-Object { -not $present.ContainsKey($_) } | Sort-Object)
+    $missing = @($normalized.Keys | Where-Object { $null -ne $normalized[$_] -and -not $present.ContainsKey($_) } | Sort-Object)
     if ($missing.Count -gt 0) {
         $newline = if ($Raw -match '\r\n|\n|\r') { $Matches[0] } else { "`n" }
         $additions = ($missing | ForEach-Object { "$_=$($normalized[$_])" }) -join $newline
@@ -610,7 +698,7 @@ function Backup-DuneRetailServerSettingsContent {
     $backup = "$($Target.path).dstbak-$stamp"
     $expected = Get-DuneRetailServerSettingsTextSha256 -Value $Raw
     $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Raw))
-    $cmd = "base64 -d | sudo kubectl exec -i -n '$($Target.namespace)' '$($Target.pod)' -- tee '$backup' >/dev/null && sudo kubectl exec -n '$($Target.namespace)' '$($Target.pod)' -- sha256sum '$backup'"
+    $cmd = "sudo kubectl exec -n '$($Target.namespace)' '$($Target.pod)' -- mkdir -p /srv/UserSettings && base64 -d | sudo kubectl exec -i -n '$($Target.namespace)' '$($Target.pod)' -- tee '$backup' >/dev/null && sudo kubectl exec -n '$($Target.namespace)' '$($Target.pod)' -- sha256sum '$backup'"
     $hashOutput = ((Invoke-V6Ssh -Ip $Ip -Cmd $cmd -StdinData $payload -TimeoutSec 30) -join '').Trim()
     $actual = @($hashOutput -split '\s+' | Where-Object { $_ })[0]
     if ($actual -ne $expected) {
@@ -633,25 +721,126 @@ function Copy-DuneRetailServerSettingsMap {
     return $copy
 }
 
+function Write-DuneRetailServerSettingsFile {
+    param(
+        [Parameter(Mandatory)][string]$Ip,
+        [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory)][string]$ExpectedRevision,
+        [bool]$ExpectedExists = $true,
+        [switch]$Remove
+    )
+    $hash = Get-DuneRetailServerSettingsTextSha256 -Value $Content
+    $exists = if ($ExpectedExists) { 'yes' } else { 'no' }
+    $removeFile = if ($Remove) { 'yes' } else { 'no' }
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Content))
+    # The temporary file stays on the same PVC. Check the original immediately
+    # before atomic replacement; refuse rollback over a concurrent manual edit.
+    $cmd = @"
+base64 -d | sudo kubectl exec -i -n '$($Target.namespace)' '$($Target.pod)' -- sh -c '
+set -eu
+f="$($Target.path)"
+mkdir -p /srv/UserSettings
+mkdir -p "`$(dirname "`$f")"
+t=`$(mktemp /srv/UserSettings/.dst-settings.XXXXXX)
+# A cleanup function avoids backslash-escaped quotes, which are corrupted by
+# the PS 5.1-compatible Windows SSH command-line transport.
+cleanup() { rm -f "`$t"; }
+trap cleanup EXIT
+cat > "`$t"
+[ "`$(sha256sum "`$t" | cut -d" " -f1)" = "$hash" ]
+if [ -f "`$f" ]; then
+  [ "$exists" = yes ] && [ "`$(sha256sum "`$f" | cut -d" " -f1)" = "$ExpectedRevision" ] || { echo __DST_CONFLICT__; exit 1; }
+  chmod "`$(stat -c %a "`$f")" "`$t"
+  chown "`$(stat -c %u "`$f"):`$(stat -c %g "`$f")" "`$t"
+else
+  [ "$exists" = no ] || { echo __DST_CONFLICT__; exit 1; }
+  chmod 644 "`$t"
+  chown "`$(stat -c %u /srv/UserSettings):`$(stat -c %g /srv/UserSettings)" "`$t"
+fi
+if [ "$removeFile" = yes ]; then rm -f "`$f"; else mv -f "`$t" "`$f"; fi
+if [ "$removeFile" != yes ]; then [ "`$(sha256sum "`$f" | cut -d" " -f1)" = "$hash" ]; fi
+echo __DST_FILE_SAVED__:$hash
+'
+"@
+    $output = (Invoke-V6Ssh -Ip $Ip -Cmd $cmd -StdinData $payload -TimeoutSec 30) -join "`n"
+    if ($output -notmatch "(?m)^__DST_FILE_SAVED__:$hash`$") {
+        throw 'Linux Server Settings file write failed or the file changed concurrently. Refresh before trying again.'
+    }
+}
+
+function Set-DuneRetailServerSettingsFileAuthority {
+    param([Parameter(Mandatory)][string]$Ip, [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)][string]$ExpectedRevision)
+    $cmd = @"
+sudo kubectl exec -n '$($Target.namespace)' '$($Target.pod)' -- sh -c '
+set -eu
+[ "`$(sha256sum "$($Target.path)" | cut -d" " -f1)" = "$ExpectedRevision" ]
+m=/srv/UserSettings/.dst-server-settings-file-authority-v1
+t=`$(mktemp /srv/UserSettings/.dst-authority.XXXXXX)
+cleanup() { rm -f "`$t"; }
+trap cleanup EXIT
+printf "file-authority-v1\n" > "`$t"
+chmod 644 "`$t"
+mv -f "`$t" "`$m"
+[ "`$(cat "`$m")" = file-authority-v1 ]
+echo __DST_AUTHORITY_SAVED__
+'
+"@
+    $output = (Invoke-V6Ssh -Ip $Ip -Cmd $cmd -TimeoutSec 30) -join "`n"
+    if ($output -notmatch '(?m)^__DST_AUTHORITY_SAVED__$') {
+        throw 'Linux file authority migration could not be verified.'
+    }
+}
+
+function Get-DuneRetailServerSettingsRuntimeSnapshot {
+    param([Parameter(Mandatory)][string]$Ip, [Parameter(Mandatory)]$Target)
+    $runtimeTarget = Copy-DuneRetailServerSettingsMap -Value $Target
+    $runtimeTarget.path = '/srv/Config/LinuxServer/ServerCustomSettings.ini'
+    $runtimeTarget.upstreamConfigured = $false
+    return Get-DuneRetailServerSettingsSnapshot -Ip $Ip -TargetOverride $runtimeTarget
+}
+
 function Set-DuneRetailServerSettings {
     param(
         [Parameter(Mandatory)][string]$Ip,
-        [Parameter(Mandatory)][hashtable]$Updates,
-        [Parameter(Mandatory)][string]$ExpectedRevision
+        [Parameter(Mandatory)][AllowEmptyCollection()][hashtable]$Updates,
+        [Parameter(Mandatory)][string]$ExpectedRevision,
+        [string]$ImportOperatorRevision,
+        [switch]$SynchronizeOnly,
+        [switch]$StageForRestart
     )
     $current = Get-DuneRetailServerSettingsSnapshot -Ip $Ip
     if (-not $current.available) { throw [InvalidOperationException]::new([string]$current.reason) }
     if (-not $ExpectedRevision -or $ExpectedRevision -cne [string]$current.revision) {
         throw [InvalidOperationException]::new('Retail Server Settings changed since they were loaded. Refresh and review the current values before saving.')
     }
-    if (-not $current.target.stopped -or [int]$current.target.serverPodCount -ne 0) {
+    if (-not $StageForRestart -and (-not $current.target.stopped -or [int]$current.target.serverPodCount -ne 0)) {
         throw [InvalidOperationException]::new('Stop the battlegroup fully before saving Official Retail Server Settings.')
     }
 
     $target = $current.target
     $raw = [string]$current.raw
-    $updated = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $raw -Updates $Updates
+    if ($ImportOperatorRevision) {
+        if (-not $target.upstreamConfigured -or
+            (Get-DuneRetailServerSettingsTextSha256 -Value ([string]$target.upstreamContent)) -cne $ImportOperatorRevision) {
+            throw [InvalidOperationException]::new('YAML settings changed since they were read. Read current settings again before saving.')
+        }
+        $raw = [string]$target.upstreamContent
+    }
+    $updated = if ($SynchronizeOnly -or ($ImportOperatorRevision -and $Updates.Count -eq 0)) { $raw } else {
+        ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $raw -Updates $Updates
+    }
     $updatedRevision = Get-DuneRetailServerSettingsTextSha256 -Value $updated
+    if (-not (Test-DuneConfigurationInjectionEnabled)) {
+        if ($SynchronizeOnly) {return @{ok=$true;skipped=$true}}
+        $fileRaw = if ($current.Contains('fileRaw')) { [string]$current.fileRaw } else { [string]$current.raw }
+        $revision = Get-DuneRetailServerSettingsTextSha256 -Value $fileRaw
+        if ($revision -cne $updatedRevision -or -not $current.fileExists) {
+            Write-DuneRetailServerSettingsFile -Ip $Ip -Target $target -Content $updated -ExpectedRevision $revision -ExpectedExists:($current.fileExists -ne $false)
+        }
+        return @{ok=$true;applied=$Updates.Count;revision=$updatedRevision;settings=@((ConvertFrom-DuneRetailServerSettingsRaw -Raw $updated).settings);target=(Get-DuneRetailServerSettingsPublicTarget -Target $target);restartRequired=$true;message='Settings saved to the INI only. YAML injections were not changed.'}
+    }
     $bg = Get-V6Battlegroup -Ip $Ip
     if ([string]$bg.Bg.metadata.resourceVersion -cne [string]$target.resourceVersion) {
         throw [InvalidOperationException]::new('Battlegroup configuration changed during save. No operator configuration was changed.')
@@ -702,55 +891,118 @@ function Set-DuneRetailServerSettings {
             value = $patchValue
         }
     )
-    $backup = Backup-DuneRetailServerSettingsContent -Ip $Ip -Target $target -Raw $raw
-    $patch = ConvertTo-Json -InputObject $patchObject -Depth 100 -Compress
-    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($patch))
-    $patchCmd = "base64 -d | sudo kubectl patch battlegroup '$($target.battlegroup)' -n '$($target.namespace)' --type=json --patch-file=/dev/stdin 2>&1"
-    $patched = ((Invoke-V6Ssh -Ip $Ip -Cmd $patchCmd -StdinData $payload -TimeoutSec 30) -join "`n").Trim()
-    if ($patched -notmatch '\bpatched\b') {
-        throw "Retail Server Settings operator patch failed; the verified backup was retained. $patched"
+    $fileRaw = if ($current.Contains('fileRaw')) { [string]$current.fileRaw } else { $raw }
+    $fileRevision = Get-DuneRetailServerSettingsTextSha256 -Value $fileRaw
+    $fileExisted = $current.fileExists -ne $false
+    $runtime = Get-DuneRetailServerSettingsRuntimeSnapshot -Ip $Ip -Target $target
+    if (-not $runtime.available) { throw 'The Linux runtime settings could not be inspected. No settings were changed.' }
+    $writeFile = (-not $SynchronizeOnly -or $current.needsMigration) -and
+        (-not $fileExisted -or $fileRevision -cne $updatedRevision)
+    # Preserve content only when this transaction actually replaces it.
+    # Startup synchronization must not accumulate identical canonical backups.
+    $backup = @{}
+    if ($writeFile -and $fileExisted) {
+        $backup = Backup-DuneRetailServerSettingsContent -Ip $Ip -Target $target -Raw $fileRaw
     }
-
+    $operatorRaw = [string]$target.upstreamContent
+    if ($target.upstreamConfigured -and $operatorRaw -cne $updated -and
+        (-not $backup.path -or $operatorRaw -cne $fileRaw)) {
+        $operatorBackupTarget = Copy-DuneRetailServerSettingsMap -Value $target
+        $operatorBackupTarget.path = "$($target.path).operator"
+        $backup.operator = Backup-DuneRetailServerSettingsContent -Ip $Ip -Target $operatorBackupTarget -Raw $operatorRaw
+    }
+    # Explicit Apply INIs already authorizes a restart. Stage the operator
+    # content now, but never replace a running game's runtime INI. The stopped
+    # startup transaction performs that write before the next start.
+    $writeRuntime = (-not $StageForRestart -or ($target.stopped -and [int]$target.serverPodCount -eq 0)) -and
+        (-not $runtime.fileExists -or [string]$runtime.revision -cne $updatedRevision)
+    if ($writeRuntime -and $runtime.fileExists) {
+        $backup.runtime = Backup-DuneRetailServerSettingsContent -Ip $Ip -Target $runtime.target -Raw ([string]$runtime.raw)
+    }
+    if ($writeFile) {
+        Write-DuneRetailServerSettingsFile -Ip $Ip -Target $target -Content $updated `
+            -ExpectedRevision $fileRevision -ExpectedExists $fileExisted
+    }
+    $runtimeWritten = $false
     try {
-        $verified = Get-V6Battlegroup -Ip $Ip
-        $verifiedUserIni = $verified.Bg.spec.serverGroup.template.spec.global.userIniConfig
-        $applied = [string]$verifiedUserIni.files.'ServerCustomSettings.ini'
-        if ((Get-DuneRetailServerSettingsTextSha256 -Value $applied) -cne $updatedRevision) {
-            throw 'Retail Server Settings operator readback did not match the requested file.'
+        if ($writeRuntime) {
+            Write-DuneRetailServerSettingsFile -Ip $Ip -Target $runtime.target -Content $updated `
+                -ExpectedRevision $runtime.revision -ExpectedExists $runtime.fileExists
+            $runtimeWritten = $true
         }
-        if ([string]$verifiedUserIni.mountPath -cne [string]$userIni.mountPath) {
-            throw 'Retail Server Settings operator readback did not preserve the mount path.'
+        $patch = ConvertTo-Json -InputObject $patchObject -Depth 100 -Compress
+        $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($patch))
+        $patchCmd = "base64 -d | sudo kubectl patch battlegroup '$($target.battlegroup)' -n '$($target.namespace)' --type=json --patch-file=/dev/stdin 2>&1"
+        $patched = ((Invoke-V6Ssh -Ip $Ip -Cmd $patchCmd -StdinData $payload -TimeoutSec 30) -join "`n").Trim()
+        if ($patched -notmatch '\bpatched\b') {
+            throw "Retail Server Settings operator patch failed; the verified backup was retained. $patched"
         }
-        $verifiedFiles = Copy-DuneRetailServerSettingsMap -Value $verifiedUserIni.files
-        foreach ($file in $userIni.files.Keys) {
-            if (-not $verifiedFiles.Contains($file) -or [string]$verifiedFiles[$file] -cne [string]$userIni.files[$file]) {
-                throw 'Retail Server Settings operator readback did not preserve all configured files.'
+
+        try {
+            $verified = Get-V6Battlegroup -Ip $Ip
+            $verifiedUserIni = $verified.Bg.spec.serverGroup.template.spec.global.userIniConfig
+            $applied = [string]$verifiedUserIni.files.'ServerCustomSettings.ini'
+            if ((Get-DuneRetailServerSettingsTextSha256 -Value $applied) -cne $updatedRevision) {
+                throw 'Retail Server Settings operator readback did not match the requested file.'
             }
+            if ([string]$verifiedUserIni.mountPath -cne [string]$userIni.mountPath) {
+                throw 'Retail Server Settings operator readback did not preserve the mount path.'
+            }
+            $verifiedFiles = Copy-DuneRetailServerSettingsMap -Value $verifiedUserIni.files
+            foreach ($file in $userIni.files.Keys) {
+                if (-not $verifiedFiles.Contains($file) -or [string]$verifiedFiles[$file] -cne [string]$userIni.files[$file]) {
+                    throw 'Retail Server Settings operator readback did not preserve all configured files.'
+                }
+            }
+            if (-not $current.fileAuthority) {
+                Set-DuneRetailServerSettingsFileAuthority -Ip $Ip -Target $target -ExpectedRevision $updatedRevision
+            }
+        } catch {
+            $rollbackBg = Get-V6Battlegroup -Ip $Ip
+            $hadPatchField = if ($null -eq $originalGlobal) { $hadGlobal } else { $hadUserIni }
+            $rollbackChange = if ($hadPatchField) {
+                [ordered]@{
+                    op = 'replace'
+                    path = $patchPath
+                    value = if ($null -eq $originalGlobal) { $originalGlobal } else { $originalUserIni }
+                }
+            } else {
+                [ordered]@{ op = 'remove'; path = $patchPath }
+            }
+            $rollbackObject = @(
+                [ordered]@{ op = 'test'; path = '/metadata/resourceVersion'; value = [string]$rollbackBg.Bg.metadata.resourceVersion }
+                [ordered]@{ op = 'test'; path = $patchPath; value = $patchValue }
+                $rollbackChange
+            )
+            $rollbackJson = ConvertTo-Json -InputObject $rollbackObject -Depth 100 -Compress
+            $rollbackPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($rollbackJson))
+            $rollbackResult = ((Invoke-V6Ssh -Ip $Ip -Cmd $patchCmd -StdinData $rollbackPayload -TimeoutSec 30) -join "`n").Trim()
+            if ($rollbackResult -notmatch '\bpatched\b') {
+                throw "Retail Server Settings verification failed and automatic rollback also failed or was refused to preserve concurrent operator changes. The verified backup was retained. $rollbackResult"
+            }
+            throw "Retail Server Settings verification failed; the original operator configuration was restored. $($_.Exception.Message)"
         }
     } catch {
-        $rollbackBg = Get-V6Battlegroup -Ip $Ip
-        $hadPatchField = if ($null -eq $originalGlobal) { $hadGlobal } else { $hadUserIni }
-        $rollbackChange = if ($hadPatchField) {
-            [ordered]@{
-                op = 'replace'
-                path = $patchPath
-                value = if ($null -eq $originalGlobal) { $originalGlobal } else { $originalUserIni }
+        $saveError = $_.Exception.Message
+        $rollbackErrors = [Collections.Generic.List[string]]::new()
+        if ($runtimeWritten) {
+            try {
+                Write-DuneRetailServerSettingsFile -Ip $Ip -Target $runtime.target -Content ([string]$runtime.raw) `
+                    -ExpectedRevision $updatedRevision -ExpectedExists $true -Remove:(-not $runtime.fileExists)
+            } catch { $rollbackErrors.Add($_.Exception.Message) }
+        }
+        if ($writeFile) {
+            try {
+                Write-DuneRetailServerSettingsFile -Ip $Ip -Target $target -Content $fileRaw `
+                    -ExpectedRevision $updatedRevision -ExpectedExists $true -Remove:(-not $fileExisted)
+            } catch {
+                $rollbackErrors.Add($_.Exception.Message)
             }
-        } else {
-            [ordered]@{ op = 'remove'; path = $patchPath }
         }
-        $rollbackObject = @(
-            [ordered]@{ op = 'test'; path = '/metadata/resourceVersion'; value = [string]$rollbackBg.Bg.metadata.resourceVersion }
-            [ordered]@{ op = 'test'; path = $patchPath; value = $patchValue }
-            $rollbackChange
-        )
-        $rollbackJson = ConvertTo-Json -InputObject $rollbackObject -Depth 100 -Compress
-        $rollbackPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($rollbackJson))
-        $rollbackResult = ((Invoke-V6Ssh -Ip $Ip -Cmd $patchCmd -StdinData $rollbackPayload -TimeoutSec 30) -join "`n").Trim()
-        if ($rollbackResult -notmatch '\bpatched\b') {
-            throw "Retail Server Settings verification failed and automatic rollback also failed or was refused to preserve concurrent operator changes. The verified backup was retained. $rollbackResult"
+        if ($rollbackErrors.Count) {
+            throw "$saveError Linux file rollback failed or was refused to preserve concurrent edits. The verified backups were retained. $($rollbackErrors -join ' ')"
         }
-        throw "Retail Server Settings verification failed; the original operator configuration was restored. $($_.Exception.Message)"
+        throw $saveError
     }
 
     $parsed = ConvertFrom-DuneRetailServerSettingsRaw -Raw $updated
@@ -760,12 +1012,51 @@ function Set-DuneRetailServerSettings {
     $savedTarget.upstreamFileName = 'ServerCustomSettings.ini'
     return [ordered]@{
         ok = $true
-        applied = $Updates.Count
+        applied = if ($ImportOperatorRevision) { @($parsed.settings | Where-Object present).Count } else { $Updates.Count }
         revision = $updatedRevision
         backup = $backup
         restartRequired = $true
-        message = 'Official Retail Server Settings saved to Funcom operator configuration. Start the battlegroup to apply them.'
+        message = 'Server Settings saved to Linux UserSettings and synchronized to Funcom operator configuration. Start the battlegroup to apply them.'
         settings = @($parsed.settings)
         target = $savedTarget
     }
+}
+
+function Sync-DuneRetailServerSettingsForStartup {
+    param([Parameter(Mandatory)][string]$Ip, [switch]$StageForRestart)
+    if(-not(Test-DuneConfigurationInjectionEnabled)){return @{ok=$true;skipped=$true;disabled=$true}}
+    $snapshot = Get-DuneRetailServerSettingsSnapshot -Ip $Ip
+    if (-not $snapshot.available) { throw [string]$snapshot.reason }
+    if (-not $snapshot.fileExists -and -not $snapshot.needsMigration) {
+        return @{ ok = $true; skipped = $true }
+    }
+    if (-not $snapshot.needsMigration -and $snapshot.target.upstreamConfigured -and
+        [string]$snapshot.target.upstreamContent -ceq [string]$snapshot.raw) {
+        $runtime = Get-DuneRetailServerSettingsRuntimeSnapshot -Ip $Ip -Target $snapshot.target
+        if ($runtime.available -and $runtime.fileExists -and [string]$runtime.revision -ceq [string]$snapshot.revision) {
+            return @{ ok = $true; unchanged = $true }
+        }
+    }
+    return Set-DuneRetailServerSettings -Ip $Ip -Updates @{} `
+        -ExpectedRevision $snapshot.revision -SynchronizeOnly -StageForRestart:$StageForRestart
+}
+
+function Select-DuneRetailServerSettingsAuthority {
+    param([Parameter(Mandatory)]$Snapshot, [bool]$FileAuthority)
+    $Snapshot.fileRaw = [string]$Snapshot.raw
+    $Snapshot.fileRevision = [string]$Snapshot.revision
+    $Snapshot.fileAuthority = $FileAuthority
+    $Snapshot.needsMigration = (Test-DuneConfigurationInjectionEnabled) -and $Snapshot.target.upstreamConfigured -and -not $FileAuthority -and
+        -not [string]::IsNullOrWhiteSpace([string]$Snapshot.target.upstreamContent)
+    if ($Snapshot.needsMigration) {
+        # Preserve existing YAML overrides on the first upgrade. Reading never
+        # mutates the server; the stopped-BG save/start transaction migrates them.
+        $Snapshot.raw = [string]$Snapshot.target.upstreamContent
+        $Snapshot.revision = Get-DuneRetailServerSettingsTextSha256 -Value $Snapshot.raw
+        $Snapshot.source = 'existing-operator-settings-pending-migration'
+        $Snapshot.authority = 'Existing operator settings (Linux file migration pending)'
+        $Snapshot.bytes = [Text.Encoding]::UTF8.GetByteCount($Snapshot.raw)
+        $Snapshot.modifiedAt = ''
+    }
+    return $Snapshot
 }

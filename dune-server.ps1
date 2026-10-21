@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 
 [CmdletBinding()]
 param(
@@ -21,7 +21,7 @@ param(
 # Wraps the original battlegroup.ps1 menu and adds extra tools
 # ============================================================
 
-$script:ToolVersion = "15.2.5"
+$script:ToolVersion = "16.5.4"
 
 # Cold-boot readiness budgets (seconds). A fresh battlegroup's FIRST boot can
 # take 10-30 min: k3s + funcom-operators initialize, metrics-server restarts a
@@ -258,7 +258,7 @@ function Run-Setup {
     Write-Host "   each time it launches, and display a color-coded status in the menu header." -ForegroundColor Gray
     Write-Host ""
     Write-Host "   Options:" -ForegroundColor Gray
-    Write-Host "     1. Built-in   - Use Check-Host for multi-node TCP checks (no UDP support)" -ForegroundColor Gray
+    Write-Host "     1. Built-in   - CanYouSeeMe, PortCheckTool, then Check-Host (TCP only)" -ForegroundColor Gray
     Write-Host "     2. Custom URL - Provide your own service (supports UDP if your service does)" -ForegroundColor Gray
     Write-Host "     3. Disabled   - Skip port checks entirely" -ForegroundColor Gray
     Write-Host ""
@@ -287,7 +287,7 @@ function Run-Setup {
         $defaultPortCheck = if ($existing.PortCheckUrlTemplate) { $existing.PortCheckUrlTemplate } else { "" }
         $portCheckUrlTemplate = Ask -Label "Custom URL template" -Default $defaultPortCheck
         if (-not $portCheckUrlTemplate) {
-            Write-Warning "No URL provided. Falling back to built-in (Check-Host)."
+            Write-Warning "No URL provided. Falling back to built-in TCP observers."
             $portCheckMode = 'builtin'
         }
     }
@@ -514,40 +514,21 @@ function Get-PublicIp {
     return $null
 }
 
-# Built-in multi-node TCP check via Check-Host. UDP is not supported by any free public
-# service (no handshake => can't distinguish "closed" from "no application reply").
+# Share the same external-observer policy as the web backend.
 function Test-PortOpen-Builtin {
     param([string]$PublicIp, [int]$Port, [string]$Protocol)
     if ($Protocol -ne 'TCP') { return 'udp-skip' }
-    try {
-        $headers = @{ Accept = 'application/json'; 'User-Agent' = 'DuneServerTool/port-check' }
-        $target = [uri]::EscapeDataString("${PublicIp}:$Port")
-        $start = (Invoke-WebRequest -Uri "https://check-host.net/check-tcp?host=$target&max_nodes=3" `
-            -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop -Headers $headers).Content | ConvertFrom-Json
-        if ($start.ok -ne 1 -or -not $start.request_id -or -not $start.nodes) { return 'unknown' }
-        $nodes = @($start.nodes.PSObject.Properties.Name)
-        if ($nodes.Count -eq 0) { return 'unknown' }
-        $requestId = [uri]::EscapeDataString("$($start.request_id)")
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
-            if ($attempt -gt 1) { Start-Sleep -Milliseconds 750 }
-            $result = (Invoke-WebRequest -Uri "https://check-host.net/check-result/$requestId" `
-                -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop -Headers $headers).Content | ConvertFrom-Json
-            $successes = 0
-            $failures = 0
-            foreach ($node in $nodes) {
-                $property = $result.PSObject.Properties[$node]
-                if (-not $property -or $null -eq $property.Value) { continue }
-                $entry = @($property.Value)[0]
-                if ($entry -and $entry.address -and $null -ne $entry.time) { $successes++ }
-                elseif ($entry -and $entry.error) { $failures++ }
-            }
-            if ($successes -gt 0) { return 'open' }
-            if ($failures -eq $nodes.Count) { return 'closed' }
+    foreach ($candidate in @(
+        (Join-Path $scriptDir 'server\lib\Ports.ps1')
+        (Join-Path $scriptDir 'app\server\lib\Ports.ps1')
+    )) {
+        if (Test-Path -LiteralPath $candidate) {
+            . $candidate
+            return Test-DunePortBuiltin -PublicIp $PublicIp -Port $Port -Protocol $Protocol
         }
-    } catch {}
+    }
     return 'unknown'
 }
-
 function Test-PortOpen-Custom {
     param([string]$Template, [string]$PublicIp, [int]$Port, [string]$Protocol)
     if (-not $Template -or -not $PublicIp) { return 'unknown' }
@@ -714,7 +695,11 @@ function Test-DuneCliVmIp {
 }
 
 function Resolve-DuneCliVmIp {
-    $ip = (Get-VMNetworkAdapter -VMName $vmName @hvSplat).IPAddresses |
+    param([AllowEmptyCollection()][string[]]$Addresses)
+    if (-not $PSBoundParameters.ContainsKey('Addresses')) {
+        $Addresses = @((Get-VMNetworkAdapter -VMName $vmName @hvSplat).IPAddresses)
+    }
+    $ip = $Addresses |
           Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } |
           Select-Object -First 1
     if ($ip) { return [string]$ip }
@@ -735,8 +720,47 @@ function Resolve-DuneCliVmIp {
     return $fallback
 }
 
+function Get-DuneCliLanVmSnapshot {
+    param([string]$Name, [hashtable]$HyperV)
+    if ($HyperV.Credential -isnot [System.Management.Automation.PSCredential]) {
+        throw 'The saved Hyper-V host credential is unavailable. Check Hyper-V over LAN in Settings. The command was not sent.'
+    }
+    try {
+        $option = New-PSSessionOption -OpenTimeout 8000 -OperationTimeout 8000
+        return Invoke-Command -ComputerName $HyperV.ComputerName -Credential $HyperV.Credential -SessionOption $option -ArgumentList $Name -ScriptBlock {
+            param($name)
+            $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
+            $addresses = if ($vm -and $vm.State -eq 'Running') { @((Get-VMNetworkAdapter -VMName $name -ErrorAction Stop).IPAddresses) } else { @() }
+            @{ Exists=[bool]$vm; State=$(if($vm){[string]$vm.State}else{'Missing'}); IPAddresses=$addresses }
+        } -ErrorAction Stop
+    } catch {
+        $remoteError = $_.Exception.Message
+        $session = $null
+        try {
+            # Preserve hosts that allow Hyper-V CIM but deny PowerShell remoting.
+            # An explicit session supplies a timeout instead of unbounded discovery.
+            $option = New-CimSessionOption -Protocol Dcom
+            $session = New-CimSession -ComputerName $HyperV.ComputerName -Credential $HyperV.Credential -SessionOption $option -OperationTimeoutSec 8 -ErrorAction Stop
+            $vm = Get-VM -Name $Name -CimSession $session -ErrorAction Stop
+            $addresses = if ($vm.State -eq 'Running') { @((Get-VMNetworkAdapter -VMName $Name -CimSession $session -ErrorAction Stop).IPAddresses) } else { @() }
+            return @{ Exists=[bool]$vm; State=[string]$vm.State; IPAddresses=$addresses }
+        } catch {
+            throw "Could not discover the VM on the Hyper-V host. PowerShell connection: $remoteError. Hyper-V query: $($_.Exception.Message). The command was not sent."
+        } finally {
+            if ($session) { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
 function Get-VmInfo {
-    $vm = Get-VM -Name $vmName @hvSplat -ErrorAction SilentlyContinue
+    param([hashtable]$HyperV = $hvSplat, [string]$Name = $vmName)
+    if ($HyperV.ComputerName) {
+        $snapshot = Get-DuneCliLanVmSnapshot -Name $Name -HyperV $HyperV
+        $running = $snapshot.Exists -and $snapshot.State -eq 'Running'
+        $ip = if ($running) { Resolve-DuneCliVmIp -Addresses @($snapshot.IPAddresses) } else { $null }
+        return @{ Exists=[bool]$snapshot.Exists; State=$snapshot.State; Running=$running; Ip=$ip }
+    }
+    $vm = Get-VM -Name $Name @HyperV -ErrorAction SilentlyContinue
     $exists  = [bool]$vm
     $state   = if ($exists) { $vm.State } else { 'Missing' }
     $running = $exists -and $vm.State -eq 'Running'
@@ -1302,6 +1326,63 @@ function Invoke-OnDemandPartitionClear {
     Write-Host "  Done — on-demand maps will spawn for the next player." -ForegroundColor Green
 }
 
+function Sync-DuneTankUpdateImage {
+    param([Parameter(Mandatory)][string]$Ip, [Nullable[int]]$UpdateExitCode, [string[]]$UpdateOutput, [switch]$BeforeUpdate, [scriptblock]$TankUpdate)
+    $completeUpdate = $PSBoundParameters.ContainsKey('UpdateExitCode')
+    $root = @($scriptDir, (Join-Path $scriptDir 'app')) | Where-Object {
+        Test-Path -LiteralPath (Join-Path $_ 'server\lib\RegisTanksActivation.ps1')
+    } | Select-Object -First 1
+    if (-not $root) { throw 'Server update support library is missing. Reinstall DST.' }
+    & {
+        param($Root, $VmIp, $KeyPath, $CompleteUpdate, $ExitCode, $OutputLines, $Preflight, $Updater)
+        . (Join-Path $Root 'lib\Db-Postgres.ps1')
+        . (Join-Path $Root 'lib\K8s.ps1')
+        . (Join-Path $Root 'server\lib\RetailServerSettings.ps1')
+        . (Join-Path $Root 'server\lib\RegisTanksBuild.ps1')
+        . (Join-Path $Root 'server\lib\RegisTanksActivation.ps1')
+        $script:V6SshKeyCache = $KeyPath
+        if ($Updater) { $result = Invoke-DuneRegisTankPreservingUpdate -Ip $VmIp -Update $Updater; Write-Host $result.message }
+        elseif ($Preflight) { Prepare-DuneRegisTankServerUpdate -Ip $VmIp }
+        elseif ($CompleteUpdate) { $null = Complete-DuneRegisTankServerUpdate -Ip $VmIp -UpdateExitCode $ExitCode -UpdateOutput $OutputLines }
+        else { $null = Sync-DuneRegisTankServerUpdate -Ip $VmIp }
+    } $root $Ip $sshKey $completeUpdate $UpdateExitCode $UpdateOutput ([bool]$BeforeUpdate) $TankUpdate
+}
+
+function Sync-DuneRetailSettingsBeforeStart {
+    param([Parameter(Mandatory)][string]$Ip)
+    $retailRoot = @($scriptDir, (Join-Path $scriptDir 'app')) | Where-Object {
+        Test-Path -LiteralPath (Join-Path $_ 'server\lib\RetailServerSettings.ps1')
+    } | Select-Object -First 1
+    if (-not $retailRoot) { throw 'Server Settings synchronization library is missing. Battlegroup was not started.' }
+    & {
+        param($Root, $VmIp, $KeyPath)
+        . (Join-Path $Root 'lib\Db-Postgres.ps1')
+        . (Join-Path $Root 'lib\K8s.ps1')
+        . (Join-Path $Root 'server\lib\RetailServerSettings.ps1')
+        . (Join-Path $Root 'server\lib\GameConfig.ps1')
+        . (Join-Path $Root 'server\lib\RegisTanksBuild.ps1')
+        . (Join-Path $Root 'server\lib\RegisTanksActivation.ps1')
+        $script:AppDir = $Root
+        $script:V6SshKeyCache = $KeyPath
+        $deadline = [DateTime]::UtcNow.AddSeconds(300)
+        do {
+            $target = Resolve-DuneRetailServerSettingsTarget -Ip $VmIp
+            if (-not $target.available -or -not $target.stopped -or $target.serverPodCount -eq 0) { break }
+            if ([DateTime]::UtcNow -ge $deadline) { throw 'Game pods have not stopped. Server Settings were not synchronized and the battlegroup was not started.' }
+            Start-Sleep -Seconds 2
+        } while ($true)
+        $null = Sync-DuneRegisTankServerUpdate -Ip $VmIp
+        $management = Get-DuneRetailStartupSyncPreference
+        if (-not $management.enabled -and $management.cleanupPending) {
+            $null = Remove-DuneManagedSettingsYamlInjections -Ip $VmIp
+            $null = Set-DuneRetailStartupSyncPreference -Enabled $false
+        }
+        if (Test-DuneConfigurationInjectionEnabled) {
+            $null = Sync-DuneRetailServerSettingsForStartup -Ip $VmIp
+        }
+    } $retailRoot $Ip $sshKey
+}
+
 function Get-DuneDnatWatchScriptPath {
     $candidates = @(
         (Join-Path $scriptDir 'resources\remote-scripts\dune-dnat-watch-install.sh')
@@ -1528,6 +1609,7 @@ $bgCommands = @(
     [pscustomobject]@{ Key = "3";  SubSection = $null;          Name = "restart";                   Label = "Restart BG Only"; Desc = "Restarts the selected battlegroup" }
     [pscustomobject]@{ Key = "4";  SubSection = $null;          Name = "stop";                      Label = "Stop BG Only";    Desc = "Stops the selected battlegroup" }
     [pscustomobject]@{ Key = "5";  SubSection = $null;          Name = "update";                    Desc = "Checks for new versions and applies them" }
+    [pscustomobject]@{ Key = "23"; SubSection = $null; Name = "update-with-tanks"; Label = "Update with Tank support"; Desc = "Update the server and restore Tank support before restarting" }
     [pscustomobject]@{ Key = "6";  SubSection = $null;          Name = "edit";                      Desc = "Edit the battlegroup with the utilities interface" }
     [pscustomobject]@{ Key = "7";  SubSection = $null;          Name = "edit-advanced";             Label = "Edit Director";   Desc = "(Advanced) Manually edit battlegroup directly with YAML" }
     [pscustomobject]@{ Key = "21"; SubSection = $null;          Name = "change-battlegroup-ip";     Label = "Change Player IP"; Desc = "Change the IP that players connect to" }
@@ -1635,6 +1717,10 @@ while ($true) {
     if ($Cmd -and $cmdHasRun) { break }
     if ($Cmd) { $cmdHasRun = $true }
 
+    if ($Cmd) {
+        $where = if ($hvComputer) { "Hyper-V host $hvComputer" } else { 'this PC' }
+        Write-Host "Checking VM on $where before '$Cmd'..." -ForegroundColor Cyan
+    }
     $info = Get-VmInfo
 
     # Build entries list
@@ -2066,6 +2152,7 @@ while ($true) {
         $bgHint = if ($estBg) { " $estBg" } else { "" }
         Write-Host "[3/4] Starting battlegroup...$bgHint" -ForegroundColor Cyan
         $t_bg = Get-Date
+        Sync-DuneRetailSettingsBeforeStart -Ip $ip
         ssh -t -o StrictHostKeyChecking=no -o LogLevel=QUIET -i "$sshKey" "$sshUser@$ip" "$bgBinPath start"
         $bgStartExit = $LASTEXITCODE
         Save-PhaseTiming 'battlegroup-start' ([int]((Get-Date) - $t_bg).TotalSeconds)
@@ -2387,6 +2474,7 @@ while ($true) {
         $bgHint = if ($estBg) { " $estBg" } else { "" }
         Write-Host "[3/3] Starting battlegroup...$bgHint" -ForegroundColor Cyan
         $t_bg = Get-Date
+        Sync-DuneRetailSettingsBeforeStart -Ip $ip
         ssh -t -o StrictHostKeyChecking=no -o LogLevel=QUIET -i "$sshKey" "$sshUser@$ip" "$bgBinPath start"
         $bgStartExit = $LASTEXITCODE
         Save-PhaseTiming 'battlegroup-start' ([int]((Get-Date) - $t_bg).TotalSeconds)
@@ -2528,7 +2616,9 @@ while ($true) {
             }
             if (Test-Path -LiteralPath "$keyPath.pub") { Remove-Item -LiteralPath "$keyPath.pub" -Force }
             Write-Host "  Generating new SSH key at $keyPath ..." -ForegroundColor Yellow
-            & ssh-keygen -t ed25519 -f $keyPath -N '""' -q -C "dst@$($env:COMPUTERNAME)" 2>&1 | Out-Null
+            # Preserve an empty passphrase under both legacy and modern native argument passing.
+            $emptyPassphrase = if ($PSVersionTable.PSVersion -ge [version]'7.3' -and $PSNativeCommandArgumentPassing -ne 'Legacy') { '' } else { '""' }
+            & ssh-keygen -t ed25519 -f $keyPath -N $emptyPassphrase -q -C "dst@$($env:COMPUTERNAME)" 2>&1 | Out-Null
             if (-not (Test-Path -LiteralPath $keyPath)) {
                 Write-Host "  FATAL: Could not generate SSH key." -ForegroundColor Red
                 Write-Host ""; continue
@@ -2818,7 +2908,8 @@ while ($true) {
     # calls). Found live on Panta's v15.1.5 dump 2026-09-20: the CRLF fix
     # (#849) got the cleanup line actually RUNNING for the first time, which
     # is what surfaced this pre-existing permission gap.
-    if ($cmdName -eq 'update') {
+    if ($cmdName -in @('update','update-with-tanks')) {
+        if ($cmdName -eq 'update') { Sync-DuneTankUpdateImage -Ip $ip -BeforeUpdate }
         $SteamCmdAppId = '4754530'  # Dune: Awakening Dedicated Server
         $preflight = @"
 if [ -d /home/dune/.dune/download/steamapps/downloading/$SteamCmdAppId ] || [ -d /home/dune/.dune/download/steamapps/temp ]; then
@@ -2835,14 +2926,36 @@ fi
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=QUIET -i "$sshKey" "$sshUser@$ip" $preflight
     }
 
+    if ($cmdName -eq 'update-with-tanks') {
+        $tankUpdater = {
+            ssh -t -o StrictHostKeyChecking=no -o LogLevel=QUIET -i "$sshKey" "$sshUser@$ip" "$bgBinPath update" | Tee-Object -Variable tankOutput | Out-Host
+            return @{exitCode=$LASTEXITCODE;output=@($tankOutput)}
+        }.GetNewClosure()
+        Sync-DuneTankUpdateImage -Ip $ip -TankUpdate $tankUpdater
+        if ($Cmd) { break }
+        continue
+    }
+
     if ($cmdName -eq 'start' -or $cmdName -eq 'restart') {
         # Refresh monitoring before issuing start/restart, not after readiness.
         Invoke-DuneHyperVGuestRecoveryInstall -Ip $ip -Phase "pre-$cmdName"
         Invoke-DuneDnatWatchdogInstall -Ip $ip -Phase "pre-$cmdName"
+        if ($cmdName -eq 'restart') {
+            ssh -t -o StrictHostKeyChecking=no -o LogLevel=QUIET -i "$sshKey" "$sshUser@$ip" "$bgBinPath stop"
+            if ($LASTEXITCODE -ne 0) { throw 'Battlegroup stop failed. Server Settings were not synchronized.' }
+        }
+        Sync-DuneRetailSettingsBeforeStart -Ip $ip
     }
 
-    ssh -t -o StrictHostKeyChecking=no -o LogLevel=QUIET -i "$sshKey" "$sshUser@$ip" "$bgBinPath $cmdName"
-    $bgFallbackExit = $LASTEXITCODE
+    $dispatchCommand = if ($cmdName -eq 'restart') { 'start' } else { $cmdName }
+    if ($cmdName -eq 'update') {
+        ssh -t -o StrictHostKeyChecking=no -o LogLevel=QUIET -i "$sshKey" "$sshUser@$ip" "$bgBinPath $dispatchCommand" | Tee-Object -Variable bgUpdateOutput | Out-Host
+        $bgFallbackExit = $LASTEXITCODE
+        Sync-DuneTankUpdateImage -Ip $ip -UpdateExitCode $bgFallbackExit -UpdateOutput @($bgUpdateOutput)
+    } else {
+        ssh -t -o StrictHostKeyChecking=no -o LogLevel=QUIET -i "$sshKey" "$sshUser@$ip" "$bgBinPath $dispatchCommand"
+        $bgFallbackExit = $LASTEXITCODE
+    }
 
     # Battlegroup commands (status/start/restart/stop) can change observable
     # port state, so invalidate the cached external port-check results to

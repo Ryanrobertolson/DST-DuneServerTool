@@ -12,6 +12,7 @@ import { Icon } from '../../components/Icon'
 import { CollapsibleCard } from '../../components/CollapsibleCard'
 import { IniShareModal } from '../../components/IniShareModal'
 import { ApiError } from '../../api/client'
+import { ConfirmationModal } from '../../components/ConfirmationModal'
 import { getLandclaimTimer, saveLandclaimTimer } from '../../api/gameconfig'
 import type { LandclaimTimerState } from '../../api/types'
 
@@ -26,8 +27,10 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  const [warning, setWarning] = useState<string | null>(null)
   const [ok, setOk] = useState<string | null>(null)
   const [showBlock, setShowBlock] = useState(false)
+  const [reviewOpen, setReviewOpen] = useState(false)
 
   const seed = useCallback((s: LandclaimTimerState) => {
     // Prefer the server's live view; fall back to the local client file when the
@@ -38,7 +41,7 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
   }, [])
 
   const load = useCallback(async () => {
-    setLoading(true); setErr(null)
+    setLoading(true); setErr(null); setWarning(null)
     try {
       const s = await getLandclaimTimer()
       setState(s)
@@ -57,25 +60,31 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
   const validSeconds = trimmed !== '' && Number.isFinite(num) && num > 0
   const server = state?.server
 
-  // Dirty vs the server's current state (what actually governs the server).
+  // Include client mismatches so a skipped local write can be retried.
   const curEnabled = server?.available ? server.enabled : false
   const curSeconds = server?.available ? server.seconds : ''
-  const dirty = enabled !== curEnabled || (enabled && trimmed !== curSeconds.trim())
+  const client = state?.client
+  const clientNeedsApply = !!client?.dirExists && (enabled !== client.enabled ||
+    (enabled && (trimmed !== client.seconds.trim() || !client.formattedOk)) ||
+    (!enabled && client.hasOverrides === true))
+  const dirty = enabled !== curEnabled || (enabled && (trimmed !== curSeconds.trim() || !server?.formattedOk)) ||
+    (!enabled && server?.hasOverrides === true) || clientNeedsApply
   const canApply = vmRunning && !saving && dirty && (!enabled || validSeconds)
 
   async function apply() {
     if (!canApply) return
-    setSaving(true); setErr(null); setOk(null)
+    setSaving(true); setErr(null); setWarning(null); setOk(null)
     try {
       const r = await saveLandclaimTimer(enabled, enabled ? trimmed : '')
       setState({ server: r.server, client: r.client, clientBlock: r.clientBlock })
       seed({ server: r.server, client: r.client, clientBlock: r.clientBlock })
       const clientNote = r.result.client.applied
-        ? 'client Game.ini updated'
-        : `client Game.ini skipped (${r.result.client.reason ?? 'no client folder'})`
+        ? ', client Game.ini updated'
+        : ''
+      if (!r.result.client.applied) setWarning(`Client Game.ini was not updated: ${r.result.client.reason ?? 'client config folder unavailable'}`)
       setOk(enabled
-        ? `Land-claim timer set to ${trimmed}s — server UserGame.ini updated, ${clientNote}.`
-        : `Land-claim timer cleared — game defaults restored. ${clientNote}.`)
+        ? `Land-claim timer set to ${trimmed}s — server UserGame.ini updated${clientNote}.`
+        : `Land-claim timer cleared — server game defaults restored${clientNote}.`)
       // Client-side setting: surface the exact block so the admin can hand it to
       // connecting players (it only takes effect on their end if THEIR Game.ini
       // carries the same block).
@@ -107,7 +116,7 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
           type="button"
           className="btn-secondary shrink-0"
           onClick={() => void load()}
-          disabled={loading || saving}
+          disabled={loading || saving || dirty}
           title="Reload current values"
         >
           <Icon name={loading ? 'Loader2' : 'RotateCcw'} size={14} className={loading ? 'animate-spin' : ''} /> Refresh
@@ -119,7 +128,7 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
         <input
           type="checkbox"
           checked={enabled}
-          onChange={e => { setEnabled(e.target.checked); setOk(null); setErr(null) }}
+          onChange={e => { setEnabled(e.target.checked); setOk(null); setErr(null); setWarning(null) }}
           disabled={!vmRunning || saving}
           className="h-4 w-4 accent-accent"
         />
@@ -134,10 +143,9 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
             min={1}
             step={1}
             value={seconds}
-            onChange={e => { setSeconds(e.target.value); setOk(null); setErr(null) }}
+            onChange={e => { setSeconds(e.target.value); setOk(null); setErr(null); setWarning(null) }}
             disabled={!vmRunning || saving}
             className="w-40 px-3 py-2 rounded-lg bg-surface-2 border border-border text-text focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent/50"
-            placeholder="1"
           />
           {trimmed !== '' && !validSeconds && (
             <div className="mt-1 text-xs text-danger">Enter a positive number of seconds.</div>
@@ -148,7 +156,7 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
       <div className="card p-3 mt-3 border-border bg-surface-2/40 text-xs text-text-muted flex items-start gap-2">
         <Icon name="Info" size={14} className="mt-0.5 shrink-0 text-accent-bright" />
         <div className="leading-relaxed">
-          Applies to both the server <span className="font-mono">UserGame.ini</span> and this PC&apos;s client
+          Applies to both the server <span className="font-mono">UserGame.ini</span> and the DST host PC&apos;s client
           <span className="font-mono"> Game.ini</span> (when the client config folder is set). Connecting players
           need the same client value for the change to take effect on their end — share your DST-managed
           <span className="font-mono"> Game.ini</span> block. Disabling restores the game&apos;s default schedule.
@@ -177,9 +185,9 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
       )}
 
       <div className="mt-3 flex items-center gap-2">
-        <button type="button" className="btn-primary" onClick={() => void apply()} disabled={!canApply}>
+        <button type="button" className="btn-primary" onClick={() => setReviewOpen(true)} disabled={!canApply}>
           <Icon name={saving ? 'Loader2' : 'Check'} size={14} className={saving ? 'animate-spin' : ''} />
-          {saving ? 'Applying…' : enabled ? 'Apply' : 'Clear & restore default'}
+          {saving ? 'Applying…' : enabled ? 'Review timer changes' : 'Review restore defaults'}
         </button>
         {state?.clientBlock && (
           <button type="button" className="btn-secondary" onClick={() => setShowBlock(true)}>
@@ -196,6 +204,11 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
           <Icon name="AlertCircle" size={14} /> {err}
         </div>
       )}
+      {warning && (
+        <div role="status" className="mt-3 text-sm text-warning flex items-start gap-2">
+          <Icon name="AlertTriangle" size={14} className="mt-0.5 shrink-0" /> <span>{warning}</span>
+        </div>
+      )}
       {ok && (
         <div className="mt-3 text-sm text-success flex items-start gap-2">
           <Icon name="ShieldCheck" size={14} className="mt-0.5 shrink-0" /> <span>{ok}</span>
@@ -209,6 +222,7 @@ export function LandclaimTimerCard({ vmRunning }: Props) {
           onClose={() => setShowBlock(false)}
         />
       )}
+      {reviewOpen && <ConfirmationModal title="Review land-claim timer" description={`This ${enabled ? `sets a ${trimmed}-second timer` : 'restores the default schedule'} in the server UserGame.ini and the DST host PC’s player Game.ini when its folder is available. Other players need their own matching value. This action is separate from the server-settings field review; deploy the server file with Review & Apply afterward.`} confirmLabel="Save server & host PC" onCancel={() => setReviewOpen(false)} onConfirm={() => { setReviewOpen(false); void apply() }} />}
     </CollapsibleCard>
   )
 }

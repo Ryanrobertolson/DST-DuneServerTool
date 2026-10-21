@@ -61,6 +61,7 @@ function Initialize-DuneGameplayItemData {
                     rarity            = [string]$v.rarity
                     icon              = [string]$v.icon
                     max_durability    = if ($null -ne $v.max_durability) { [double]$v.max_durability } else { 0.0 }
+                    durability_known  = [bool]$v.durability_known
                     stack_max         = if ($null -ne $v.stack_max) { [int]$v.stack_max } else { 0 }
                     volume            = if ($null -ne $v.volume) { [double]$v.volume } else { 0.0 }
                     vendor_price      = if ($null -ne $v.vendor_price) { [int]$v.vendor_price } else { 0 }
@@ -85,7 +86,7 @@ function Get-DuneGameplayItemRule {
     if ($script:DuneGameplayItemRules.ContainsKey($TemplateId)) {
         return $script:DuneGameplayItemRules[$TemplateId]
     }
-    return @{ name = ''; category = ''; tier = 0; rarity = ''; icon = ''; max_durability = 0.0 }
+    return @{ name = ''; category = ''; tier = 0; rarity = ''; icon = ''; max_durability = 0.0; durability_known = $false }
 }
 
 function Get-DuneGameplayItemName {
@@ -107,12 +108,12 @@ function Get-DuneGameplayItemName {
 # appearance when it lands. Developer cosmetics remain visible so operators can
 # test every grantable template shipped in the bundled item metadata. Returns
 # @{ templates = @(@{template;name;group}); total }.
-# Authoritative grantable building-set / building-recipe item ids
-# (app/data/building-sets.json): the union of dune.building_progression.learned_building_sets
-# (live cross-check) and every building Patent/Placeable item form in gameplay-item-data.json.
+# Building grant catalog cross-referenced against tech BLD_ keys.
+# Only tech buildables are omitted; preserve non-tech grants regardless of prefix.
 # Loaded once into a case-insensitive set; friendly names come from gameplay-item-data.json.
 $script:DuneBuildingSetIds = $null
 $script:DuneBuildingSetLabels = $null
+$script:DuneBuildingSetNoItemIds = $null
 function Get-DuneBuildingSetsPath {
     foreach ($candidate in @(
         (Join-Path $PSScriptRoot '..\..\data\building-sets.json'),
@@ -126,11 +127,13 @@ function Initialize-DuneBuildingSets {
     if ($null -ne $script:DuneBuildingSetIds) { return }
     $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $labels = @{}
+    $noItems = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $path = Get-DuneBuildingSetsPath
     if ($path) {
         try {
             $json = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
             foreach ($id in @($json.ids)) { if ($id) { [void]$set.Add([string]$id) } }
+            foreach ($id in @($json._meta.flagged_no_item_form)) { if ($id) { [void]$noItems.Add([string]$id) } }
             foreach ($property in $json.labels.PSObject.Properties) {
                 if ($property.Name -and $property.Value) { $labels[[string]$property.Name] = [string]$property.Value }
             }
@@ -138,6 +141,7 @@ function Initialize-DuneBuildingSets {
     }
     $script:DuneBuildingSetIds = $set
     $script:DuneBuildingSetLabels = $labels
+    $script:DuneBuildingSetNoItemIds = $noItems
 }
 
 # Readable group label for a grantable building set / building recipe (Observer Twitch
@@ -159,6 +163,15 @@ function Get-DuneBuildingSetGroup {
     return 'Building Sets - Structures & Other'
 }
 
+$script:DuneCosmeticGrantMetadata = $null
+function Get-DuneCosmeticGrantMetadata {
+    if ($null -eq $script:DuneCosmeticGrantMetadata) {
+        $path = Join-Path $PSScriptRoot '..\..\data\cosmetic-grants.json'
+        $script:DuneCosmeticGrantMetadata = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    }
+    return $script:DuneCosmeticGrantMetadata
+}
+
 function Get-DuneCosmeticsCatalog {
     Initialize-DuneGameplayItemData
     Initialize-DuneBuildingSets
@@ -170,9 +183,9 @@ function Get-DuneCosmeticsCatalog {
         if     ($k -match 'SetVariant')        { $group = 'Armor & Suit Sets' }
         elseif ($k -match 'Swatch')            { $group = 'Swatches (Dyes)' }
         elseif ($k -match 'MeshCustomization') { $group = 'Vehicle Skins' }
-        elseif ($k -match 'Variant$') {
+        elseif ($k -match 'Variant$' -or $name -match '\bVariant$') {
             # `<thing>_Variant` (distinct from the armor `SetVariant`, matched above)
-            # is the game's naming for grantable skin cosmetics — vehicles, weapons,
+            # and display names ending in Variant identify grantable skin cosmetics — vehicles, weapons,
             # and a few armor/mask pieces. None of these matched the groups above, so
             # the whole family was silently dropped from the catalog. Bucket by the
             # object keyword so they surface under a sensible header; anything that
@@ -180,12 +193,13 @@ function Get-DuneCosmeticsCatalog {
             # "Other Customization" (grantable) rather than vanishing.
             if     ($k -match '(Buggy|Ornithopter|Orni|Sandbike|Sandcrawler|MechanicBike)') { $group = 'Vehicle Skins' }
             elseif ($k -match '(Sword|Pistol|Rifle|SMG|LMG|Shotgun|Knife|Kindjal|Dirk|Rapier|Flamethrower|Battlerifle|Sniper|Blade|Melee|Memento|Snubnose|Drillshot|Fireballer|Frameblade|Lasgun|Maula)') { $group = 'Weapon Skins' }
-            elseif ($k -match '(Armor|Suit|Mask)') { $group = 'Armor & Suit Sets' }
+            elseif ($k -match '(Armor|Suit|Mask|Helmet)') { $group = 'Armor & Suit Sets' }
             else   { $group = 'Other Customization' }
         }
         elseif ($k -match 'Customization')     { $group = 'Other Customization' }
+        elseif ($k -eq 'Developer_Storage_Container_Patent') { $group = 'Building Sets - Developer Storage' }
         elseif ($script:DuneBuildingSetIds.Contains($k)) { $group = Get-DuneBuildingSetGroup -Id $k }
-        elseif ($k -like 'D_*' -and $name -match '\bPatent$') { $group = Get-DuneBuildingSetGroup -Id $k }
+
         if ($group) {
             $out += @{ template = [string]$k; name = $name; group = $group }
         }
@@ -194,8 +208,30 @@ function Get-DuneCosmeticsCatalog {
         if ($out.template -contains $id) { continue }
         $out += @{ template = [string]$id; name = [string]$script:DuneBuildingSetLabels[$id]; group = Get-DuneBuildingSetGroup -Id $id }
     }
+    $out = @($out | Where-Object { $_.group -notlike 'Building Sets - *' -or $_.template -eq 'Developer_Storage_Container_Patent' -or $script:DuneBuildingSetIds.Contains([string]$_.template) })
+    foreach ($entry in $out) {
+        $entry.bulk_exclusion = if ($entry.template -eq 'Developer_Storage_Container_Patent') {
+            'Developer storage is an individual-grant exception; excluded from All Building Sets.'
+        } elseif ($entry.template -in (Get-DuneCosmeticGrantMetadata).unsupported_tokens) {
+            'This token has no working research action; excluded from bulk grants.'
+        } else { '' }
+        $entry.bulk_building_set = $entry.group -like 'Building Sets - *' -and
+            $entry.template -ne 'Developer_Storage_Container_Patent'
+    }
     $out = @($out | Sort-Object { $_.group }, { $_.name })
     return @{ ok = $true; templates = $out; total = $out.Count }
+}
+
+function Get-DuneBuildingSetGrantCatalog {
+    $catalog = Get-DuneCosmeticsCatalog
+    return @($catalog.templates | Where-Object { $_.bulk_building_set })
+}
+
+function Get-DuneSkinGrantCatalog {
+    param([ValidateSet('armor','weapon','vehicle','dyes')][string]$Kind)
+    $group = switch ($Kind) { 'armor' { 'Armor & Suit Sets' }; 'weapon' { 'Weapon Skins' }; 'vehicle' { 'Vehicle Skins' }; 'dyes' { 'Swatches (Dyes)' } }
+    $catalog = Get-DuneCosmeticsCatalog
+    return @($catalog.templates | Where-Object { $_.group -eq $group -and -not $_.bulk_exclusion })
 }
 
 function Get-DuneHouseSwatchCatalog {
@@ -303,17 +339,17 @@ function Get-DuneSchematicCategory {
 # ----------------------------------------------------------------------------
 function ConvertTo-DuneRowMaps {
     param($Result)
-    $maps = @()
-    if (-not $Result -or -not $Result.ok -or -not $Result.columns) { return ,$maps }
+    $maps = [Collections.Generic.List[object]]::new()
+    if (-not $Result -or -not $Result.ok -or -not $Result.columns) { return ,@() }
     $cols = @($Result.columns)
     foreach ($row in @($Result.rows)) {
         $m = @{}
         for ($i = 0; $i -lt $cols.Count; $i++) {
             $m[[string]$cols[$i]] = if ($i -lt $row.Length) { $row[$i] } else { $null }
         }
-        $maps += ,$m
+        $maps.Add($m)
     }
-    return ,$maps
+    return ,$maps.ToArray()
 }
 
 function ConvertTo-DuneInt {

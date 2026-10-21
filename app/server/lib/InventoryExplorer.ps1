@@ -1,7 +1,7 @@
-# Shared Inventory Explorer read model. This file only projects proven player
+﻿# Shared Inventory Explorer read model. This file only projects proven player
 # inventories, inventory_type=4 storage placeables, and proven vehicle cargo.
 
-$script:DuneInventoryDefaultLimit = 100
+$script:DuneInventoryDefaultLimit = 28
 $script:DuneInventoryMaxLimit = 500
 $script:DuneInventoryCursorGeneration = 'inventory-v1'
 $script:DuneInventoryGroupedCursorGeneration = 'inventory-groups-v1'
@@ -173,7 +173,6 @@ WITH inventory_rows AS (
     JOIN dune.inventories inv ON inv.id = i.inventory_id
     JOIN dune.player_state ps ON ps.player_pawn_id = inv.actor_id
     LEFT JOIN dune.actors a ON a.id = ps.player_pawn_id
-
     UNION ALL
 
     SELECT i.id::bigint AS item_id,
@@ -267,6 +266,7 @@ function ConvertTo-DuneInventoryItem {
             volume = [double]$rule.volume
             vendorPrice = [int]$rule.vendor_price
             isGradeable = [bool]$rule.is_gradeable
+            baseMaxDurability = [Math]::Max(0, [double]$rule.max_durability)
         }
         entity = [ordered]@{
             type = $entityType
@@ -486,7 +486,7 @@ function Test-DuneInventoryVisibleItem {
     $templateId = [string]$Item.templateId
     $rule = Get-DuneGameplayItemRule -TemplateId $templateId
     if ([string]$rule.category) { return $true }
-    return [string]$Item.kind -ne 'emote' -and $templateId -notmatch '(?i)Emote|Gesture'
+    return [string]$Item.kind -notin @('emote','contract') -and $templateId -notmatch '(?i)Emote|Gesture|^(D_)?Contract'
 }
 
 function New-DuneInventoryParameterizedSql {
@@ -639,6 +639,8 @@ inventory_rows AS (
     JOIN dune.inventories inv ON inv.id = i.inventory_id
     JOIN dune.player_state ps ON ps.player_pawn_id = inv.actor_id
     LEFT JOIN dune.actors a ON a.id = ps.player_pawn_id
+    WHERE 'player' = ANY(string_to_array((SELECT entity_types FROM _dst_parameters), ','))
+      AND ((SELECT player_id FROM _dst_parameters) = 0 OR ps.player_pawn_id = (SELECT player_id FROM _dst_parameters))
     UNION ALL
     SELECT i.id::bigint AS item_id, i.template_id, i.stack_size,
            COALESCE(i.quality_level, 0) AS quality_level,
@@ -670,6 +672,8 @@ inventory_rows AS (
         ORDER BY par.rank ASC, ps.character_name ASC, ps.player_pawn_id ASC LIMIT 1
     ) owner ON true
     WHERE p.is_hologram = false AND p.owner_entity_id IS NOT NULL AND p.owner_entity_id <> 0
+      AND 'storage' = ANY(string_to_array((SELECT entity_types FROM _dst_parameters), ','))
+      AND ((SELECT player_id FROM _dst_parameters) = 0 OR owner.player_pawn_id = (SELECT player_id FROM _dst_parameters))
     $vehicleSql
 ),
 visible_rows AS (
@@ -679,7 +683,7 @@ visible_rows AS (
       AND (p.scope_type = '' OR (r.entity_type = p.scope_type AND r.entity_id = p.scope_id))
       AND (
           r.template_id IN (SELECT jsonb_array_elements_text(p.catalog_ids::jsonb))
-          OR r.template_id !~* 'Emote|Gesture'
+          OR r.template_id !~* 'Emote|Gesture|^(D_)?Contract'
       )
 ),
 searched_rows AS (
@@ -774,6 +778,7 @@ function ConvertTo-DuneInventoryCacheInput {
             volume = if ($hasRule -and $null -ne $rule.volume) { [double]$rule.volume } else { $null }
             vendorPrice = [long]$Item.metadata.vendorPrice
             isGradeable = [bool]$Item.metadata.isGradeable
+            baseMaxDurability = [Math]::Max(0, [double]$rule.max_durability)
         }
         inventoryId = [long]$Item.entity.inventoryId
         inventoryType = [int]$Item.entity.inventoryType
@@ -1216,6 +1221,7 @@ inventory_players AS (
     CROSS JOIN _dst_parameters p
     LEFT JOIN searched_rows r ON r.player_id = ps.player_pawn_id
     WHERE 'player' = ANY(string_to_array(p.entity_types, ','))
+      AND (p.player_id = 0 OR ps.player_pawn_id = p.player_id)
     GROUP BY ps.player_pawn_id, ps.character_name
 ),
 search_facets AS (
@@ -1370,7 +1376,7 @@ function Invoke-DuneInventoryGroupedPage {
     # The derived item cache cannot represent empty player inventories. Player
     # facets must come from the live inventory table so an empty type-30 bank
     # remains discoverable; storage-only grouped views may still use the cache.
-    if ('vehicle' -notin $EntityTypes -and 'player' -notin $EntityTypes -and $CursorSource -ne 'live' -and
+    if (-not $PlayerId -and -not $ScopeType -and 'vehicle' -notin $EntityTypes -and 'player' -notin $EntityTypes -and $CursorSource -ne 'live' -and
         (Get-Command Invoke-DuneInventoryGroupedCachePage -ErrorAction SilentlyContinue)) {
         $cached = Invoke-DuneInventoryGroupedCachePage `
             -Query $Query `
@@ -1638,7 +1644,7 @@ function Invoke-DuneInventoryOccurrencesPage {
     if ('vehicle' -in $EntityTypes -and $CursorSource -eq 'cache') {
         return @{ ok = $false; status = 409; error = 'Vehicle cargo uses current database reads. Refresh to discard the cache cursor.' }
     }
-    if ('vehicle' -notin $EntityTypes -and $CursorSource -ne 'live' -and
+    if (-not $PlayerId -and -not $ScopeType -and 'vehicle' -notin $EntityTypes -and $CursorSource -ne 'live' -and
         (Get-Command Invoke-DuneInventoryOccurrenceCachePage -ErrorAction SilentlyContinue)) {
         $cached = Invoke-DuneInventoryOccurrenceCachePage `
             -TemplateId $TemplateId `

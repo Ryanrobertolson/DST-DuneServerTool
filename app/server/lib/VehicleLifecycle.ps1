@@ -71,21 +71,14 @@ function Get-DuneVehicleModuleDefaultDurability {
     param([string]$TemplateId)
     $defaults = Get-DuneVehicleModuleDurabilityDefaults
     if ($defaults.ContainsKey($TemplateId)) { return [double]$defaults[$TemplateId] }
-    $rule = Get-DuneGameplayItemRule -TemplateId $TemplateId
-    return [double]$rule.max_durability
+    # Installed modules use CDT_BaseVehicleModules, not the inventory item's cap.
+    return 0.0
 }
 
 function Get-DuneVehicleModuleRepairDefaults {
     $combined = @{}
     foreach ($entry in (Get-DuneVehicleModuleDurabilityDefaults).GetEnumerator()) {
         $combined[[string]$entry.Key] = [double]$entry.Value
-    }
-    Initialize-DuneGameplayItemData
-    foreach ($templateId in $script:DuneGameplayItemRules.Keys) {
-        $rule = $script:DuneGameplayItemRules[$templateId]
-        if ([string]$rule.category -like 'items/vehicles/*' -and [double]$rule.max_durability -gt 0) {
-            $combined[[string]$templateId] = [double]$rule.max_durability
-        }
     }
     return $combined
 }
@@ -102,8 +95,11 @@ function ConvertTo-DuneVehicleNumber {
 }
 
 function Get-DuneVehicleFleetLive {
-    param([string]$Ip, [long]$VehicleId = 0)
+    param([string]$Ip, [long]$VehicleId = 0, [long]$PlayerId = 0)
     $filter = if ($VehicleId -gt 0) { "AND a.id = $VehicleId::bigint" } else { '' }
+    if ($PlayerId -gt 0) {
+        $filter += " AND EXISTS (SELECT 1 FROM dune.permission_actor_rank selected_rank JOIN dune.player_state selected_player ON selected_player.player_controller_id = selected_rank.player_id WHERE selected_rank.permission_actor_id = a.id AND selected_player.player_pawn_id = $PlayerId)"
+    }
     $hostScope = Get-DuneVehicleHostScope -Ip $Ip
     $revisionSql = Get-DuneVehicleTargetRevisionSql -DatabaseScope $hostScope.key
     $sql = @"

@@ -1,4 +1,5 @@
 import { GAMEPLAY_PATHS } from './platform/gameplay'
+import { isSoloDestination } from './hooks/useInstallationMode'
 
 export type NavGroup = 'workspaces' | 'overview' | 'terminal' | 'data' | 'solo' | 'database' | 'system'
 
@@ -42,10 +43,9 @@ export const LEGACY_NAV_ITEMS: readonly NavItem[] = [
   { to: '/pods',        label: 'Pods',          icon: 'Boxes',           group: 'overview', legacy: true },
   { to: '/operations',  label: 'Operations',    icon: 'Activity',        group: 'overview', workspaceId: 'operations' },
   { to: '/commands',    label: 'Commands',     icon: 'Zap',             group: 'terminal', legacy: true },
-  { to: '/map?view=atlas', label: 'DD Atlas', icon: 'Map',              group: 'database', legacy: true },
+  { to: '/map?view=atlas', label: 'DD Atlas', icon: 'Map',              group: 'database', legacy: true, activePaths: ['/map'] },
   { to: '/terminal',    label: 'PowerShell',   icon: 'SquareTerminal',  group: 'terminal', localOnly: true, sidebarHidden: true, legacy: true },
-  { to: '/server-settings', label: 'Server Settings', icon: 'ServerCog', group: 'terminal', ownerOnly: true, legacy: true },
-  { to: '/gameconfig',  label: 'Game Config',  icon: 'Sliders',         group: 'terminal', ownerOnly: true, legacy: true },
+  { to: '/server-settings', label: 'Server Settings', icon: 'ServerCog', group: 'terminal', ownerOnly: true, legacy: true, activePaths: ['/server-settings', '/gameconfig'] },
   { to: '/experimental', label: 'Experimental Lab', icon: 'FlaskConical', group: 'terminal', ownerOnly: true, legacy: true },
   { to: '/broadcasts',  label: 'Broadcasts',   icon: 'Megaphone',       group: 'terminal', legacy: true },
   { to: '/gameplay', sidebarTo: '/gameplay?view=overview', label: 'Gameplay Admin', icon: 'Gamepad2', group: 'workspaces', activePaths: GAMEPLAY_PATHS, inactivePaths: ['/map?view=atlas', '/map?view=lifecycle'] },
@@ -91,13 +91,16 @@ export function getVisibleNavItems({
   windows,
   canAccessOwnerSurfaces,
   includeSidebarHidden = true,
+  soloOnly = false,
 }: {
   local: boolean
   windows: boolean
   canAccessOwnerSurfaces: boolean
   includeSidebarHidden?: boolean
+  soloOnly?: boolean
 }) {
   return NAV_ITEMS
+    .filter(item => !soloOnly || isSoloDestination(item.to))
     .filter(item => includeSidebarHidden || !item.sidebarHidden)
     .filter(item => !item.localOnly || local)
     .filter(item => !item.ownerOnly || canAccessOwnerSurfaces)

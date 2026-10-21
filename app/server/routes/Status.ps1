@@ -1,13 +1,20 @@
 ﻿# GET /api/status — combined VM + Battlegroup + Ports snapshot
 Register-DuneRoute -Method GET -Path '/api/status' -Handler {
     param($req, $res, $routeParams, $body)
+    if (Test-DuneSoloInstallation) {
+        Write-DuneJson -Response $res -Body @{
+            vm = @{ exists=$false; running=$false; name=''; state='Not applicable'; ip=$null; uptime=0 }
+            bg=$null; ports=$null; serverName=''; ts=(Get-Date).ToString('o')
+        }
+        return
+    }
     $vm = Get-DuneVmStatus
     $bg = $null
     if ($vm.running) {
         try { $bg = Get-DuneBattlegroupSnapshot -VmStatus $vm } catch { $bg = @{ available=$false; reason=$_.Exception.Message } }
     }
     $ports = $null
-    try { $ports = Get-DunePortStatus } catch { $ports = $null }
+    try { $ports = Get-DunePortStatus -BattlegroupState $bg.state } catch { $ports = $null }
     $serverName = ''
     if ($bg -and $bg.title) {
         $serverName = [string]$bg.title
@@ -49,7 +56,7 @@ Register-DuneRoute -Method POST -Path '/api/status/refresh' -Handler {
         try { $bg = Get-DuneBattlegroupSnapshot -Force -VmStatus $vm } catch { $bg = @{ available=$false; reason=$_.Exception.Message } }
     }
     $ports = $null
-    try { $ports = Get-DunePortStatus -Force } catch { $ports = $null }
+    try { $ports = Get-DunePortStatus -Force -BattlegroupState $bg.state } catch { $ports = $null }
     $serverName = ''
     if ($bg -and $bg.title) {
         $serverName = [string]$bg.title

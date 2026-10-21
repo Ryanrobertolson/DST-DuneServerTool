@@ -7,6 +7,8 @@ export interface SoloProcess {
 }
 
 export interface SoloProfile {
+  platform?: 'steam' | 'xbox'
+  dataRoot?: string
   id: string
   channel: string
   adapter?: string
@@ -61,6 +63,7 @@ export interface SoloProgressionSummary {
   unspentSkillPoints: number
   keystoneBonusSkillPoints: number
   intel: number
+  characterXp?: number | null
 }
 
 export interface SoloFillableItem {
@@ -86,7 +89,7 @@ export interface SoloInventoryItemGroup {
   inventoryId: number
   destinationKey: string
   destinationLabel: string
-  destinationKind: SoloInventoryDestination['kind']
+  destinationKind: SoloInventoryDestination['kind'] | 'equipment'
   templateId: string
   displayName: string
   totalQuantity: number
@@ -113,6 +116,24 @@ export interface SoloRangedWeapon {
   currentAmmo: number
 }
 
+export type SoloUnlockKind = 'building-sets' | 'armor' | 'weapon' | 'vehicle' | 'dyes' | 'house' | 'placeables'
+export interface SoloCosmeticOwnership {
+  reviewedCounts?: Record<string, {total: number; owned: number; remaining: number}>
+  available: boolean
+  owned: string[]
+  unlocked: string[]
+  pending: string[]
+  error: string
+}
+
+export function grantSoloUnlocks(kind: SoloUnlockKind, expectedProfileToken: string): Promise<{
+  ok: boolean; submitted: number; remaining: number; skipped: number; safetyBackup?: string
+}> {
+  return api('/api/solo/grant-unlocks', {
+    method: 'POST', body: JSON.stringify({ kind, expectedProfileToken }),
+  })
+}
+
 export interface SoloStatus {
   ok: boolean
   supported: boolean
@@ -131,6 +152,7 @@ export interface SoloStatus {
   helperAvailable: boolean
   inspection: SoloInspection | null
   inspectionError: string
+  cosmeticOwnership?: SoloCosmeticOwnership
   backupRoot: string
 }
 
@@ -155,6 +177,7 @@ export interface SoloSetting {
   key: string
   value: string
   present: boolean
+  needsApply?: boolean
 }
 
 export interface SoloSettingsResponse {
@@ -166,7 +189,7 @@ export interface SoloSettingsResponse {
 }
 
 export interface SoloConsoleSetting extends SoloSetting {
-  type: 'bool01' | 'int'
+  type: 'bool01' | 'int' | 'float'
   default: string
   min: number | null
   max: number | null
@@ -207,10 +230,10 @@ export function getSoloRuntime(): Promise<SoloRuntime> {
   return api<SoloRuntime>('/api/solo/runtime')
 }
 
-export function discoverSolo(path: string): Promise<SoloDiscovery> {
+export function discoverSolo(path: string, platform: 'auto' | 'steam' | 'xbox' = 'auto'): Promise<SoloDiscovery> {
   return api<SoloDiscovery>('/api/solo/discover', {
     method: 'POST',
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, ...(platform === 'auto' ? {} : { platform }) }),
   })
 }
 
@@ -500,6 +523,34 @@ interface SoloProgressionResult {
   inspection: SoloInspection
 }
 
+export function setSoloCharacterXp(action: 'add' | 'set', amount: number, expectedProfileToken: string): Promise<SoloProgressionResult> {
+  return api('/api/solo/progression/character-xp', {
+    method: 'PUT',
+    body: JSON.stringify({ action, amount, expectedProfileToken, confirm: 'SET SOLO CHARACTER XP' }),
+  })
+}
+
+export function unlockSoloMainQuest(quest: string, expectedProfileToken: string): Promise<SoloProgressionResult> {
+  return api('/api/solo/progression/main-quest/unlock', {
+    method: 'POST',
+    body: JSON.stringify({ quest, expectedProfileToken, confirm: 'UNLOCK SOLO MAIN QUEST' }),
+  })
+}
+
+export function unlockSoloTestingStations(station: string, expectedProfileToken: string): Promise<SoloProgressionResult> {
+  return api('/api/solo/progression/testing-stations/unlock', {
+    method: 'POST',
+    body: JSON.stringify({ station, expectedProfileToken, confirm: 'UNLOCK SOLO TESTING STATIONS' }),
+  })
+}
+
+export function unlockSoloTrainer(job: string, expectedProfileToken: string): Promise<SoloProgressionResult> {
+  return api('/api/solo/progression/trainer/unlock', {
+    method: 'POST',
+    body: JSON.stringify({ job, expectedProfileToken, confirm: 'UNLOCK SOLO TRAINER' }),
+  })
+}
+
 export function maxSoloSpecializations(expectedProfileToken: string): Promise<SoloProgressionResult> {
   return api('/api/solo/progression/specializations/max', {
     method: 'POST',
@@ -540,6 +591,13 @@ export function enableSoloAllSkills(expectedProfileToken: string): Promise<SoloP
   })
 }
 
+export function setSoloFactionProgression(faction: string, action: string, amount: number, expectedProfileToken: string): Promise<SoloProgressionResult> {
+  return api('/api/solo/progression/faction', {
+    method: 'POST',
+    body: JSON.stringify({ faction, action, amount, expectedProfileToken, confirm: 'SET SOLO FACTION PROGRESSION' }),
+  })
+}
+
 export function setSoloProgressionPoints(
   skillPoints: number,
   intel: number,
@@ -562,6 +620,23 @@ export function exportSoloDiagnostics(expectedProfileToken: string): Promise<{
   return api(`/api/solo/diagnostics?expectedProfileToken=${encodeURIComponent(expectedProfileToken)}`)
 }
 
+export interface SoloBlueprintSettings {
+  ok: boolean
+  supported: boolean
+  enabled: boolean
+  canRestore: boolean
+  conflict: boolean
+}
+
+export function saveSoloBlueprintSettings(enabled: boolean, expectedProfileToken: string): Promise<{
+  ok: boolean; settings: SoloBlueprintSettings; backupPath: string
+}> {
+  return api('/api/solo/blueprint-settings', {
+    method: 'PUT',
+    body: JSON.stringify({ enabled, expectedProfileToken, confirm: 'APPLY SOLO BLUEPRINT SETTINGS' }),
+  })
+}
+
 export function setSoloSpecialization(track: string, level: number, expectedProfileToken: string): Promise<SoloProgressionResult> {
   return api('/api/solo/progression/specializations', {
     method: 'PUT',
@@ -573,5 +648,14 @@ export function resetSoloSpecializationRewards(track: string, expectedProfileTok
   return api('/api/solo/progression/specializations/reset-rewards', {
     method: 'POST',
     body: JSON.stringify({ track, expectedProfileToken, confirm: 'RESET SOLO SPECIALIZATION REWARDS' }),
+  })
+}
+
+export function repairSoloEquipment(expectedProfileToken: string, destination = 'carried'): Promise<{ok: boolean; repaired: number; safetyBackup: string; inspection: SoloInspection}> {
+  return api('/api/solo/items/repair-equipment', {method: 'POST', body: JSON.stringify({expectedProfileToken, destination, confirm: 'REPAIR SOLO EQUIPMENT'})})
+}
+export function grantSoloReviewedCustomization(expectedProfileToken: string, customizationId = 'StillSCharDyepackImota') {
+  return api<SoloProgressionResult>('/api/solo/reviewed-customization', {
+    method: 'POST', body: JSON.stringify({ expectedProfileToken, customizationId, confirm: 'GRANT REVIEWED CUSTOMIZATION' }),
   })
 }

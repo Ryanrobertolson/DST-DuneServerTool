@@ -1,11 +1,12 @@
 import React from 'react'
+import userEvent from '@testing-library/user-event'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   getPlayerDetail, getReserveRecovery, recoverReserve, rollbackReserve,
   type Player, type ReserveRecoveryPreview,
 } from '../src/api/gameplay'
-import { InventorySection } from '../src/pages/gameplay/players/sections'
+import { PlayerItemToolsSection as InventorySection } from '../src/pages/gameplay/players/sections'
 
 vi.mock('../src/api/gameplay', async importOriginal => ({
   ...await importOriginal<typeof import('../src/api/gameplay')>(),
@@ -73,9 +74,10 @@ describe('Reserve recovery inventory controls', () => {
     expect(await screen.findByText(/Reserve 4 → Backpack 0/)).toBeInTheDocument()
     const button = screen.getByRole('button', { name: /Recover Reserve to Backpack/ })
     expect(button).toBeDisabled()
-    fireEvent.change(screen.getByRole('textbox', { name: 'Reserve recovery confirmation' }), { target: { value: 'RECOVER' } })
-    expect(button).toBeEnabled()
-    fireEvent.click(button)
+    const user = userEvent.setup()
+    await user.type(screen.getByRole('textbox', { name: 'Reserve recovery confirmation' }), 'RECOVER')
+    await waitFor(() => expect(button).toBeEnabled())
+    await user.click(button)
     await waitFor(() => expect(recoverReserve).toHaveBeenCalledExactlyOnceWith(42, 100, 'a'.repeat(64)))
   })
 
@@ -147,8 +149,10 @@ describe('Reserve recovery inventory controls', () => {
     renderInventory()
     const button = await screen.findByRole('button', { name: /Roll back recovery/ })
     expect(button).toBeDisabled()
-    fireEvent.change(screen.getByRole('textbox', { name: 'Reserve rollback confirmation' }), { target: { value: 'ROLLBACK' } })
-    fireEvent.click(button)
+    const user = userEvent.setup()
+    await user.type(screen.getByRole('textbox', { name: 'Reserve rollback confirmation' }), 'ROLLBACK')
+    await waitFor(() => expect(button).toBeEnabled())
+    await user.click(button)
     await waitFor(() => expect(rollbackReserve).toHaveBeenCalledExactlyOnceWith(42, 100, 'b'.repeat(32)))
   })
 })

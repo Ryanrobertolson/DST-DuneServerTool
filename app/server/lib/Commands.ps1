@@ -19,20 +19,18 @@ $script:DuneCommands = @(
     @{ Section='VM'; Key='d';  Name='startup';         Label='Start All';          Mode='Console'; Requires='exists';  DisabledWhen='bg-running';  Desc='Power on VM, start battlegroup, wait for maps Ready' }
     @{ Section='VM'; Key='e';  Name='shutdown';        Label='Stop All';           Mode='Console'; Requires='running'; Desc='Stop the battlegroup (if running) and power off the VM' }
     @{ Section='VM'; Key='f';  Name='reboot';          Label='Reboot All';         Mode='Console'; Requires='running'; Desc='Stop battlegroup, reboot VM, start battlegroup' }
-    @{ Section='VM'; Key='g';  Name='rotate-ssh-key';  Mode='Console'; Requires='running'; Desc='Generate a new SSH key and authorize it on the VM' }
+    @{ Section='VM'; Key='g';  Name='rotate-ssh-key';  Label='Generate SSH key'; Mode='Console'; Requires='running'; Desc='Generate a new SSH key and authorize it on the VM' }
     @{ Section='VM'; Key='h';  Name='change-password'; Mode='Console'; Requires='running'; Desc="Change the password of the 'dune' user on the VM" }
     @{ Section='VM'; Key='i';  Name='change-vm-ip';    Mode='Console'; Requires='running'; Desc="Change the VM's IP address or how it gets one (DHCP/static)" }
 
     @{ Section='Battlegroup'; Key='2';  Name='start';                    Label='Start BG Only';   Mode='Console'; Requires='running'; DisabledWhen='bg-running';  Desc='Start the selected battlegroup' }
     @{ Section='Battlegroup'; Key='3';  Name='restart';                  Label='Restart BG Only'; Mode='Console'; Requires='running'; DisabledWhen='bg-stopped';  Desc='Restart the selected battlegroup' }
-    # Apply INIs is the restart that first rebuilds each server's startup values
-    # from the current UserEngine.ini. Plain 'restart' does not, so a console
-    # variable saved in Game Config or Experimental only takes effect through
-    # this one. Handled in-app (routes/Commands.ps1) rather than launched as an
-    # external console command.
-    @{ Section='Battlegroup'; Key='22'; Name='apply-inis';               Label='Apply INIs & Restart'; Mode='InApp'; Requires='running'; DisabledWhen='bg-stopped'; Desc='Rebuild server startup values from the INIs, then restart the battlegroup so every map reloads with the current settings' }
+    # Keep the legacy command ID for callers. Restarts retain the current server
+    # INIs; explicit apply also restores management after an opt-in.
+    @{ Section='Battlegroup'; Key='22'; Name='apply-inis';               Label='Apply Server Settings & Restart'; Mode='InApp'; Requires='running'; DisabledWhen='bg-stopped'; Desc='Deploy saved server settings and startup commands, then restart every map together. Player-PC files are separate.' }
     @{ Section='Battlegroup'; Key='4';  Name='stop';                     Label='Stop BG Only';    Mode='Console'; Requires='running'; DisabledWhen='bg-stopped';  Desc='Stop the selected battlegroup' }
     @{ Section='Battlegroup'; Key='5';  Name='update';                   Mode='Console'; Requires='running'; Desc='Check for new versions and apply them' }
+    @{ Section='Battlegroup'; Key='23'; Name='update-with-tanks'; Label='Update with Tank support'; Mode='Console'; Requires='running'; Desc='Update the server and restore Tank support before restarting' }
     @{ Section='Battlegroup'; Key='6';  Name='edit';                     Mode='Console'; Requires='running'; External=$true; Desc='Edit battlegroup via utilities interface' }
     @{ Section='Battlegroup'; Key='7';  Name='edit-advanced';            Label='Edit Director';   Mode='Console'; Requires='running'; External=$true; Desc='(Advanced) Edit battlegroup YAML directly' }
     @{ Section='Battlegroup'; Key='21'; Name='change-battlegroup-ip';    Label='Change Player IP'; Mode='Console'; Requires='running'; Desc='Change the IP that players connect to' }

@@ -16,14 +16,20 @@ name: PII Guard
 
 on:
   pull_request:
-    types: [opened, edited, reopened, synchronize]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
   pull-requests: read
 
+# Draft PRs run no jobs. Ready PRs validate each new head; superseded runs stop.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   scan:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR merge result with full history
@@ -178,7 +184,24 @@ jobs:
                   continue
               path = pathlib.Path(name)
               try:
-                  text = path.read_text(encoding="utf-8", errors="ignore")
+                  raw = path.read_bytes()
+                  # WebP pixel data is compressed binary, not source text.
+                  # Keep scanning embedded EXIF/XMP metadata for identities.
+                  if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+                      metadata = []
+                      offset = 12
+                      while offset + 8 <= len(raw):
+                          kind = raw[offset:offset + 4]
+                          size = int.from_bytes(raw[offset + 4:offset + 8], "little")
+                          end = offset + 8 + size
+                          if end > len(raw):
+                              break
+                          if kind in (b"EXIF", b"XMP "):
+                              metadata.append(raw[offset + 8:end])
+                          offset = end + size % 2
+                      else:
+                          raw = b"\n".join(metadata)
+                  text = raw.decode("utf-8", errors="ignore")
               except OSError:
                   continue
               file_reasons = reasons(text)

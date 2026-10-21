@@ -1,4 +1,4 @@
-BeforeAll {
+﻿BeforeAll {
     . "$PSScriptRoot\_TestHelpers.ps1"
     $script:OriginalAppData = $env:APPDATA
     $script:OriginalLocalAppData = $env:LOCALAPPDATA
@@ -8,6 +8,8 @@ BeforeAll {
     New-Item -ItemType Directory -Path $env:APPDATA, $env:LOCALAPPDATA -Force | Out-Null
     Import-DstLib 'AugmentCatalog.ps1'
     Import-DstLib 'SoloMode.ps1'
+    Import-DstLib 'SoloCosmetics.ps1'
+    Import-DstLib 'SoloBlueprintSettings.ps1'
 }
 
 AfterAll {
@@ -31,6 +33,144 @@ function global:New-TestSoloLayout {
     $db = Join-Path $profile 'game.db'
     [IO.File]::WriteAllBytes($db, [byte[]](1, 2, 3))
     return @{ root = $root; db = $db; config = $config }
+}
+
+Describe 'Solo blueprint timer restoration' {
+    BeforeEach {
+        Reset-TestSoloState
+        $script:blueprintLayout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $script:blueprintLayout.root -DbPath $script:blueprintLayout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        $script:blueprintIni = Join-Path $script:blueprintLayout.config 'Game.ini'
+    }
+
+    It 'restores custom and duplicated prior values while preserving later unrelated edits and UTF-8 BOM' {
+        $original = "[Other]`r`nm_DefaultBuildAndFillTimeInSeconds=99`r`n[/Script/DuneSandbox.BuildingSettings]`r`n; Keep this comment`r`n m_DefaultBuildAndFillTimeInSeconds = 2.50`r`nm_BuildableBuildAndFillHoldTimes=((Short, 3),(Long, 5))`r`n[/Script/DuneSandbox.BuildingSettings]`r`nm_DefaultBuildAndFillTimeInSeconds=4`r`nFutureKey=Keep`r`n"
+        [IO.File]::WriteAllText($script:blueprintIni, $original, (New-Object Text.UTF8Encoding($true)))
+        $enabled = Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS'
+        $enabled.settings.enabled | Should -BeTrue
+        [IO.File]::ReadAllText($enabled.backupPath) | Should -BeExactly $original
+        Add-Content -LiteralPath $script:blueprintIni 'NewKey=Later'
+        Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        $restored = Set-DuneSoloBlueprintSettings -Enabled $false -Confirm 'APPLY SOLO BLUEPRINT SETTINGS'
+        $restored.settings.canRestore | Should -BeFalse
+        $lines = @(Get-DuneSoloBlueprintLines -Text ([IO.File]::ReadAllText($script:blueprintIni)))
+        $lines.Count | Should -Be 3
+        $lines | Should -Contain ' m_DefaultBuildAndFillTimeInSeconds = 2.50'
+        $lines | Should -Contain 'm_BuildableBuildAndFillHoldTimes=((Short, 3),(Long, 5))'
+        $lines | Should -Contain 'm_DefaultBuildAndFillTimeInSeconds=4'
+        $text = [IO.File]::ReadAllText($script:blueprintIni)
+        $text | Should -Match 'NewKey=Later'
+        $text | Should -Match 'FutureKey=Keep'
+        $text | Should -Match 'm_DefaultBuildAndFillTimeInSeconds=99'
+        $text | Should -Match '; Keep this comment'
+        [IO.File]::ReadAllBytes($script:blueprintIni)[0] | Should -Be 239
+    }
+
+    It 'removes introduced keys when no original overrides or file existed' {
+        Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        Add-Content -LiteralPath $script:blueprintIni 'OtherSetting=Keep'
+        Set-DuneSoloBlueprintSettings -Enabled $false -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        @(Get-DuneSoloBlueprintLines -Text ([IO.File]::ReadAllText($script:blueprintIni))).Count | Should -Be 0
+        Get-Content -LiteralPath $script:blueprintIni -Raw | Should -Match 'OtherSetting=Keep'
+    }
+
+    It 'blocks writes while the game runs without creating a restoration record' {
+        Mock Get-DuneSoloGameProcesses { @([pscustomobject]@{ ProcessName = 'DuneSandbox'; Id = 42 }) }
+        { Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' } | Should -Throw '*still running*'
+        Test-Path -LiteralPath $script:blueprintIni | Should -BeFalse
+    }
+
+    It 'restores saved timers after external edits and backs up those edits' {
+        Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        $text = [IO.File]::ReadAllText($script:blueprintIni).Replace('m_BuildableBuildAndFillHoldTimes=', 'm_BuildableBuildAndFillHoldTimes=changed')
+        [IO.File]::WriteAllText($script:blueprintIni, $text)
+        $restored = Set-DuneSoloBlueprintSettings -Enabled $false -Confirm 'APPLY SOLO BLUEPRINT SETTINGS'
+        [IO.File]::ReadAllText($restored.backupPath) | Should -BeExactly $text
+        [IO.File]::ReadAllText($script:blueprintIni) | Should -Not -Match 'm_DefaultBuildAndFillTimeInSeconds='
+        (Read-DuneSoloBlueprintSettings).canRestore | Should -BeFalse
+        Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        (Read-DuneSoloBlueprintSettings).enabled | Should -BeTrue
+    }
+
+    It 'restores original timers when managed keys were deleted and preserves unrelated edits' {
+        [IO.File]::WriteAllText($script:blueprintIni, "[/Script/DuneSandbox.BuildingSettings]`nm_BuildableBuildAndFillHoldTimes=((Short, 12))`nOtherSetting=before`n")
+        Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        [IO.File]::WriteAllText($script:blueprintIni, "[/Script/DuneSandbox.BuildingSettings]`nOtherSetting=after`n[Unrelated]`nKeep=1`n")
+        Set-DuneSoloBlueprintSettings -Enabled $false -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        $text = [IO.File]::ReadAllText($script:blueprintIni)
+        $text | Should -Match ([regex]::Escape('m_BuildableBuildAndFillHoldTimes=((Short, 12))'))
+        $text | Should -Match 'OtherSetting=after'
+        $text | Should -Match 'Keep=1'
+        (Read-DuneSoloBlueprintSettings).canRestore | Should -BeFalse
+    }
+
+    It 'recreates deleted Game.ini with the saved original blueprint timers' {
+        [IO.File]::WriteAllText($script:blueprintIni, "[/Script/DuneSandbox.BuildingSettings]`nm_BuildableBuildAndFillHoldTimes=((Short, 12))`n")
+        Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        Remove-Item -LiteralPath $script:blueprintIni
+        Set-DuneSoloBlueprintSettings -Enabled $false -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        [IO.File]::ReadAllText($script:blueprintIni) | Should -Match ([regex]::Escape('m_BuildableBuildAndFillHoldTimes=((Short, 12))'))
+        (Read-DuneSoloBlueprintSettings).canRestore | Should -BeFalse
+    }
+
+    It 'restores legacy three-key snapshots and enables only hold times afterward' {
+        $paths = Get-DuneSoloBlueprintPaths
+        New-Item -ItemType Directory (Split-Path -Parent $paths.state) -Force | Out-Null
+        @{ version = 1; path = $paths.path; originalLines = @('m_DefaultBuildAndFillTimeInSeconds=12', 'm_BuildAndFillStartThresholdTimerInSeconds=3') } | ConvertTo-Json | Set-Content $paths.state
+        [IO.File]::WriteAllText($script:blueprintIni, "[/Script/DuneSandbox.BuildingSettings]`nm_DefaultBuildAndFillTimeInSeconds=0`nm_BuildAndFillStartThresholdTimerInSeconds=0`nOther=keep`n")
+        Set-DuneSoloBlueprintSettings -Enabled $false -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' | Out-Null
+        $text = [IO.File]::ReadAllText($script:blueprintIni)
+        $text | Should -Match 'm_DefaultBuildAndFillTimeInSeconds=12'
+        $text | Should -Match 'm_BuildAndFillStartThresholdTimerInSeconds=3'
+        $text | Should -Match 'Other=keep'
+        (Read-DuneSoloBlueprintSettings).enabled | Should -BeTrue
+    }
+
+    It 'preserves the file when atomic replacement fails and clears the unused snapshot' {
+        [IO.File]::WriteAllText($script:blueprintIni, '[Unrelated]')
+        Mock Invoke-DuneSoloFileReplace { throw 'Test replacement failure' }
+        { Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' } | Should -Throw '*replacement failure*'
+        [IO.File]::ReadAllText($script:blueprintIni) | Should -BeExactly '[Unrelated]'
+        (Read-DuneSoloBlueprintSettings).canRestore | Should -BeFalse
+    }
+
+    It 'rejects legacy profiles before writing configuration' {
+        $legacy = New-TestSoloLayout -Channel 'FLS_beta'
+        Save-DuneSoloState -DataRoot $legacy.root -DbPath $legacy.db | Out-Null
+        { Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' } | Should -Throw '*verified Retail*'
+        Test-Path -LiteralPath $script:blueprintIni | Should -BeFalse
+    }
+}
+
+Describe 'Solo blueprint write recovery' {
+    BeforeEach {
+        Reset-TestSoloState
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        $script:recoveryIni = Join-Path $layout.config 'Game.ini'
+    }
+    It 'rolls back a verification failure and keeps exact original bytes' {
+        $original = "[Other]`nKeep=Yes"
+        [IO.File]::WriteAllText($script:recoveryIni, $original)
+        Mock Invoke-DuneSoloFileReplace {
+            param($Source, $Destination, $Backup)
+            [IO.File]::Replace($Source, $Destination, $Backup)
+            if ($Source.EndsWith('.tmp')) { [IO.File]::WriteAllText($Destination, 'Test corruption') }
+        }
+        { Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' } | Should -Throw '*verification failed*'
+        [IO.File]::ReadAllText($script:recoveryIni) | Should -BeExactly $original
+        (Read-DuneSoloBlueprintSettings).canRestore | Should -BeFalse
+    }
+    It 'rejects UTF-16 without modifying it or creating restoration state' {
+        [IO.File]::WriteAllText($script:recoveryIni, '[Other]', [Text.Encoding]::Unicode)
+        $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:recoveryIni))
+        { Set-DuneSoloBlueprintSettings -Enabled $true -Confirm 'APPLY SOLO BLUEPRINT SETTINGS' } | Should -Throw '*UTF-8*'
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:recoveryIni)) | Should -BeExactly $before
+        (Read-DuneSoloBlueprintSettings).canRestore | Should -BeFalse
+    }
 }
 
 Describe 'Solo Mode profile discovery and persistence' {
@@ -186,7 +326,7 @@ Describe 'Solo Mode profile discovery and persistence' {
         (Read-DuneSoloState).dbPath | Should -Be $secondDb
         (Read-DuneSoloState).dataRoot | Should -Be $layout.root
         { Assert-DuneSoloExpectedProfile -ExpectedProfileToken $firstToken } |
-            Should -Throw '*changed in another window*'
+            Should -Throw '*active Solo save changed*'
     }
 
     It 'rejects a saved database path outside its configured root' {
@@ -202,11 +342,11 @@ Describe 'Solo Mode profile discovery and persistence' {
 Describe 'Solo Mode write gates and settings backups' {
     BeforeEach { Reset-TestSoloState }
 
-    It 'reports all 48 native settings even when the INI is absent' {
+    It 'reports all 49 settings even when the INI is absent' {
         $layout = New-TestSoloLayout
         Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
         $settings = Read-DuneSoloSettings
-        $settings.entries.Count | Should -Be 48
+        $settings.entries.Count | Should -Be 49
         @($settings.entries | Where-Object present).Count | Should -Be 0
     }
 
@@ -215,6 +355,24 @@ Describe 'Solo Mode write gates and settings backups' {
         Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
         { Set-DuneSoloSettings -Settings @{ GatheringAmount = '2.0' } -Confirm 'yes' } |
             Should -Throw '*APPLY SOLO SETTINGS*'
+    }
+    It 'writes inventory slots only to Game.ini and preserves unrelated content' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        $game = Join-Path $layout.config 'Game.ini'
+        [IO.File]::WriteAllText($game, "[/Script/DuneSandbox.InventorySystemSettings]`r`nPlayerInventoryStartingSize=35`r`nPlayerInventoryStartingSize=40`r`nKeepInventory=Yes`r`n[Other]`r`nKeep=Yes`r`n")
+        $before = [IO.File]::ReadAllText($game)
+        $result = Set-DuneSoloSettings -Settings @{ PlayerInventoryStartingSize = '100' } -Confirm 'APPLY SOLO SETTINGS'
+        [IO.File]::ReadAllText($result.backupPath) | Should -Be $before
+        $text = [IO.File]::ReadAllText($game)
+        ([regex]::Matches($text, '(?m)^PlayerInventoryStartingSize=')).Count | Should -Be 1
+        $text | Should -Match 'PlayerInventoryStartingSize=100'
+        $text | Should -Match 'KeepInventory=Yes'
+        $text | Should -Match 'Keep=Yes'
+        (Test-Path (Join-Path $layout.config 'ServerCustomSettings.ini')) | Should -BeFalse
+        ($result.settings.entries | Where-Object key -eq 'PlayerInventoryStartingSize').value | Should -Be '100'
+        { Set-DuneSoloSettings -Settings @{ PlayerInventoryStartingSize = '0' } -Confirm 'APPLY SOLO SETTINGS' } | Should -Throw '*positive*'
     }
 
     It 'blocks settings writes while a Dune process is running' {
@@ -242,6 +400,95 @@ Describe 'Solo Mode write gates and settings backups' {
         (Get-Content -LiteralPath $ini -Raw) | Should -Match 'GatheringAmount=2\.500000'
         (Get-Content -LiteralPath $ini -Raw) | Should -Match 'FutureRetailSetting=KeepMe'
         (Test-Path -LiteralPath $result.backupPath) | Should -BeTrue
+    }
+
+    It 'writes landclaim segments to native settings and Game.ini while preserving other controls' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        $game = Join-Path $layout.config 'Game.ini'
+        [IO.File]::WriteAllText($game, "[/Script/DuneSandbox.BuildingSettings]`r`nm_MaxNumLandclaimSegments=10`r`nm_MaxNumLandclaimSegments=9`r`nm_bBuildingRestrictionLimitsEnabled=True`r`nm_DefaultBuildAndFillTimeInSeconds=0`r`n[Other]`r`nKeep=Yes`r`n", [Text.UTF8Encoding]::new($true))
+        $engine = Join-Path $layout.config 'Engine.ini'
+        [IO.File]::WriteAllText($engine, "[ConsoleVariables]`r`nVehicle.MaxVehiclesPerPlayer=20`r`n")
+        $engineBefore = [IO.File]::ReadAllBytes($engine)
+        $result = Set-DuneSoloSettings -Settings @{ MaxLandclaimSegments = '20'; GatheringAmount = '2.5' } -Confirm 'APPLY SOLO SETTINGS'
+        $result.ok | Should -BeTrue
+        ($result.settings.entries | Where-Object key -eq 'MaxLandclaimSegments').needsApply | Should -BeFalse
+        [IO.File]::ReadAllText((Join-Path $layout.config 'ServerCustomSettings.ini')) | Should -Match 'MaxLandclaimSegments=20'
+        $text = [IO.File]::ReadAllText($game)
+        ([regex]::Matches($text, '(?m)^m_MaxNumLandclaimSegments=')).Count | Should -Be 1
+        $text | Should -Match 'm_MaxNumLandclaimSegments=20'
+        $text | Should -Match 'm_bBuildingRestrictionLimitsEnabled=True'
+        $text | Should -Match 'm_DefaultBuildAndFillTimeInSeconds=0'
+        $text | Should -Match 'Keep=Yes'
+        [IO.File]::ReadAllBytes($game)[0] | Should -Be 0xEF
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($engine)) | Should -Be ([Convert]::ToBase64String($engineBefore))
+        $result.backupPaths.Count | Should -Be 1
+    }
+
+    It 'creates the required Game.ini building section on first landclaim apply' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        Set-DuneSoloSettings -Settings @{ MaxLandclaimSegments = '18' } -Confirm 'APPLY SOLO SETTINGS' | Out-Null
+        [IO.File]::ReadAllText((Join-Path $layout.config 'Game.ini')) | Should -Match '\[/Script/DuneSandbox.BuildingSettings\]\s+m_MaxNumLandclaimSegments=18'
+    }
+
+    It 'flags an existing native landclaim value for apply until the required override matches' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        $native = Join-Path $layout.config 'ServerCustomSettings.ini'
+        [IO.File]::WriteAllText($native, "[/Script/DuneSandbox.UserServerCustomSettings]`nMaxLandclaimSegments=20`n")
+        (Read-DuneSoloSettings -Path $native).entries | Where-Object key -eq 'MaxLandclaimSegments' | Select-Object -ExpandProperty needsApply | Should -BeTrue
+        [IO.File]::WriteAllText((Join-Path $layout.config 'Game.ini'), "[/Script/DuneSandbox.BuildingSettings]`nm_MaxNumLandclaimSegments=20`n")
+        (Read-DuneSoloSettings -Path $native).entries | Where-Object key -eq 'MaxLandclaimSegments' | Select-Object -ExpandProperty needsApply | Should -BeFalse
+    }
+
+    It 'rejects malformed UTF-8 Game.ini without changing either original file' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        $native = Join-Path $layout.config 'ServerCustomSettings.ini'
+        $game = Join-Path $layout.config 'Game.ini'
+        [IO.File]::WriteAllText($native, "[/Script/DuneSandbox.UserServerCustomSettings]`nMaxLandclaimSegments=10`n")
+        [IO.File]::WriteAllBytes($game, [byte[]](91,79,116,104,101,114,93,10,75,101,121,61,0xC3,0x28))
+        $nativeBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($native))
+        $gameBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($game))
+        { Set-DuneSoloSettings -Settings @{ MaxLandclaimSegments = '20' } -Confirm 'APPLY SOLO SETTINGS' } | Should -Throw
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($native)) | Should -BeExactly $nativeBefore
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($game)) | Should -BeExactly $gameBefore
+    }
+
+    It 'reads the shared client landclaim override and synchronizes native settings without reverting it' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        $native = Join-Path $layout.config 'ServerCustomSettings.ini'
+        $game = Join-Path $layout.config 'Game.ini'
+        [IO.File]::WriteAllText($native, "[/Script/DuneSandbox.UserServerCustomSettings]`nMaxLandclaimSegments=24`n")
+        [IO.File]::WriteAllText($game, "[/Script/DuneSandbox.BuildingSettings]`nm_MaxNumLandclaimSegments=23`n[Other]`nKeep=Yes`n")
+        $entry = (Read-DuneSoloSettings -Path $native).entries | Where-Object key -eq 'MaxLandclaimSegments'
+        $entry.value | Should -Be '23'
+        $entry.needsApply | Should -BeTrue
+        $result = Set-DuneSoloSettings -Settings @{ MaxLandclaimSegments = $entry.value } -Confirm 'APPLY SOLO SETTINGS'
+        ($result.settings.entries | Where-Object key -eq 'MaxLandclaimSegments').value | Should -Be '23'
+        ($result.settings.entries | Where-Object key -eq 'MaxLandclaimSegments').needsApply | Should -BeFalse
+        [IO.File]::ReadAllText($native) | Should -Match 'MaxLandclaimSegments=23'
+        [IO.File]::ReadAllText($game) | Should -Match 'm_MaxNumLandclaimSegments=23'
+        [IO.File]::ReadAllText($game) | Should -Match 'Keep=Yes'
+    }
+
+    It 'rolls native settings back when the required Game.ini write fails' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        $native = Join-Path $layout.config 'ServerCustomSettings.ini'
+        $original = "[/Script/DuneSandbox.UserServerCustomSettings]`r`nMaxLandclaimSegments=10`r`nFuture=Keep`r`n"
+        [IO.File]::WriteAllText($native, $original)
+        Mock Write-DuneSoloBlueprintFile { throw 'Injected Game.ini failure' }
+        { Set-DuneSoloSettings -Settings @{ MaxLandclaimSegments = '20' } -Confirm 'APPLY SOLO SETTINGS' } | Should -Throw '*Injected Game.ini failure*'
+        [IO.File]::ReadAllText($native) | Should -BeExactly $original
+        Test-Path -LiteralPath (Join-Path $layout.config 'Game.ini') | Should -BeFalse
     }
 
     It 'rejects unsupported setting injection' {
@@ -316,13 +563,21 @@ Describe 'Solo Mode write gates and settings backups' {
 
         $before = Read-DuneSoloConsoleSettings
         $before.supported | Should -BeTrue
+        ($before.entries | Where-Object key -eq 'dw.EnableBuildablePlacementAlwaysFilled').value |
+            Should -Be ''
         ($before.entries | Where-Object key -eq 'Hydration.SunExposureEnabled').value |
             Should -Be '1'
 
         $result = Set-DuneSoloConsoleSettings -Settings @{
             'Hydration.SunExposureEnabled' = '0'
             'Vehicle.MaxVehiclesPerPlayer' = '20'
+            'dw.EnableBuildablePlacementAlwaysFilled' = '1'
             'Dune.DisableShieldOnShooting' = '0'
+            'Vehicle.RecoveryTimeLimit' = '1'
+            'dw.VehicleDurabilityDamageMultiplier' = '0.010000'
+            'Vehicle.RelocationEnabled' = '1'
+            'Vehicle.RecoveryChassisDurabilityReductionFraction' = '0.001000'
+            'Vehicle.RecoveryCurrencyBaseCost' = '100'
         } -Confirm 'APPLY SOLO CONSOLE SETTINGS'
 
         $result.ok | Should -BeTrue
@@ -337,7 +592,13 @@ Describe 'Solo Mode write gates and settings backups' {
         @([regex]::Matches($written, '(?m)^Hydration\.SunExposureEnabled=0\r?$')).Count |
             Should -Be 1
         $written | Should -Match '(?m)^Vehicle\.MaxVehiclesPerPlayer=20\r?$'
+        $written | Should -Match '(?m)^dw\.EnableBuildablePlacementAlwaysFilled=1\r?$'
         $written | Should -Match '(?m)^Dune\.DisableShieldOnShooting=0\r?$'
+        $written | Should -Match '(?m)^Vehicle\.RecoveryTimeLimit=1\r?$'
+        $written | Should -Match '(?m)^dw\.VehicleDurabilityDamageMultiplier=0\.010000\r?$'
+        $written | Should -Match '(?m)^Vehicle\.RelocationEnabled=1\r?$'
+        $written | Should -Match '(?m)^Vehicle\.RecoveryChassisDurabilityReductionFraction=0\.001000\r?$'
+        $written | Should -Match '(?m)^Vehicle\.RecoveryCurrencyBaseCost=100\r?$'
         $clientWritten | Should -Match '(?m)^Client\.FutureKey=KeepMe\r?$'
         $clientWritten.Trim() | Should -Be ((@(
             '[ConsoleVariables]'
@@ -345,6 +606,27 @@ Describe 'Solo Mode write gates and settings backups' {
             'Dune.DisableShieldOnShooting=1'
             'Client.FutureKey=KeepMe'
         ) -join [Environment]::NewLine).Trim())
+    }
+
+    It 'rejects invalid vehicle values before changing Engine.ini' -TestCases @(
+        @{ Key = 'dw.VehicleDurabilityDamageMultiplier'; Value = 'NaN' }
+        @{ Key = 'dw.VehicleDurabilityDamageMultiplier'; Value = 'Infinity' }
+        @{ Key = 'dw.VehicleDurabilityDamageMultiplier'; Value = '0,01' }
+        @{ Key = 'Vehicle.RecoveryTimeLimit'; Value = '-1' }
+        @{ Key = 'Vehicle.RecoveryChassisDurabilityReductionFraction'; Value = '1.01' }
+        @{ Key = 'Vehicle.RecoveryCurrencyBaseCost'; Value = '100.5' }
+        @{ Key = 'Vehicle.RelocationEnabled'; Value = '2' }
+    ) {
+        param($Key, $Value)
+        $layout = New-TestSoloLayout
+        $engine = Join-Path $layout.config 'Engine.ini'
+        $original = "[ConsoleVariables]`nUnknown.FutureKey=KeepMe"
+        [IO.File]::WriteAllText($engine, $original)
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        { Set-DuneSoloConsoleSettings -Settings @{ $Key = $Value } -Confirm 'APPLY SOLO CONSOLE SETTINGS' } |
+            Should -Throw
+        [IO.File]::ReadAllText($engine) | Should -BeExactly $original
     }
 
     It 'blocks Retail Engine.ini writes while the game is running' {
@@ -497,6 +779,7 @@ Describe 'Solo Mode write gates and settings backups' {
     }
 
     It 'rejects invalid or unconfirmed Solo item deletion input before invoking the helper' {
+        Mock Get-DuneSoloGameProcesses { @() }
         {
             Remove-DuneSoloInventoryItem -ItemId 107 `
                 -ExpectedStackSize 10 -Quantity 11 -Confirm 'DELETE SOLO ITEM'
@@ -678,6 +961,48 @@ Describe 'Solo Mode write gates and settings backups' {
         }
     }
 
+    It 'builds a main quest unlock with the selected save and retained backup' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        Mock Invoke-DuneSoloHelper { @{ ok = $true } }
+        (Unlock-DuneSoloMainQuest -Quest 'DA_MQ_AssassinsHandbook' -Confirm 'UNLOCK SOLO MAIN QUEST').ok | Should -BeTrue
+        Assert-MockCalled Invoke-DuneSoloHelper -Times 1 -ParameterFilter {
+            $Command -eq 'unlock-main-quest' -and $Arguments.input -eq $layout.db -and
+            $Arguments.quest -eq 'DA_MQ_AssassinsHandbook' -and
+            $Arguments.tags -like '*dune-tags.json' -and
+            $Arguments['safety-backup'] -like '*pre-progression*'
+        }
+    }
+
+    It 'rejects a main quest unlock while the game is running' {
+        Mock Get-DuneSoloGameProcesses { @(@{name='DuneSandbox';pid=42}) }
+        Mock Invoke-DuneSoloHelper { throw 'Must not run' }
+        { Unlock-DuneSoloMainQuest -Quest 'DA_MQ_ANewBeginning' -Confirm 'UNLOCK SOLO MAIN QUEST' } | Should -Throw '*still running*'
+        Assert-MockCalled Invoke-DuneSoloHelper -Times 0
+    }
+
+    It 'builds a trainer unlock with the selected save and retained backup' {
+        $layout = New-TestSoloLayout
+        Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
+        Mock Get-DuneSoloGameProcesses { @() }
+        Mock Invoke-DuneSoloHelper { @{ ok = $true } }
+        (Unlock-DuneSoloTrainer -Job 'Mentat' -Confirm 'UNLOCK SOLO TRAINER').ok | Should -BeTrue
+        Assert-MockCalled Invoke-DuneSoloHelper -Times 1 -ParameterFilter {
+            $Command -eq 'unlock-trainer' -and $Arguments.input -eq $layout.db -and
+            $Arguments.job -eq 'Mentat' -and
+            $Arguments.tags -like '*dune-tags.json' -and
+            $Arguments['safety-backup'] -like '*pre-progression*'
+        }
+    }
+
+    It 'rejects a trainer unlock while the game is running' {
+        Mock Get-DuneSoloGameProcesses { @(@{name='DuneSandbox';pid=42}) }
+        Mock Invoke-DuneSoloHelper { throw 'Must not run' }
+        { Unlock-DuneSoloTrainer -Job 'Mentat' -Confirm 'UNLOCK SOLO TRAINER' } | Should -Throw '*still running*'
+        Assert-MockCalled Invoke-DuneSoloHelper -Times 0
+    }
+
     It 'builds each Retail progression command with a retained backup' {
         $layout = New-TestSoloLayout
         Save-DuneSoloState -DataRoot $layout.root -DbPath $layout.db | Out-Null
@@ -777,7 +1102,7 @@ Describe 'Solo Mode route security metadata' {
             & $Script
         }
         Mock Assert-DuneSoloExpectedProfile {
-            throw 'The selected Solo profile changed in another window. Refresh and try again.'
+            throw 'The selected Solo profile active Solo save changed. Refresh and try again.'
         }
         Mock Export-DuneSoloBlueprint {}
         . (Join-Path (Get-DstRepoRoot) 'app\server\routes\SoloMode.ps1')
@@ -790,7 +1115,7 @@ Describe 'Solo Mode route security metadata' {
         & $script:CapturedSoloRouteHandlers['/api/solo/blueprints/export'] $request $response $null $null
 
         $response.Status | Should -Be 409
-        $response.Message | Should -Match 'changed in another window'
+        $response.Message | Should -Match 'active Solo save changed'
         Assert-MockCalled Export-DuneSoloBlueprint -Times 0 -Exactly
     }
 
@@ -883,7 +1208,7 @@ Describe 'Solo Mode backup profile isolation' {
         $token = Get-DuneSoloProfileToken -DbPath $layout.db
         { Assert-DuneSoloExpectedProfile -ExpectedProfileToken $token } | Should -Not -Throw
         { Assert-DuneSoloExpectedProfile -ExpectedProfileToken ('0' * 64) } |
-            Should -Throw '*changed in another window*'
+            Should -Throw '*active Solo save changed*'
     }
 
     It 'keeps blueprint list and export behind the same stale-profile guard' {

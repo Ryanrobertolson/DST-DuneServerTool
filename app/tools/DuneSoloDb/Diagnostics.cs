@@ -52,7 +52,7 @@ internal static partial class Program
                 : "SELECT keystone_id FROM purchased_specialization_keystones WHERE player_id=(SELECT player_controller_id FROM player_state LIMIT 1) ORDER BY keystone_id;";
             var rewards = Rows("purchased_specialization_keystones", rewardSql);
             var journeys = Rows("journey_story_node", "SELECT story_node_id, json(complete_condition_state) AS complete_condition, json(reveal_condition_state) AS reveal_condition, has_pending_reward FROM journey_story_node WHERE character_id=(SELECT id FROM player_state LIMIT 1) ORDER BY story_node_id;");
-            var tags = Rows("player_tags", "SELECT tag FROM player_tags WHERE character_id=(SELECT id FROM player_state LIMIT 1) AND (tag LIKE 'Journey.%' OR tag LIKE 'Faction.%' OR tag LIKE 'DialogueFlags.Factions.%') ORDER BY tag;");
+            var tags = Rows("player_tags", "SELECT tag FROM player_tags WHERE character_id=(SELECT id FROM player_state LIMIT 1) AND (tag LIKE 'Journey.%' OR tag LIKE 'Faction.%' OR tag LIKE 'DialogueFlags.Factions.%' OR tag LIKE 'Character.Keystone.%') ORDER BY tag;");
             var standing = Rows("player_faction_reputation", "SELECT faction_id, reputation_amount FROM player_faction_reputation WHERE actor_id=(SELECT player_controller_id FROM player_state LIMIT 1) ORDER BY faction_id;");
             if (!SHA256.HashData(bytes).SequenceEqual(SHA256.HashData(ReadStable(input))))
                 throw new IOException("Solo save changed during diagnostics. Close the game and try again.");
@@ -75,7 +75,7 @@ internal static partial class Program
         string adapterPath, string keystonePath, string track)
     {
         var adapter = ReadSoloAdapter(adapterPath);
-        AssertProgressionSchema(input, adapter);
+        AssertProgressionAdapter(input, adapter);
         var match = adapter.Tracks.FirstOrDefault(pair => pair.Key.Equals(track, StringComparison.OrdinalIgnoreCase));
         if (match.Key is null) throw new ArgumentException("Choose a valid specialization.");
         var catalog = ReadKeystones(keystonePath);
@@ -127,6 +127,16 @@ internal static partial class Program
                     level["UnspentSkillPoints"] = unspent - removedBonus;
                     WriteFglComponents(connection, identity.EntityId, components);
                 }
+                // Older resets removed claims but left these effects behind.
+                // Clear every verified tag for the selected track, including
+                // that stale state, while preserving other tracks and tags.
+                foreach (var rule in catalog.Values.Where(rule => rule.Track.Equals(match.Key, StringComparison.OrdinalIgnoreCase)))
+                {
+                    foreach (var tag in rule.PlayerTags)
+                        ExecuteNonQuery(connection,
+                            "DELETE FROM player_tags WHERE character_id=$character AND tag=$tag;",
+                            ("$character", identity.CharacterId), ("$tag", tag));
+                }
                 foreach (var id in rewardIds)
                 {
                     if (ExecuteNonQuery(connection, "DELETE FROM purchased_specialization_keystones WHERE player_id=$player AND keystone_id=$reward;", ("$player", identity.ControllerId), ("$reward", id)) != 1)
@@ -144,7 +154,7 @@ internal static partial class Program
         string adapterPath, string track, long level)
     {
         var adapter = ReadSoloAdapter(adapterPath);
-        AssertProgressionSchema(input, adapter);
+        AssertProgressionAdapter(input, adapter);
         var match = adapter.Tracks.FirstOrDefault(pair => pair.Key.Equals(track, StringComparison.OrdinalIgnoreCase));
         if (match.Key is null || level < 0 || level > adapter.MaxLevel)
             throw new ArgumentException("Choose a valid specialization and a level from 0 to 100.");

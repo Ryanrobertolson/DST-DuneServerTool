@@ -109,12 +109,12 @@ $script:DuneRelaunchArgs = @()
 if ($script:DuneHeadlessMode) { $script:DuneRelaunchArgs += '--headless' }
 if ($script:DuneReattachMode) { $script:DuneRelaunchArgs += '--reattach' }
 
-# ---------- Minimize own console window IMMEDIATELY ----------------------------
+# ---------- Hide own console window IMMEDIATELY ----------------------------
 # v6.1.7+: the EXE is built console-subsystem (NoConsole=$false in Build-Exe.ps1)
 # so that child kubectl/ssh/git processes inherit a console and Windows doesn't
 # allocate a flashy new console window for each one (the "popup window flash"
 # users saw on every dashboard refresh in v6.1.2-v6.1.6). We don't actually
-# want the console visible, so minimize it as the very first action.
+# want the console visible, so hide it as the very first action.
 #
 # Detection rule: process name is the compiled EXE name (e.g. "DuneServer")
 # when launched as the ps2exe build. When the script runs as plain .ps1
@@ -142,20 +142,20 @@ public static extern System.IntPtr GetConsoleWindow();
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool IsIconic(System.IntPtr hWnd);
+public static extern bool IsWindowVisible(System.IntPtr hWnd);
 '@ -Name 'DuneNativeWin' -Namespace 'DuneServer' -ErrorAction Stop
 
         # Retry loop: console may not be attached on the very first tick after
         # process start (especially when launched by Inno Setup's [Run] step
         # or by the in-app updater). Try for up to ~2s; bail as soon as we
-        # see the window is iconic.
+        # see the window is hidden.
         $deadline = (Get-Date).AddSeconds(2)
         while ((Get-Date) -lt $deadline) {
             $hwnd = [DuneServer.DuneNativeWin]::GetConsoleWindow()
             if ($hwnd -ne [System.IntPtr]::Zero) {
-                [void][DuneServer.DuneNativeWin]::ShowWindow($hwnd, 7)   # SW_SHOWMINNOACTIVE
+                [void][DuneServer.DuneNativeWin]::ShowWindow($hwnd, 0)   # SW_HIDE: retain console for child processes
                 Start-Sleep -Milliseconds 50
-                if ([DuneServer.DuneNativeWin]::IsIconic($hwnd)) { break }
+                if (-not [DuneServer.DuneNativeWin]::IsWindowVisible($hwnd)) { break }
             }
             Start-Sleep -Milliseconds 100
         }
@@ -166,7 +166,7 @@ public static extern bool IsIconic(System.IntPtr hWnd);
 Write-DuneStartupLog 'Console presentation initialized'
 
 # Version (one of the 5 sync'd constants; see persistent-notes.md)
-$script:DuneToolVersion = '15.2.5'
+$script:DuneToolVersion = '16.5.4'
 # Artifact identity defaults for source/dev runs. Build-Exe.ps1 replaces these
 # four declarations only in its generated compilation input, so the resulting
 # executable carries immutable identity without changing tracked version stamps.
@@ -551,7 +551,8 @@ try {
     )) { if (Test-Path $p) { $script:PwshExe = $p; break } }
 }
 if (-not $script:PwshExe) {
-    Show-DuneMessage 'pwsh.exe (PowerShell 7) not found. Install from https://aka.ms/PowerShell-Release' 'Dune Server' 'Error'
+    Write-DuneStartupLog 'Startup blocked: PowerShell 7 was not found.'
+    Show-DuneMessage 'PowerShell 7 is required. Install PowerShell from the Microsoft Store, then reopen DST: https://apps.microsoft.com/detail/9MZ1SNWT0N5D' 'Dune Server' 'Error'
     exit 1
 }
 
@@ -614,7 +615,7 @@ Write-DuneStartupLog 'Route modules loaded'
 # Start the native Market Bot ("Duke") scheduler in its own background runspace.
 # It only acts when the bot is enabled in gameplay-bot.json, so this is safe to
 # always start; it idles otherwise.
-if (Get-Command Start-DuneGameplayBotScheduler -ErrorAction SilentlyContinue) {
+if (-not (Test-DuneSoloInstallation) -and (Get-Command Start-DuneGameplayBotScheduler -ErrorAction SilentlyContinue)) {
     try { [void](Start-DuneGameplayBotScheduler -ServerDir $serverDir) } catch {}
 }
 Write-DuneStartupLog 'Gameplay bot scheduler initialized'

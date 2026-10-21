@@ -13,6 +13,7 @@ param(
     [switch]$SkipWebBuild,
     [switch]$SkipShellBuild,
     [switch]$SkipSoloBuild,
+    [switch]$SkipRegisBuild,
     [switch]$SkipPlatformBuild,
     [switch]$SkipVersionCheck,
     # Artifact/release-channel identity is independent of stable product stamps.
@@ -26,6 +27,17 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $appRoot    = Split-Path -Parent $PSScriptRoot                          # ...\app
+$runtimePins = @{
+    'runtime-1140.zip' = 'B954F036B10E9ABB0C0C41599311AB1ACCC53E30515AEED7E48EE22C5B3B1280'
+    'runtime.zip' = '3C72142A383E25E9F9553AC9E4D5677AA572E98CB369CAC57200EFB2E381E603'
+    'configs.zip' = '1B2420B7DEB237CD680D27306EADF26628699D992A322C89A963D80F580C9B78'
+}
+foreach ($name in $runtimePins.Keys) {
+    $archive = Join-Path $appRoot ('resources\solo-mod-runtime\' + $name)
+    if (-not (Test-Path -LiteralPath $archive) -or (Get-FileHash -LiteralPath $archive).Hash -ne $runtimePins[$name]) {
+        throw "Bundled Solo mod runtime archive is missing or has an unexpected checksum: $name"
+    }
+}
 $repoRoot   = Split-Path -Parent $appRoot                               # ...\<repo>
 $webuiDir   = Join-Path $repoRoot 'webui'
 $webuiDist  = Join-Path $webuiDir 'dist'
@@ -33,8 +45,11 @@ $iss        = Join-Path $appRoot 'installer\DuneServer.iss'
 $exePath    = Join-Path $appRoot 'build\output\DuneServer.exe'
 $outDir     = Join-Path $appRoot 'installer\output'
 $installer  = Join-Path $outDir 'DuneServerSetup.exe'
+& (Join-Path $PSScriptRoot 'Prepare-AtlasPython.ps1')
 $soloProj   = Join-Path $appRoot 'tools\DuneSoloDb\DuneSoloDb.csproj'
 $soloExe    = Join-Path $appRoot 'tools\DuneSoloDb\bin\Release\net10.0-windows\win-x64\publish\DuneSoloDb.exe'
+$regisProj  = Join-Path $appRoot 'tools\DuneRegisTanks\DuneRegisTanks.csproj'
+$regisExe   = Join-Path $appRoot 'tools\DuneRegisTanks\bin\Release\net10.0-windows\win-x64\publish\DuneRegisTanks.exe'
 $platformProj = Join-Path $appRoot 'tools\DunePlatformStore\DunePlatformStore.csproj'
 $platformExe = Join-Path $appRoot 'tools\DunePlatformStore\bin\Release\net10.0-windows\win-x64\publish\DunePlatformStore.exe'
 $buildHelpers = Join-Path $appRoot 'build\BuildHelpers.ps1'
@@ -110,6 +125,25 @@ if ($BuildTag) {
 }
 Write-Host "Build identity: prerelease=$([bool]$Prerelease), tag=$(if ($BuildTag) { $BuildTag } else { '(manual)' }), commit=$BuildCommit" -ForegroundColor Cyan
 Write-Host ''
+
+# Verify the generated Linux helper before compiling the installer. No Python
+# installation is required here; regeneration is a developer build-time action.
+$deckInputs = @('scripts/build-deck-companion.py','app/server/lib/SoloMode.ps1') + @(
+    'deck_helper.py','settings_writer.py','settings_batch.py','deck_mods.py','deck_modlaunch.py','deck_ssh.py','companion.py'
+    | ForEach-Object { 'app/resources/steam-deck/' + $_ }
+)
+$deckCanonical = New-Object Text.StringBuilder
+foreach ($deckInput in $deckInputs) {
+    $deckSource = [IO.File]::ReadAllText((Join-Path $repoRoot $deckInput)).Replace("`r`n","`n").Replace("`r","`n")
+    [void]$deckCanonical.Append($deckInput).Append([char]0).Append($deckSource).Append([char]0)
+}
+$deckHashAlgorithm = [Security.Cryptography.SHA256]::Create()
+try { $deckFingerprint = [BitConverter]::ToString($deckHashAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($deckCanonical.ToString()))).Replace('-','').ToLowerInvariant() }
+finally { $deckHashAlgorithm.Dispose() }
+$deckArtifact = [IO.File]::ReadAllText((Join-Path $appRoot 'resources/steam-deck/DST-Deck-Companion.sh'))
+if ($deckArtifact -notmatch ('(?m)^# Source SHA256: ' + $deckFingerprint + '$')) {
+    throw 'The Deck companion is stale. Regenerate it with scripts/build-deck-companion.py before building the installer.'
+}
 
 # ---------------------------------------------------------------------------
 # Pre-flight: version-stamp sync check.
@@ -308,6 +342,15 @@ if (-not $SkipSoloBuild) {
     if ($LASTEXITCODE -ne 0) { throw "DuneSoloDb self-test failed (exit $LASTEXITCODE)" }
     Write-Host ""
 }
+if (-not $SkipRegisBuild) {
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'Install .NET 10 SDK to build Regis Tank support.' }
+    & dotnet publish $regisProj -c Release
+    if ($LASTEXITCODE -ne 0) { throw 'Regis Tank helper publish failed.' }
+    & $regisExe --self-test
+    if ($LASTEXITCODE -ne 0) { throw 'Regis Tank helper self-test failed.' }
+}
+if (-not (Test-Path -LiteralPath $regisExe)) { throw 'Regis Tank helper executable is missing.' }
+
 if (-not (Test-Path $soloExe)) {
     throw "DuneSoloDb.exe not found at $soloExe - run 'dotnet publish' for DuneSoloDb (or omit -SkipSoloBuild)"
 }

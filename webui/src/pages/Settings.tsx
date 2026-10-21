@@ -1,5 +1,7 @@
+import { useSoloInstallation } from '../hooks/useInstallationMode'
 import { useState, useEffect, type FormEvent } from 'react'
 import { PageHeader } from '../components/PageHeader'
+import { StartupSettingsSync } from './gameconfig/StartupSettingsSync'
 import { Icon } from '../components/Icon'
 import { api } from '../api/client'
 import type { ConfigResponse } from '../api/types'
@@ -12,10 +14,10 @@ import { PublicIpCard } from './settings/PublicIpCard'
 import { ServerBrowserPingCard } from './settings/ServerBrowserPingCard'
 import { HyperVLanCard } from './settings/HyperVLanCard'
 import { HyperVLifecycleCard } from './settings/HyperVLifecycleCard'
-import { RemoteAccessCard } from './settings/RemoteAccessCard'
-import { MobileAppCard } from './settings/MobileAppCard'
+import { BrowserAccessCard } from './settings/BrowserAccessCard'
 import { FlsTokenCard } from './settings/FlsTokenCard'
 import { FreshStartSnapshotsCard } from './settings/FreshStartSnapshotsCard'
+import { IniBackupsCard } from './settings/IniBackupsCard'
 import { InstallLocationCard } from './settings/InstallLocationCard'
 import { ShellPreferencesCard } from './settings/ShellPreferencesCard'
 import { SectionErrorBoundary } from '../components/SectionErrorBoundary'
@@ -45,7 +47,7 @@ const FIELDS: {
     help: 'Used for desktop shortcut creation.' },
   { key: 'PortCheckMode',label: 'Port-check mode', placeholder: 'builtin',
     type: 'select',
-    help: 'builtin = Check-Host multi-node TCP check · checkhost = same documented API · canyouseeme = legacy alternate provider · custom = your own URL · disabled = off' },
+    help: 'builtin = CanYouSeeMe, PortCheckTool, then Check-Host (TCP only) · checkhost = Check-Host only · canyouseeme = CanYouSeeMe only · custom = your own URL · disabled = off' },
   { key: 'PortCheckUrlTemplate', label: 'Port-check URL template',
     placeholder: 'https://example.com/check?ip={ip}&port={port}&protocol={protocol}',
     help: 'Used when mode is "custom". Tokens: {ip} {port} {protocol}',
@@ -60,6 +62,7 @@ const FIELDS: {
 ]
 
 export function Settings() {
+  const soloOnly = useSoloInstallation()
   const [cfg, setCfg] = useState<ConfigResponse | null>(null)
   const [values, setValues] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(true)
@@ -232,10 +235,10 @@ export function Settings() {
   const [prLoading, setPrLoading] = useState(false)
   const [updSwitching, setUpdSwitching] = useState(false)
 
-  async function loadPreReleases() {
+  async function loadPreReleases(force = false) {
     setPrLoading(true)
     try {
-      const r = await listPreReleases({ force: true })
+      const r = await listPreReleases({ force })
       setPreReleases(r.releases ?? [])
       return r.releases ?? []
     } catch (e) {
@@ -262,7 +265,7 @@ export function Settings() {
       } else {
         setSelectedTag('')
       }
-      await onCheckUpdate()
+      await onCheckUpdate(false)
     } catch (e) {
       setUpdErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -277,7 +280,7 @@ export function Settings() {
     try {
       await setPreReleaseTag(tag)
       setSelectedTag(tag)
-      await onCheckUpdate()
+      await onCheckUpdate(false)
     } catch (e) {
       setUpdErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -285,12 +288,13 @@ export function Settings() {
     }
   }
 
-  async function onCheckUpdate() {
+  async function onCheckUpdate(force = true) {
     setUpdChecking(true)
     setUpdErr(null)
     setUpdMsg(null)
     try {
-      const res = await checkForUpdate({ force: true })
+      if (force && updChannel === 'test') { await loadPreReleases(true) }
+      const res = await checkForUpdate({ force })
       setUpdCheck(res)
       // Share the result so the global UpdateBanner reflects it immediately.
       publishUpdateCheck(res)
@@ -546,7 +550,7 @@ export function Settings() {
               <p className="text-sm text-text-dim">
                 Checks GitHub releases for newer versions. Settings installs launch the visible installer wizard; your config in <span className="font-mono">%APPDATA%\DuneServer</span> is preserved.
               </p>
-              <button type="button" onClick={onCheckUpdate} disabled={updChecking} className="btn-secondary ml-3 shrink-0">
+              <button type="button" onClick={() => void onCheckUpdate()} disabled={updChecking} className="btn-secondary ml-3 shrink-0">
                 <Icon name={updChecking ? 'Loader2' : 'RefreshCw'} size={15} className={updChecking ? 'animate-spin' : ''} />
                 {updChecking ? 'Checking…' : 'Check now'}
               </button>
@@ -702,6 +706,7 @@ export function Settings() {
       </SectionErrorBoundary>
 
       <SectionErrorBoundary name="Dune Server Tool installation"><InstallLocationCard /></SectionErrorBoundary>
+      <SectionErrorBoundary name="INI backups"><IniBackupsCard /></SectionErrorBoundary>
 
       <SectionErrorBoundary name="Appearance"><AppearanceCard /></SectionErrorBoundary>
 
@@ -709,9 +714,8 @@ export function Settings() {
         <SectionErrorBoundary name="Desktop shell"><ShellPreferencesCard /></SectionErrorBoundary>
       )}
 
-      <SectionErrorBoundary name="Dashboard warnings"><DashboardAlertsCard /></SectionErrorBoundary>
+      {!soloOnly && <><SectionErrorBoundary name="Dashboard warnings"><DashboardAlertsCard /></SectionErrorBoundary>
 
-      <SectionErrorBoundary name="Remote Access"><RemoteAccessCard /></SectionErrorBoundary>
 
       <SectionErrorBoundary name="Hyper-V over LAN"><HyperVLanCard /></SectionErrorBoundary>
 
@@ -810,7 +814,7 @@ export function Settings() {
                 className="w-full px-3 py-2 rounded-lg bg-surface-2 border border-border text-text focus:outline-none focus:ring-2 focus:ring-ibad focus:border-ibad/50"
               >
                 <option value="">(default: builtin)</option>
-                <option value="builtin">builtin — Check-Host multi-node API (TCP only)</option>
+                <option value="builtin">builtin — automatic external observers (TCP only)</option>
                 <option value="checkhost">check-host.net — documented multi-node API (TCP only)</option>
                 <option value="canyouseeme">canyouseeme.org — alternate provider (TCP only)</option>
                 <option value="custom">custom — your own URL template</option>
@@ -951,7 +955,9 @@ export function Settings() {
         </div>
       </form>
 
-      <SectionErrorBoundary name="Mobile App Pairing"><MobileAppCard /></SectionErrorBoundary>
+      </>}
+      {!soloOnly && <SectionErrorBoundary name="Mobile App Pairing"><BrowserAccessCard /></SectionErrorBoundary>}
+      {!soloOnly && <div className="mt-4"><StartupSettingsSync /></div>}
     </>
   )
 }

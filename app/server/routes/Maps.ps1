@@ -1,9 +1,10 @@
 ﻿# Routes for on-demand map control (currently DeepDesert).
 
-# Versioned Maps read-model routes are cache-only. Source reads happen in the
-# bounded startup refresh and never on an HTTP response path.
+# Versioned Maps reads renew a short viewer lease. Responses remain cache-only;
+# the background worker does no source reads after the last viewer expires.
 Register-DuneRoute -Method GET -Path '/api/v1/maps/catalog' -Handler {
     param($req, $res, $routeParams, $body)
+    (Get-DunePlatformCoordinationTable)['maps:viewer-until'] = [DateTime]::UtcNow.AddMinutes(2)
     try {
         $requestId = if ($routeParams.requestId) { [string]$routeParams.requestId } else { New-DuneRequestId }
         Write-DuneJson -Response $res -Body (Get-DuneMapsCatalogResponse -RequestId $requestId)
@@ -14,6 +15,7 @@ Register-DuneRoute -Method GET -Path '/api/v1/maps/catalog' -Handler {
 
 Register-DuneRoute -Method GET -Path '/api/v1/maps/deep-desert' -Handler {
     param($req, $res, $routeParams, $body)
+    (Get-DunePlatformCoordinationTable)['maps:viewer-until'] = [DateTime]::UtcNow.AddMinutes(2)
     try {
         $requestId = if ($routeParams.requestId) { [string]$routeParams.requestId } else { New-DuneRequestId }
         Write-DuneJson -Response $res -Body (Get-DuneDeepDesertMapResponse -RequestId $requestId)
@@ -24,6 +26,7 @@ Register-DuneRoute -Method GET -Path '/api/v1/maps/deep-desert' -Handler {
 
 Register-DuneRoute -Method GET -Path '/api/v1/maps/deep-desert/layers/{layer}' -Handler {
     param($req, $res, $routeParams, $body)
+    (Get-DunePlatformCoordinationTable)['maps:viewer-until'] = [DateTime]::UtcNow.AddMinutes(2)
     try {
         $layer = [string]$routeParams.layer
         if ($layer -notin @('active-spice','public-poi')) {
@@ -85,6 +88,13 @@ Register-DuneRoute -Method GET -Path '/api/maps/{key}' -Handler {
         if (-not $state.ok) {
             Write-DuneError -Response $res -Status $state.status -Message $state.message
             return
+        }
+        if ([string]$routeParams.requestPrincipal.type -eq 'linked-player') {
+            $state = @{
+                ok=$true; key=$state.key; label=$state.label; running=[bool]$state.running
+                playersOnline=$state.playersOnline; present=[bool]$state.present
+                targetInstances=$state.targetInstances; readyInstances=$state.readyInstances
+            }
         }
         Write-DuneJson -Response $res -Body $state
     } catch {

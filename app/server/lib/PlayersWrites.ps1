@@ -377,15 +377,26 @@ function Invoke-DunePlayerGiveItemsBulk {
     # Route each item the same way the single give-item endpoint does: an online
     # player keeps their inventory in memory, so a direct SQL write is ignored and
     # overwritten on the next save (the item never appears, or vanishes on relog).
-    # Default-quality gives to an online player must therefore go through the RMQ
-    # live path. Custom-quality gives can't be delivered live, so they fall back to
-    # SQL with a "must relog" note. Resolve online status + fls_id once up front.
+    # Default-quality gives to an online player use RMQ. Grade overrides require
+    # an offline player, just like the single-item route. Preflight the whole
+    # package before granting anything so a Grade rejection cannot partly apply it.
     $off = Test-DunePlayerOffline -Ip $Ip -PawnId $PawnId
     $isOnline = -not $off.ok
+    if ($isOnline) {
+        foreach ($it in @($Items)) {
+            if ((Get-DuneBodyInt -Body $it -Name 'quality') -gt 0) {
+                return @{ ok = $false; error = 'Changing the Grade requires the player to be offline. No package items were sent. Ask the player to log out, then retry.' }
+            }
+        }
+    }
     $fls = $FlsId
     if ($isOnline -and [string]::IsNullOrWhiteSpace($fls)) {
         $fr = Resolve-DuneFlsIdOrError -Ip $Ip -ActorId $PawnId
-        if ($fr.ok) { $fls = [string]$fr.fls_id }
+        if (-not $fr.ok) { return @{ ok = $false; error = $fr.error } }
+        $fls = [string]$fr.fls_id
+    }
+    if ($isOnline -and [string]::IsNullOrWhiteSpace($fls)) {
+        return @{ ok = $false; error = 'Cannot resolve the online player for live package delivery. No package items were sent.' }
     }
     $sourceItems = @($Items)
     $results = [object[]]::new($sourceItems.Count)
@@ -424,13 +435,10 @@ function Invoke-DunePlayerGiveItemsBulk {
                 -Template $tmpl -Quantity ([int]$qty) -Durability 1.0 -AllowOverflow $false
             if ($r.ok -and -not $r.path) { $r['path'] = 'rmq' }
         } else {
-            # Offline, OR online with custom quality / unresolved fls → SQL
+            # Only offline players may receive SQL inventory writes.
             $r = Invoke-DunePlayerGiveItem -Ip $Ip -PawnId $PawnId -Template $tmpl -Qty $qty -Quality ([int64]$qlevel)
             if ($r.ok) {
                 $r['path'] = 'sql'
-                if ($isOnline) {
-                    $r['message'] = "$($r.message) Player is online — they must relog to see this item."
-                }
             }
         }
         $results[$index] = $r
@@ -456,7 +464,7 @@ function Invoke-DunePlayerGiveItemsBulk {
     } else {
         "$($total - $failures)/$total item templates gave OK; $failures failed."
     }
-    return @{ ok = $ok; message = $msg; results = $results; failures = $failures; total = $total }
+    return @{ ok = $ok; message = $msg; error = $msg; results = $results; failures = $failures; total = $total }
 }
 
 function Invoke-DunePlayerGrantHouseSwatches {
@@ -530,6 +538,66 @@ function Invoke-DunePlayerGrantHouseSwatches {
     }
 }
 
+# Uses the same paced live token delivery as House Swatches; never writes unlock
+# arrays directly or falls back to offline inventory insertion.
+function Invoke-DunePlayerGrantUnlockTokens {
+    param([string]$Ip, [long]$PawnId, [long]$AccountId, [ValidateSet('building-sets','armor','weapon','vehicle','dyes')][string]$Kind)
+    $label = switch ($Kind) { 'armor' { 'armor skin' }; 'weapon' { 'weapon skin' }; 'vehicle' { 'vehicle skin' }; 'dyes' { 'dye' }; default { 'building set' } }
+    if ($PawnId -le 0) { return @{ ok = $false; error = 'pawn_id is required.' } }
+    if ($AccountId -le 0) { return @{ ok = $false; error = 'account_id is required.' } }
+
+    # Match both identities and an exact Online state; unknown status and
+    # LoggingOut must not turn into a live grant to a different character.
+    $players = Get-DunePlayersLive -Ip $Ip
+    if (-not $players.ok) { return @{ ok = $false; error = "Player status could not be verified: $($players.error)" } }
+    $target = @($players.players | Where-Object { [long]$_.id -eq $PawnId -and [long]$_.account_id -eq $AccountId })
+    if ($target.Count -ne 1 -or [string]$target[0].online_status -ne 'Online') {
+        return @{ ok = $false; error = "The matching player must be online to receive $label tokens." }
+    }
+
+    $sets = @(if ($Kind -eq 'building-sets') { Get-DuneBuildingSetGrantCatalog } else { Get-DuneSkinGrantCatalog -Kind $Kind })
+    if ($sets.Count -eq 0) { return @{ ok = $false; error = "Grantable $label catalog is empty." } }
+    $before = Get-DunePlayerOwnedCosmeticsLive -Ip $Ip -AccountId $AccountId
+    if (-not $before.ok) { return @{ ok = $false; error = "Read current $label ownership: $($before.error)" } }
+    $owned = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in @($before.owned)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$id)) { [void]$owned.Add([string]$id) }
+    }
+    $missing = @($sets | Where-Object { -not $owned.Contains([string]$_.template) } |
+        ForEach-Object { [string]$_.template } | Select-Object -Unique)
+    $result = @{
+        ok = $true; total = $sets.Count; already_owned = $sets.Count - $missing.Count
+        requested = $missing.Count; granted = 0; submitted = 0; failed = @(); delivery = 'tokens'; overflow = $true
+    }
+    if ($missing.Count -eq 0) {
+        $result.message = "No new $label requests: existing unlocks and held tokens were skipped. Held tokens do not confirm activation."
+        return $result
+    }
+    $fls = Resolve-DuneFlsIdOrError -Ip $Ip -ActorId $PawnId
+    if (-not $fls.ok) { return @{ ok = $false; error = $fls.error } }
+    $batch = Invoke-DuneRmqAddItemsToInventoryBatch -FlsId ([string]$fls.fls_id) -ItemNames $missing -SpacingMilliseconds 200
+    if (-not $batch.ok) {
+        $result.ok = $false
+        $result.failed = $missing
+        $result.error = "$label delivery was not confirmed: $($batch.message). Some tokens may have arrived. Check unlocks, inventory and dropped tokens before retrying."
+        return $result
+    }
+    # RMQ acceptance is a submitted request, not proof of delivery or activation.
+    $result.submitted = $missing.Count
+    $result.message = "Submitted $($missing.Count) missing $label token requests to the live game. This does not confirm every unlock activated. Check the unlocked and held-token counts; pick up any overflow. Tokens without a working research action cannot be activated by this delivery process."
+    return $result
+}
+
+function Invoke-DunePlayerGrantBuildingSets {
+    param([string]$Ip, [long]$PawnId, [long]$AccountId)
+    Invoke-DunePlayerGrantUnlockTokens -Ip $Ip -PawnId $PawnId -AccountId $AccountId -Kind 'building-sets'
+}
+
+function Invoke-DunePlayerGrantSkins {
+    param([string]$Ip, [long]$PawnId, [long]$AccountId, [ValidateSet('armor','weapon','vehicle','dyes')][string]$Kind)
+    Invoke-DunePlayerGrantUnlockTokens -Ip $Ip -PawnId $PawnId -AccountId $AccountId -Kind $Kind
+}
+
 # Repair equipped gear — OFFLINE only. Sets every durability item in the gear
 # inventory types to GREATEST(catalog.max_durability, item.MaxDurability,
 # item.CurrentDurability, item.DecayedMaxDurability), so a buggy/decayed
@@ -569,7 +637,7 @@ WHERE inv.actor_id = $PawnId::bigint
         $iDec = [double]([string]$r['d'])
         $cMax = Get-DuneItemCatalogMaxDurability -TemplateId $tmpl
         $hasCur = ConvertTo-DuneBool $r['has_c']
-        $target = Resolve-DuneRepairDurabilityTarget -CatalogMax $cMax -ItemMax $iMax -ItemCurrent $iCur -ItemDecayedMax $iDec -HasCurrent $hasCur
+        $target = Resolve-DuneRepairDurabilityTarget -CatalogMax $cMax -CatalogKnown ([bool](Get-DuneGameplayItemRule -TemplateId $tmpl).durability_known) -ItemMax $iMax -ItemCurrent $iCur -ItemDecayedMax $iDec -HasCurrent $hasCur
         if ($target -gt 0) {
             $iid  = [long]$r['id']
             $tval = Format-DuneFloatForSql -Value $target
@@ -774,7 +842,7 @@ WHERE inv.actor_id = $PawnId::bigint
         $iDec = [double]([string]$r['d'])
         $cMax = Get-DuneItemCatalogMaxDurability -TemplateId $tmpl
         $hasCur = ConvertTo-DuneBool $r['has_c']
-        $target = Resolve-DuneRepairDurabilityTarget -CatalogMax $cMax -ItemMax $iMax -ItemCurrent $iCur -ItemDecayedMax $iDec -HasCurrent $hasCur
+        $target = Resolve-DuneRepairDurabilityTarget -CatalogMax $cMax -CatalogKnown ([bool](Get-DuneGameplayItemRule -TemplateId $tmpl).durability_known) -ItemMax $iMax -ItemCurrent $iCur -ItemDecayedMax $iDec -HasCurrent $hasCur
         if ($target -gt 0) {
             $iid  = [long]$r['id']
             $tval = Format-DuneFloatForSql -Value $target

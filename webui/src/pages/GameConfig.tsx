@@ -29,6 +29,7 @@ import {
   openGameConfigClientFile,
   getGameConfigDefaults,
   saveGameConfigRaw,
+  saveLabLocal,
 } from '../api/gameconfig'
 import type {
   GameConfigCategory,
@@ -48,6 +49,8 @@ import { LandclaimTimerCard } from './gameconfig/LandclaimTimerCard'
 import { DeepDesertPvpCard } from './gameconfig/DeepDesertPvpCard'
 import { BaseBackupGuardPanel } from './gameconfig/BaseBackupGuardPanel'
 import { isLocalViewer } from '../util/viewer'
+import { useSettingsDraft } from './gameconfig/settingsApplyContext'
+import { LabSaveReview } from './gameconfig/LabSaveReview'
 
 export const EXPERIMENTAL_BLOCKED_DEFAULT_TARGETS = new Set([
   'game||/script/dunesandbox.timeofdaysettings||m_starttime',
@@ -59,10 +62,11 @@ const RETAIL_CLIENT_COMPATIBILITY_TARGETS = new Set([
   'game||playerinventorystartingsize',
   'game||playerinventorystartingvolumecapacity',
   'game||m_basebackuptoolmaprestriction',
+  'game||m_maxnumlandclaimsegments',
 ])
 
 type LoadState = 'idle' | 'loading' | 'ready' | 'error' | 'unavailable'
-type ClientReviewMode = 'server' | 'legacy'
+type ClientReviewMode = 'server' | 'legacy' | 'comparison'
 
 function clientBundleFor(info: GameConfigClientInfo, file: 'game' | 'engine') {
   return file === 'engine' ? info.engine : (info.game ?? info)
@@ -129,6 +133,12 @@ function liveValue(data: GameConfigResponse | null, field: GameConfigField): str
   if (inSection !== undefined && inSection !== '') return inSection
   const byKey = b?.effectiveByKey?.[field.key]
   return byKey ?? inSection ?? ''
+}
+
+function hasOverride(data: GameConfigResponse | null, field: GameConfigField): boolean {
+  if (!data) return false
+  const b = bundleFor(data, field.file)
+  return b?.effective?.[`${field.section}||${field.key}`] !== undefined || b?.effectiveByKey?.[field.key] !== undefined
 }
 
 // A field is "customized" when the live file overrides it with a value other than the default.
@@ -255,6 +265,69 @@ export function buildAllClientApplyItems(
   return items
 }
 
+export function buildClientConfigDifferences(
+  cats: GameConfigCategory[] | null,
+  cfg: GameConfigResponse | null,
+  client: GameConfigClientInfo | null,
+) {
+  if (!cfg || !client) return []
+  const seen = new Set<string>()
+  const differences: Array<GameConfigClientApplyItem & { serverPresent: boolean; localPresent: boolean; raw?: boolean }> = []
+  const coveredTargets = new Set<string>()
+  for (const category of cats ?? []) for (const field of category.fields ?? []) {
+    const id = `${field.file}||${field.key}`.toLowerCase()
+    if (seen.has(id)) continue
+    seen.add(id)
+    coveredTargets.add(`${field.file}||${field.section}||${field.key}`.toLowerCase())
+    const local = clientBundleFor(client, field.file)
+    if (!local?.exists) continue
+    const read = (bundle: GameConfigFileBundle | typeof local) => {
+      const target = `${field.section}||${field.key}`.toLowerCase()
+      const entry = Object.entries(bundle.effective ?? {}).find(([key]) => key.toLowerCase() === target)
+        ?? (field.structKey ? Object.entries(bundle.effectiveByKey ?? {}).find(([key]) => key.toLowerCase() === field.key.toLowerCase()) : undefined)
+      return { present: !!entry, value: entry?.[1] ?? '' }
+    }
+    const server = read(cfg[field.file]), current = read(local)
+    // Comparison is requested explicitly; a missing override is still a real
+    // difference. Never copy either side merely because it was read.
+    const typedEqual = ['float', 'int', 'bool', 'bool01', 'boolLower'].includes(field.type)
+      && valuesEqual(server.value, current.value)
+    if (server.present === current.present && (server.value === current.value || typedEqual)) continue
+    differences.push({ file: field.file, key: field.key, label: field.label, section: field.section,
+      value: server.value, currentValue: current.value, remove: !server.present || server.value === '',
+      serverPresent: server.present, localPresent: current.present })
+  }
+  // Manual scalar entries need comparison even when no curated control exists.
+  // Keep the exact section identity; a similarly named key elsewhere is separate.
+  for (const file of ['game', 'engine'] as const) {
+    const local = clientBundleFor(client, file)
+    if (!local?.exists) continue
+    const serverEntries = new Map(Object.entries(cfg[file].effective ?? {}).map(([key, value]) => [key.toLowerCase(), { key, value }]))
+    const localEntries = new Map(Object.entries(local.effective ?? {}).map(([key, value]) => [key.toLowerCase(), { key, value }]))
+    for (const target of new Set([...serverEntries.keys(), ...localEntries.keys()])) {
+      const server = serverEntries.get(target), current = localEntries.get(target)
+      const identity = (server ?? current)!.key
+      const split = identity.indexOf('||')
+      if (split < 0) continue
+      const section = identity.slice(0, split), key = identity.slice(split + 2)
+      if (!section || !key || /^[+\-!]/.test(key) || coveredTargets.has(`${file}||${section}||${key}`.toLowerCase())) continue
+      // User preferences and engine infrastructure are not server gameplay
+      // overrides. Their absence on a dedicated server is expected.
+      if (/^Settings\./i.test(section) || /^(FuncomLiveServices|Core\.System|GameNetDriver StatelessConnectHandlerComponent)$/i.test(section)
+        || /^(URL)$/i.test(section) || /^Bgd\./i.test(key) || key === 'm_BackpackSortType'
+        || /^\/Script\/DuneSandbox\.UserServerCustomSettings$/i.test(section)
+        || /^\/Script\/Engine\./i.test(section) || /^\/Script\/DuneSandbox\.DuneGameEngine$/i.test(section)) continue
+      const numeric = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:e[+-]?\d+)?$/i
+      const equivalent = server && current && numeric.test(server.value) && numeric.test(current.value)
+        && Number.isFinite(Number(server.value)) && Number(server.value) === Number(current.value)
+      if (server && current && (server.value === current.value || equivalent)) continue
+      differences.push({ file, section, key, label: key, value: server?.value ?? '', currentValue: current?.value ?? '',
+        remove: !server || server.value === '', serverPresent: !!server, localPresent: !!current, raw: true })
+    }
+  }
+  return differences
+}
+
 function isExperimentalCategory(category: string): boolean {
   return category.startsWith('Experimental')
 }
@@ -287,10 +360,10 @@ export function buildCategoryClientBlocks(
   return { entries: buildClientShareEntries(items, cfg), count, hasClientFields }
 }
 
-// The value an input should hold: the live override when present, otherwise the default.
+// Show the actual override. An absent entry stays empty until the user enters
+// a value or explicitly clicks this setting's Default button.
 function currentValue(data: GameConfigResponse | null, field: GameConfigField): string {
-  const lv = liveValue(data, field)
-  return lv !== '' ? lv : fieldDefault(field)
+  return liveValue(data, field)
 }
 
 // Numeric-aware, case-insensitive equality so 4 vs 4.0 and True vs true don't
@@ -371,7 +444,7 @@ function groupExperimental(cats: GameConfigCategory[]): GameConfigCategory[] {
     .map(([category, fields]) => ({ category, fields }))
 }
 
-export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experimental' } = {}) {
+export function GameConfig({ mode = 'standard', embedded = false, section = 'advanced' }: { mode?: 'standard' | 'experimental'; embedded?: boolean; section?: 'advanced' | 'client' | 'tools' } = {}) {
   const contextual = useCommandDeck()
   const Guidance = contextual ? 'details' : 'div'
   const experimentalPage = mode === 'experimental'
@@ -383,9 +456,14 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
   const [cfg, setCfg] = useState<GameConfigResponse | null>(null)
   const [values, setValues] = useState<Record<string, string>>({})
   const [originals, setOriginals] = useState<Record<string, string>>({})
+  const [removedKeys, setRemovedKeys] = useState<Set<string>>(new Set())
+  const unsavedDraft = useRef(false)
+  unsavedDraft.current = removedKeys.size > 0 || Object.keys(values).some(key => values[key] !== originals[key])
   const [loadState, setLoadState] = useState<LoadState>('idle')
   const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [comparisonServerOnly, setComparisonServerOnly] = useState(false)
+  const [labReview, setLabReview] = useState<GameConfigRawUpdate[] | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [savedMsg, setSavedMsg] = useState<string | null>(null)
   const [reloadingPods, setReloadingPods] = useState(false)
@@ -425,6 +503,11 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
   const [clientErr, setClientErr] = useState<string | null>(null)
   const [clientReview, setClientReview] = useState<{ mode: ClientReviewMode; items: GameConfigClientApplyItem[] } | null>(null)
   const [clientViewFile, setClientViewFile] = useState<'game' | 'engine' | null>(null)
+  const [skippedDifferences, setSkippedDifferences] = useState<string[]>(() => {
+    try { const saved = JSON.parse(localStorage.getItem('dst.ini-difference-skips.v1') ?? '[]'); return Array.isArray(saved) ? saved.filter(value => typeof value === 'string') : [] } catch { return [] }
+  })
+  const [skipError, setSkipError] = useState('')
+  const [compareOpen, setCompareOpen] = useState(false)
   const refreshClient = useCallback(async () => {
     if (!localViewer) return null
     try {
@@ -587,7 +670,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
     }
   }, [backupSel])
 
-  const handleFieldChange = useCallback((key: string, newVal: string) => {
+  const handleFieldChange = useCallback((key: string, newVal: string, remove = false) => {
     if (
       key === SANDWORM_ENABLED_KEY &&
       newVal === '1' &&
@@ -596,16 +679,17 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
       setSandwormModalOpen(true)
       return
     }
+    setRemovedKeys(prev => { const next = new Set(prev); if (remove) next.add(key); else next.delete(key); return next })
     setValues(prev => ({ ...prev, [key]: newVal }))
   }, [values])
 
   const confirmSandwormEnable = useCallback(() => {
+    setRemovedKeys(prev => { const next = new Set(prev); next.delete(SANDWORM_ENABLED_KEY); return next })
     setValues(prev => ({ ...prev, [SANDWORM_ENABLED_KEY]: '1' }))
     setSandwormModalOpen(false)
   }, [])
 
-  // Seed editable values: live override when present, otherwise the funcom default,
-  // so every field is populated even before (or without) a live battlegroup.
+  // Seed only actual saved entries; defaults remain a separate explicit action.
   const seedValues = useCallback((cats: GameConfigCategory[], data: GameConfigResponse | null) => {
     const out: Record<string, string> = {}
     for (const cat of cats ?? []) {
@@ -620,6 +704,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
     setLoadState('loading')
     setLoadError(null)
     setSavedMsg(null)
+    void refreshClient()
     try {
       let sch = schema
       if (!sch) {
@@ -633,15 +718,20 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
       const seeded = seedValues(sch, data)
       setValues(seeded)
       setOriginals(seeded)
+      setRemovedKeys(new Set())
       setLoadState('ready')
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       setLoadError(msg)
       setLoadState(/\b503\b/.test(msg) ? 'unavailable' : 'error')
     }
-  }, [schema, seedValues])
+  }, [schema, seedValues, refreshClient])
 
   useEffect(() => {
+    if (unsavedDraft.current) {
+      if (!vmRunning) setLoadError('Server unavailable. Your unsaved draft is retained; reconnect before applying.')
+      return
+    }
     void (async () => {
       let s = schema
       if (!s) {
@@ -677,6 +767,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
           const seeded = seedValues(s, null)
           setValues(seeded)
           setOriginals(seeded)
+          setRemovedKeys(new Set())
         } catch (e) {
           // Seeding should never throw with the guards in seedValues, but if it
           // does we still want to leave the page in a recoverable state.
@@ -706,10 +797,10 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
   const dirtyKeys = useMemo(() => {
     const keys: string[] = []
     for (const k of Object.keys(values)) {
-      if ((values[k] ?? '') !== (originals[k] ?? '')) keys.push(k)
+      if (removedKeys.has(k) || (values[k] ?? '') !== (originals[k] ?? '')) keys.push(k)
     }
     return keys
-  }, [values, originals])
+  }, [values, originals, removedKeys])
 
   const loadedExperimentalFields = useMemo(
     () => {
@@ -760,6 +851,26 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
     () => buildAllClientApplyItems(schemaWithLoadedExperimental, cfg),
     [schemaWithLoadedExperimental, cfg],
   )
+  const allClientDifferences = useMemo(
+    () => buildClientConfigDifferences(schemaWithLoadedExperimental, cfg, clientInfo),
+    [schemaWithLoadedExperimental, cfg, clientInfo],
+  )
+  const differenceIdentity = (item: typeof allClientDifferences[number]) => JSON.stringify([
+    cfg?.game.path, cfg?.engine.path, clientInfo?.dir, item.file, item.section, item.key,
+    dirtyKeys.includes(item.key) ? (values[item.key] ?? '') !== '' : item.serverPresent,
+    dirtyKeys.includes(item.key) ? values[item.key] ?? '' : item.value, item.localPresent, item.currentValue,
+  ])
+  const clientDifferences = allClientDifferences.filter(item => !skippedDifferences.includes(differenceIdentity(item))
+    && (compareOpen || dirtyKeys.includes(item.key)))
+  const propagationItems = schemaWithLoadedExperimental.flatMap(category => category.fields)
+    .filter(field => field.clientApply && dirtyKeys.includes(field.key) && localViewer
+      && !allClientDifferences.some(item => item.file === field.file && item.key === field.key && skippedDifferences.includes(differenceIdentity(item))))
+    .map(field => ({ file: field.file, section: field.section, key: field.key, value: values[field.key] ?? '' }))
+  const skipDifferences = (items: typeof allClientDifferences) => {
+    const next = [...new Set([...skippedDifferences, ...items.map(differenceIdentity)])]
+    try { localStorage.setItem('dst.ini-difference-skips.v1', JSON.stringify(next)); setSkippedDifferences(next); setSkipError('') }
+    catch { setSkipError('Could not remember this Skip. Neither file was changed. Please try again.') }
+  }
   const enabledClientApplyItems = useMemo(
     () => clientApplyItems.filter(item => item.file === 'game' || clientInfo?.engineEnabled === true),
     [clientApplyItems, clientInfo?.engineEnabled],
@@ -777,8 +888,18 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
     setClientMsg(null)
     setClientBusy(true)
     try {
-      const result = await applyGameConfigClient(reviewedItems, clientInfo?.dir)
-      setClientInfo(result.client)
+      const result = clientReview?.mode === 'comparison'
+        ? await api<import('../api/types').GameConfigClientApplyResult>('/api/gameconfig/client/lab', {
+          method: 'PUT',
+          body: JSON.stringify({ approved: true, updates: reviewedItems.map(item => ({
+            file: item.file, section: item.section, key: item.key, value: item.remove ? '' : item.value,
+          })) }),
+        })
+        : await applyGameConfigClient(reviewedItems, clientInfo?.dir)
+      // Older services may omit the snapshot. Reread without clearing the
+      // existing comparison, so an unavailable response never hides differences.
+      if (result.client) setClientInfo(result.client)
+      else await refreshClient()
       setClientReview(null)
       const backupCount = Object.keys(result.backups ?? {}).length
       setClientMsg(
@@ -790,7 +911,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
     } finally {
       setClientBusy(false)
     }
-  }, [clientInfo])
+  }, [clientInfo, clientReview, refreshClient])
 
   // The two pages share this component and split the same schema between them:
   // Game Config shows the settings we stand behind, Experimental shows the
@@ -959,10 +1080,19 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
       .filter(cat => cat.fields.length > 0)
   }, [visibleSchema, search, experimentalPage, experimentalSearchActive, selectedExperimentalGroup, experimentalFilteredFields, experimentalPageIndex])
 
-  async function onSubmit(e: FormEvent) {
-    e.preventDefault()
+  async function saveDraft(fromReview = false) {
     if (dirtyKeys.length === 0) return
-    if (experimentalStartupDirtyKeys.length > 0) {
+    if (experimentalPage && !fromReview) {
+      const fields = schemaWithLoadedExperimental.flatMap(category => category.fields)
+      setComparisonServerOnly(false)
+      setLabReview(dirtyKeys.map(key => {
+        const field = fields.find(field => field.key === key)
+        if (!field) throw new Error(`Reload the Lab catalog before saving ${key}.`)
+        return { file: field.file, section: field.section, key, value: values[key] ?? '' }
+      }))
+      return
+    }
+    if (experimentalStartupDirtyKeys.length > 0 && !fromReview) {
       const count = experimentalStartupDirtyKeys.length
       const engineStatus = clientInfo?.engineEnabled
         ? 'Client Engine.ini management is currently ON.'
@@ -970,8 +1100,8 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
       const ok = confirmRoutineAction(
         `Save ${count} Experimental setting${count === 1 ? '' : 's'}?\n\n`
         + (experimentalPage
-            ? 'These are written to the server UserGame.ini or UserEngine.ini as labeled. Nothing on the server changes until you restart the battlegroup — use “Apply INIs & restart” in the bar at the bottom of this page. Saving on its own does not disconnect anyone.\n\n'
-            : 'These are written to the server UserEngine.ini. Nothing on the server changes until you restart the battlegroup — use “Apply INIs & restart”. Saving on its own does not disconnect anyone.\n\n')
+            ? 'These are written to the server UserGame.ini or UserEngine.ini as labeled. Nothing on the server changes until you restart the battlegroup — use “Apply server settings” in the bar at the bottom of this page. Saving on its own does not disconnect anyone.\n\n'
+            : 'These are written to the server UserEngine.ini. Nothing on the server changes until you restart the battlegroup — use “Apply server settings”. Saving on its own does not disconnect anyone.\n\n')
         + 'Only controls explicitly marked Client are known to read a local Engine.ini value. '
         + 'Unknown-scope Lab controls stay server-side so field tests are not contaminated by an unnecessary client override.\n\n'
         + `${engineStatus} Turn it on under “Your client config” at the top of this page to let DST manage those values.`,
@@ -984,18 +1114,27 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
     try {
       const updates: Record<string, string> = {}
       for (const k of dirtyKeys) updates[k] = values[k] ?? ''
-      const out = await saveGameConfig(updates)
+      let localSaved = false
+      if (propagationItems.length > 0) {
+        const localResult = await saveLabLocal(propagationItems)
+        localSaved = true
+        if (localResult?.client) setClientInfo(localResult.client)
+      }
+      let out
+      try { out = await saveGameConfig(updates) }
+      catch (error) { throw new Error(`${localSaved ? 'The reviewed local changes were saved and backed up; server save failed. ' : ''}${error instanceof Error ? error.message : String(error)}`) }
       const next: GameConfigResponse = { available: true, source: out.source, game: out.game, engine: out.engine }
       setCfg(next)
       const seeded = seedValues(schemaWithLoadedExperimental, next)
       setValues(seeded)
       setOriginals(seeded)
+      setRemovedKeys(new Set())
       const n = out.applied ?? dirtyKeys.length
-      let msg = `Saved ${n} change${n === 1 ? '' : 's'} into the DST-managed block. Tip: use “Backup settings” to snapshot before big changes — DST no longer auto-backs-up on every save.`
+      let msg = `Saved ${n} change${n === 1 ? '' : 's'} into the DST-managed block. Verified pre-save copies of the changed server files are available under View backups.`
       if (experimentalStartupDirtyKeys.length > 0) {
         msg += experimentalPage
-          ? ' Saved to the labeled server INI only — use “Apply INIs & restart” in the bar at the bottom of this page to put these into effect.'
-          : ' Saved to the server INI only — restart the battlegroup with “Apply INIs & restart” to put these into effect.'
+          ? ' Saved to the labeled server INI only — use “Apply server settings” in the bar at the bottom of this page to put these into effect.'
+          : ' Saved to the required INI files — restart the battlegroup with “Apply server settings” to put these into effect.'
       }
       // If m_TaskGoalAmount was in this save, DST also rewrote the current
       // Landsraad term's goal_amount for every House row — surface the result.
@@ -1011,14 +1150,49 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
 
       }
       setSavedMsg(msg)
-      // Local client files remain available through the explicit client-config
-      // tools. Saving authoritative server settings never opens a client prompt.
+      if (localSaved) msg += ' Required local compatibility entries were also saved and backed up.'
+      setSavedMsg(msg)
     } catch (err) {
       setSavedMsg(null)
       setSaveError(err instanceof Error ? err.message : String(err))
+      if (fromReview) throw err
     } finally {
       setSaving(false)
     }
+  }
+
+  const applyController = useSettingsDraft('advanced', {
+    ready: vmRunning && loadState === 'ready' && !!cfg?.available && !cfg.needsInitialization && !saving,
+    changes: dirtyKeys.map(key => {
+      const field = schemaWithLoadedExperimental.flatMap(category => category.fields).find(field => field.key === key)
+      return {
+        label: field?.label ?? key, before: originals[key] ?? '', after: values[key]?.trim() ? values[key] : 'Remove from server file',
+        target: `${propagationItems.some(item => item.key === key) ? 'Server + this PC’s local game file' : 'Server'} · ${field?.file === 'engine' ? 'UserEngine.ini' : 'UserGame.ini'} · ${key === 'm_TaskGoalAmount' ? 'also updates current Landsraad goals on save' : 'after start/restart'}${field?.consoleVar ? ' · startup command' : ''}`,
+      }
+    }),
+    validate: async () => {
+      for (const key of dirtyKeys) {
+        const field = schemaWithLoadedExperimental.flatMap(category => category.fields).find(field => field.key === key)
+        const value = values[key]?.trim() ?? ''
+        if (!field || !value || !['int', 'float'].includes(field.type)) continue
+        const number = Number(value)
+        if (!Number.isFinite(number) || (field.type === 'int' && !Number.isInteger(number))
+          || (field.min !== undefined && number < field.min) || (field.max !== undefined && number > field.max)) {
+          throw new Error(`${field.label}: enter a valid ${field.type === 'int' ? 'whole number' : 'number'} within the displayed limits before applying.`)
+        }
+      }
+      const current = await getGameConfig()
+      if (!current.available || current.source !== cfg?.source || current.game.raw !== cfg.game.raw || current.engine.raw !== cfg.engine.raw) {
+        throw new Error('Advanced server settings changed outside this form. Refresh and review them before applying; your draft is still here.')
+      }
+    },
+    apply: () => saveDraft(true),
+  })
+
+  function onSubmit(e: FormEvent) {
+    e.preventDefault()
+    if (applyController) applyController.review()
+    else void saveDraft()
   }
 
   async function onInitializeGameConfig() {
@@ -1050,8 +1224,8 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
   async function onReloadPods() {
     if (dirtyKeys.length > 0 || reloadingPods) return
     const ok = window.confirm(
-      'Apply the saved INI files by restarting every running game-server pod one at a time?\n\n'
-      + 'Players on each map will disconnect when that map restarts. Database, director, operator, and other infrastructure pods are not touched. Each replacement must become Ready before the next map restarts.',
+      'Deploy the saved server settings and restart the battlegroup?\n\n'
+      + 'All maps restart together and connected players disconnect. Player PC configuration is separate and will not be changed.',
     )
     if (!ok) return
     setReloadingPods(true)
@@ -1071,6 +1245,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
 
   function resetDirty() {
     setValues(originals)
+    setRemovedKeys(new Set())
     setSaveError(null)
     setSavedMsg(null)
   }
@@ -1078,6 +1253,8 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
   const sourcePresentation = cfg && (
     cfg.source === 'installed'
       ? { className: 'pill-success', title: 'Values from the authoritative installed INI files.', icon: 'CircleCheck' as const, label: 'Authoritative' }
+      : cfg.source === 'self-managed'
+        ? { className: 'pill-info', title: 'Manual configuration management is selected; explicit saves change files only.', icon: 'Info' as const, label: 'Manual management' }
       : cfg.source === 'legacy-live'
         ? { className: 'pill-success', title: 'Values from the live battlegroup INI files on an older Funcom installation.', icon: 'CircleCheck' as const, label: 'Live' }
         : cfg.source === 'live'
@@ -1100,14 +1277,15 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
 
   return (
     <>
-      <PageHeader
+      <div hidden={embedded && section !== 'advanced'}>
+      {!embedded && <PageHeader
         title={experimentalPage ? 'Experimental Lab' : 'Game Config'}
         icon={experimentalPage ? 'FlaskConical' : 'Sliders'}
         description={experimentalPage
-          ? 'Complete recovered CVar and live default-INI catalog. Curated DST controls are excluded; saved overrides apply on the next DST battlegroup restart.'
+          ? 'Complete recovered CVar and live default-INI catalog. Clear an edited scalar value to remove its server-file entry on save. Zero is a value. Saved overrides apply on the next battlegroup restart; local player INIs require a separate approved apply.'
           : 'UserGame.ini + UserEngine.ini editor. Edits are tracked in a DST-managed block written to the live battlegroup.'}
         actions={
-          <div className="gameconfig-header-actions flex items-center gap-2">
+          <div className="gameconfig-header-actions flex flex-wrap items-center gap-2">
             {sourcePill}
             <button
               type="button"
@@ -1119,7 +1297,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
                 : 'Rebuild the server startup values from the INIs and restart the battlegroup so every map reloads with the current settings'}
             >
               <Icon name={reloadingPods ? 'Loader2' : 'RefreshCw'} size={14} className={reloadingPods ? 'animate-spin' : ''} />
-              {reloadingPods ? 'Restarting battlegroup…' : 'Apply INIs & restart'}
+              {reloadingPods ? 'Restarting battlegroup…' : 'Apply server settings'}
             </button>
             {experimentalPage && (
               <Link to="/gameconfig" className="btn-secondary" title="Back to the settings we stand behind">
@@ -1158,17 +1336,59 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
             </button>
           </div>
         }
-      />
+      />}
+
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <button type="button" className="btn-secondary" disabled={!localViewer || loadState !== 'ready' || clientBusy}
+          onClick={() => { setCompareOpen(true); void loadAll() }}>Compare INIs</button>
+        <span className="text-xs text-text-muted">Compare server and this PC’s gameplay overrides. Existing differences stay as set until you choose an action.</span>
+      </div>
+      {localViewer && compareOpen && clientDifferences.length === 0 && <p role="status" className="mb-4 text-sm text-text-muted">No unskipped gameplay differences. Existing settings are unchanged.</p>}
+      {localViewer && clientDifferences.length > 0 && (
+        <section className="card mb-4 min-w-0 border-warning/40 p-4" aria-label="Server and local INI differences">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-semibold text-warning">Server and local settings differ</h2>
+              <p className="text-sm text-text-muted">These differences can be intentional. Nothing is synchronized automatically, and they do not block a server restart.</p>
+            </div>
+            <button type="button" className="btn-secondary" onClick={() => skipDifferences(clientDifferences)}>Keep settings separate</button>
+          </div>
+          <details open className="mt-3">
+            <summary className="cursor-pointer">Review {clientDifferences.length} related setting differences</summary>
+            {skipError && <p role="alert" className="text-danger">{skipError}</p>}
+            <div className="mt-3 overflow-x-auto">
+              <table className="block w-full table-fixed text-left text-sm md:table">
+                <colgroup className="hidden md:table-column-group"><col className="w-[28%]" /><col className="w-[20%]" /><col className="w-[20%]" /><col className="w-[32%]" /></colgroup>
+                <thead className="hidden md:table-header-group"><tr><th className="p-2">Setting</th><th className="p-2">Server INI</th><th className="p-2">Local game INI</th><th className="p-2">Optional action</th></tr></thead>
+                <tbody className="block md:table-row-group">{clientDifferences.map(item => <tr key={`${item.file}:${item.section}:${item.key}`} className="grid grid-cols-2 border-t border-border md:table-row">
+                  <td className="col-span-2 block min-w-0 p-2 align-top break-all md:table-cell"><span className="font-mono">{item.key}</span><br /><span className="text-text-muted">{item.file === 'engine' ? 'Engine.ini' : 'Game.ini'} · {item.section}</span></td>
+                  <td className="block min-w-0 p-2 align-top font-mono break-all md:table-cell"><span className="mb-1 block text-xs text-text-muted md:hidden">Server INI</span><div className="max-h-32 overflow-auto">{item.serverPresent ? item.value === '' ? 'Empty assignment (Key=)' : item.value : 'Missing (no override)'}</div></td>
+                  <td className="block min-w-0 p-2 align-top font-mono break-all md:table-cell"><span className="mb-1 block text-xs text-text-muted md:hidden">Local game INI</span><div className="max-h-32 overflow-auto">{item.localPresent ? item.currentValue === '' ? 'Empty assignment (Key=)' : item.currentValue : 'Missing (no override)'}</div></td>
+                  <td className="col-span-2 block min-w-0 p-2 md:table-cell"><div className="flex flex-wrap gap-2">
+                    <button type="button" className="btn-secondary" disabled={clientBusy}
+                      aria-label={`Save to local ${item.key}`}
+                      onClick={() => setClientReview({ mode: 'comparison', items: [{ ...item, selected: true }] })}>Save to local</button>
+                    <button type="button" className="btn-secondary" disabled={!vmRunning || saving || loadState !== 'ready'}
+                      aria-label={`Local to server ${item.key}`}
+                      onClick={() => { setComparisonServerOnly(true); setLabReview([{ file: item.file, section: item.section, key: item.key, value: item.currentValue ?? '' }]) }}>Local to server</button>
+                    <button type="button" className="btn-secondary" aria-label={`Skip difference ${item.key}`} onClick={() => skipDifferences([item])}>Skip</button>
+                  </div></td>
+                </tr>)}</tbody>
+              </table>
+            </div>
+          </details>
+        </section>
+      )}
 
       {/* Backup / risk reminder. On the Experimental page this is also the single
           page-level warning — the per-card copy is suppressed there, otherwise it
           would repeat on every themed card. */}
-      <Guidance className={'gameconfig-guidance card p-4 mb-4 text-sm flex items-start gap-3 ' + (experimentalPage ? 'border-warning/40 bg-warning/5' : 'border-ibad/40 bg-ibad/5')}>
+      {!embedded && <Guidance className={'gameconfig-guidance card p-4 mb-4 text-sm flex items-start gap-3 ' + (experimentalPage ? 'border-warning/40 bg-warning/5' : 'border-ibad/40 bg-ibad/5')}>
         {contextual && <summary>
           <strong>Back up before editing. </strong>
           {experimentalPage
-            ? 'Recovered controls are unconfirmed: crashes, disconnects, state corruption and performance loss are possible. Change one setting at a time; save, then Apply INIs & restart.'
-            : 'Saving writes to the installed authoritative INIs; Apply INIs & restart pushes them to the battlegroup.'}
+            ? 'Save your changes, then use Apply server settings to restart the battlegroup with the updated INIs.'
+            : 'Saving writes to the current server INIs; Apply server settings restarts the battlegroup with those files.'}
           <span> Safety &amp; player config</span>
         </summary>}
         <Icon name="FlaskConical" size={18} className={'mt-0.5 shrink-0 ' + (experimentalPage ? 'text-warning' : 'text-ibad')} />
@@ -1177,16 +1397,12 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
             <>
               <p className="text-xs text-text-muted leading-relaxed">
                 Experimental Lab exposes recovered Dune and Unreal Engine console variables plus every setting in the live game&apos;s
-                default INIs that DST does not already surface. CVar overrides are staged in{' '}
-                <span className="font-mono">UserEngine.ini</span>; default-INI overrides keep their original file and section. Descriptions
-                are recovered metadata, not proof the shipped build uses a control.{' '}
-                <span className="text-text font-medium">Back up first and change one setting at a time.</span>
+                default INIs. CVar overrides are staged in{' '}
+                <span className="font-mono">UserEngine.ini</span>; default-INI overrides keep their original file and section.
               </p>
               <p className="text-xs text-warning/90 leading-relaxed mt-1.5">
-                Saving here changes nothing on a running server — use “Apply INIs &amp; restart” in the bar at the
-                bottom of this page, or the same command on the Commands page. Critical and high-risk controls can crash,
-                disconnect, corrupt state, or sharply reduce performance. Client behavior is unknown unless a control is explicitly
-                marked Client.
+                Saving here changes nothing on a running server — use “Apply server settings” in the bar at the
+                bottom of this page, or the same command on the Commands page. Settings marked Client also have a client-side apply action.
               </p>
             </>
           ) : (
@@ -1198,7 +1414,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
                 you have a restore point — backups are saved on the server next to each file and can be restored via the File Browser.
               </p>
               <p className="text-xs text-warning/90 leading-relaxed mt-1.5">
-                Some settings are read only when a game pod starts. Use “Apply INIs &amp; restart” after saving to do a clean battlegroup restart so every map reloads with the new values.
+                Some settings are read only when a game pod starts. Use “Apply server settings” after saving to do a clean battlegroup restart so every map reloads with the new values.
               </p>
             </>
           )}
@@ -1227,7 +1443,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
             View backups
           </button>
         </div>
-      </Guidance>
+      </Guidance>}
 
       {backupMsg && (
         <div className="card p-3 mb-4 border-success/40 bg-success/10 text-success text-sm flex items-center gap-2">
@@ -1252,14 +1468,14 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
       {/* How it works. On the Experimental page this is also where the user is
           told to go back to Game Config to apply — that path rebuilds the server
           startup values from the INI, which is what makes these take effect. */}
-      {!contextual && (experimentalPage ? (
+      {!embedded && !contextual && (experimentalPage ? (
         <div className="card p-3 mb-4 border-border bg-surface-2/40 text-xs text-text-muted flex items-start gap-2">
           <Icon name="Info" size={14} className="mt-0.5 shrink-0 text-accent-bright" />
           <div>
             These are written to the labeled server <span className="font-mono text-text">UserGame.ini</span> or{' '}
             <span className="font-mono text-text">UserEngine.ini</span> when you save.
             Nothing changes on a running server until the battlegroup restarts — use{' '}
-            <strong className="text-text">Apply INIs &amp; restart</strong> in the bar at the bottom of this page, or the same command
+            <strong className="text-text">Apply server settings</strong> in the bar at the bottom of this page, or the same command
             on the Commands page.
           </div>
         </div>
@@ -1275,7 +1491,10 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
       ))}
 
       {cfg && <AdvancedIniBrowser cfg={cfg} />}
+      </div>
 
+      <div hidden={embedded && section !== 'client'}>
+      {!localViewer && <p className="card p-4 text-sm text-text-muted">Player compatibility applies to each player’s own PC. Open DST locally to review that PC’s files. Applying server settings does not change player files.</p>}
       {localViewer && (
         <>
           {/* Local client config (this PC) */}
@@ -1283,10 +1502,11 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
             id="gameconfig.clientConfig"
             icon="MonitorSmartphone"
             iconClassName="text-accent-bright shrink-0"
-            title="Optional local client overrides (this PC)"
+            title="Player compatibility · this PC only"
             titleClassName="text-sm font-semibold text-text"
             className="mb-4 border-border"
-            headerClassName="px-4 pt-4 pb-2"
+            headerClassName="flex-wrap px-4 pt-4 pb-2"
+            headerRightClassName="flex w-full flex-wrap items-center gap-2"
             bodyClassName="px-4 pb-4"
             headerRight={
               <>
@@ -1328,11 +1548,12 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
             }
           >
             <p className="text-xs text-text-muted mb-3">
-              Funcom&apos;s in-game Custom Settings deployment remains authoritative for supported settings. DST can
-              optionally mirror a small, field-proven set of advanced Retail values that are still evaluated locally into
-              this PC&apos;s <span className="font-mono">Game.ini</span>. Managing{' '}
-              <span className="font-mono">Engine.ini</span> is a separate opt-in because client console-variable overrides
-              can materially change gameplay.
+              This edits the game-client files on this PC, separately from the selected server&apos;s files.
+              They are shared across this game installation, not saved per server. DST offers a reviewed set of local{' '}
+              <span className="font-mono">Game.ini</span> compatibility values. Managing{' '}
+              <span className="font-mono">Engine.ini</span> is a separate opt-in: some of its settings are evaluated by
+              the client independently and can affect play on your own DST server or other servers. Do not assume a
+              server value always overrides a local Engine.ini value.
             </p>
             <label className="mb-3 flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/5 p-3 cursor-pointer select-none">
               <input
@@ -1355,7 +1576,10 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
               </span>
             </label>
             <div className="mb-3 rounded-lg border border-border bg-surface-2/40 p-3 text-xs text-text-muted">
-              <strong className="text-text">Review compatibility overrides from the action bar below.</strong>{' '}
+              <button type="button" className="btn-secondary mb-2" disabled={clientBusy || enabledClientApplyItems.length === 0}
+                onClick={() => setClientReview({ mode: 'server', items: enabledClientApplyItems.map(item => ({ ...item })) })}>
+                Review player-PC changes
+              </button>{' '}
               Only customized, non-default advanced settings outside Funcom&apos;s normal synchronized surface and backed
               by direct current-Retail evidence are offered. Game.ini values can apply without the Engine.ini opt-in.
               {clientApplyItems.some(item => item.file === 'engine') && clientInfo?.engineEnabled !== true
@@ -1449,7 +1673,8 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
           )}
         </>
       )}
-
+      </div>
+      <div hidden={embedded && section !== 'advanced'}>
       {/* Status / error banners */}
       {cfg?.needsInitialization && loadState === 'ready' && (
         <div className="card p-4 mb-4 border-accent/30 bg-accent/5 text-text-muted text-sm flex items-start gap-2 justify-between">
@@ -1491,6 +1716,14 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
           </button>
         </div>
       )}
+      {embedded && <p className="mb-4 text-sm text-text-muted">Advanced server controls apply to the battlegroup. Each control names its file and intended effect. Clear a scalar value to remove its entry from the server file when you apply; zero remains a value. Local player INIs change only through a separately approved local apply. Existing values stay in place until you review changes; gameplay effects can vary with game updates.</p>}
+      {embedded && <div className="mb-4 flex flex-wrap items-center gap-2">
+        {sourcePill}
+        <button type="button" className="btn-secondary" disabled={!vmRunning || saving || loadState === 'loading' || dirtyKeys.length > 0} onClick={() => void loadAll()}>Refresh advanced values</button>
+        <button type="button" className="btn-secondary" disabled={!vmRunning || backing || saving} onClick={() => void onBackup()}>Back up advanced settings</button>
+        <button type="button" className="btn-secondary" disabled={!vmRunning || saving} onClick={() => void onViewBackups()}>View advanced backups</button>
+        {dirtyKeys.length > 0 && <span className="text-xs text-text-muted">Discard the draft before refreshing outside edits.</span>}
+      </div>}
       {saveError ? (
         <ViewportNotice kind="err" text={saveError} onDismiss={() => setSaveError(null)} />
       ) : savedMsg ? (
@@ -1602,10 +1835,10 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
                         key={`${f.section}||${f.key}`}
                         field={f}
                         value={values[f.key] ?? ''}
-                        onChange={v => handleFieldChange(f.key, v)}
+                        onChange={(v, remove) => handleFieldChange(f.key, v, remove)}
                         disabled={loadState !== 'ready' || saving}
-                        isDirty={(values[f.key] ?? '') !== (originals[f.key] ?? '')}
-                        isSet={liveValue(cfg, f) !== ''}
+                        isDirty={dirtyKeys.includes(f.key)}
+                        isSet={hasOverride(cfg, f)}
                         isCustom={isCustomized(cfg, f)}
                         defaultValue={fieldDefault(f)}
                         managed={cfg ? sectionIsManaged(cfg, f) : false}
@@ -1648,10 +1881,10 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
                 {/* Not an INI field, but it belongs with the base backup
                     settings: allowing the tool in the Deep Desert without this
                     means a stored base is recyclable-only after every reset. */}
-                {!experimentalPage && cat.category === 'BaseBackUp' && (
+                {!embedded && !experimentalPage && cat.category === 'BaseBackUp' && (
                   <BaseBackupGuardPanel vmRunning={vmRunning} />
                 )}
-                {!experimentalPage && cat.category === 'Time of Day' && (
+                {!embedded && !experimentalPage && cat.category === 'Time of Day' && (
                   <TimeOfDayLockPanel vmRunning={vmRunning} />
                 )}
               </CategoryCard>
@@ -1661,7 +1894,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
               <div className="card p-6 text-text-muted text-sm">No settings match “{search}”.</div>
             )}
 
-            {!experimentalPage && (
+            {!embedded && !experimentalPage && (
               <>
                 <DeepDesertPvpCard vmRunning={vmRunning} />
 
@@ -1672,14 +1905,15 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
             {experimentalPage && (
               <DefaultsCatalogBrowser
                 vmRunning={vmRunning}
+                serverPaths={{ game: cfg?.game.path ?? '', engine: cfg?.engine.path ?? '' }}
                 onSaved={() => void loadAll()}
                 excludedTargets={surfacedIniTargets}
               />
             )}
           </div>
 
-          <div className="gameconfig-savebar sticky bottom-0 mt-6 -mx-6 px-6 py-3 bg-surface/95 border-t border-border backdrop-blur-sm flex items-center justify-between">
-            <div className="text-xs text-text-muted flex items-center gap-4">
+          <div className="gameconfig-savebar sticky bottom-0 mt-6 -mx-6 px-6 py-3 bg-surface/95 border-t border-border backdrop-blur-sm flex flex-wrap gap-3 items-center justify-between">
+            <div className="min-w-0 text-xs text-text-muted flex flex-wrap items-center gap-4">
               {cfg && (
                 <>
                   <span className="font-mono truncate max-w-xs" title={cfg.game.path}>game: {cfg.game.path}</span>
@@ -1696,7 +1930,7 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
               >
                 <Icon name="ArrowUp" size={14} /> Top
               </button>
-              <button
+              {!applyController && <button
                 type="button"
                 onClick={() => void onReloadPods()}
                 disabled={!vmRunning || reloadingPods || saving || dirtyKeys.length > 0 || loadState !== 'ready'}
@@ -1706,9 +1940,9 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
                   : 'Rebuild the server startup values from the INIs and restart the battlegroup so every map reloads with the current settings'}
               >
                 <Icon name={reloadingPods ? 'Loader2' : 'RefreshCw'} size={14} className={reloadingPods ? 'animate-spin' : ''} />
-                {reloadingPods ? 'Restarting battlegroup…' : 'Apply INIs & restart'}
-              </button>
-              {localViewer && (
+                {reloadingPods ? 'Restarting battlegroup…' : 'Apply server settings'}
+              </button>}
+              {localViewer && !applyController && (
                 <button
                   type="button"
                   onClick={() => setClientReview({ mode: 'server', items: enabledClientApplyItems.map(item => ({ ...item })) })}
@@ -1739,12 +1973,20 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
                 className="btn-primary"
               >
                 <Icon name={saving ? 'Loader2' : 'Save'} size={15} className={saving ? 'animate-spin' : ''} />
-                {saving ? 'Saving…' : 'Save'}
+                {saving ? 'Saving…' : applyController ? 'Review & Apply' : 'Save'}
               </button>
             </div>
           </div>
         </form>
       )}
+      </div>
+      {embedded && <div hidden={section !== 'tools'}>
+        <p className="card mb-4 p-4 text-sm text-text-muted">These tools have their own actions because their targets differ from ordinary field drafts. Save partition choices while maps are running, then use Review & Apply to deploy the saved server configuration. The land-claim timer also targets the DST host PC; base protection changes database cleanup immediately.</p>
+        <DeepDesertPvpCard vmRunning={vmRunning} />
+        <LandclaimTimerCard vmRunning={vmRunning} />
+        <section className="card mb-4 p-4"><h2 className="text-sm font-semibold">Base-backup protection · server database · immediate</h2><BaseBackupGuardPanel vmRunning={vmRunning} /></section>
+        <TimeOfDayLockPanel vmRunning={vmRunning} />
+      </div>}
 
       <SandwormConfirmModal
         open={sandwormModalOpen}
@@ -1752,6 +1994,10 @@ export function GameConfig({ mode = 'standard' }: { mode?: 'standard' | 'experim
         onConfirm={confirmSandwormEnable}
       />
 
+      {labReview && <LabSaveReview serverOnly={comparisonServerOnly} updates={labReview} serverAvailable={vmRunning} serverPaths={{ game: cfg?.game.path ?? '', engine: cfg?.engine.path ?? '' }} onServerSave={() => saveGameConfigRaw(labReview)}
+        onCancel={() => setLabReview(null)} onDone={message => {
+          setLabReview(null); void loadAll().then(() => setSavedMsg(message))
+        }} />}
       {clientReview && (
         <ClientApplyReviewModal
           items={clientReview.items}
@@ -2038,10 +2284,10 @@ function CategoryCard({
                 <Icon name="FlaskConical" size={14} /> Test settings
               </div>
               <p>
-                These CVars are written to the battlegroup&apos;s <span className="font-mono text-text">UserEngine.ini</span> under <span className="font-mono text-text">[ConsoleVariables]</span>. Saving changes nothing on a running server: the values are applied to the game servers when the battlegroup restarts, so use <strong className="text-text">Apply INIs &amp; restart</strong> to put them into effect. The explicit client-config tools remain available for optional local edits.
+                These CVars are written to the battlegroup&apos;s <span className="font-mono text-text">UserEngine.ini</span> under <span className="font-mono text-text">[ConsoleVariables]</span>. Saving changes nothing on a running server: the values are applied to the game servers when the battlegroup restarts, so use <strong className="text-text">Apply server settings</strong> to put them into effect. The explicit client-config tools remain available for optional local edits.
               </p>
               <p className="mt-1.5">
-                Experimental Lab includes recovered Dune and Unreal Engine controls that are not already surfaced by DST. Risk badges identify known crash, persistence, networking, performance, and diagnostic hazards; they do not make lower-risk controls field-confirmed. Back up first and change one setting at a time.
+                Experimental Lab includes additional Dune and Unreal Engine controls. Save your changes, then use Apply server settings.
               </p>
             </div>
           )}
@@ -2055,7 +2301,7 @@ function CategoryCard({
 type FieldRowProps = {
   field: GameConfigField
   value: string
-  onChange: (v: string) => void
+  onChange: (v: string, remove?: boolean) => void
   disabled: boolean
   isDirty: boolean
   isSet: boolean
@@ -2094,6 +2340,12 @@ export function formatCoriolisCycleStartHour(utcHour: number, timezoneOffsetMinu
 }
 
 function FieldRow({ field, value, onChange, disabled, isDirty, isSet, isCustom, defaultValue, managed, fixedHeight = false }: FieldRowProps) {
+  if (/[\\/]/.test(`${defaultValue} ${value}`) || /(path|directory|folder|datatable|assetreference)(name)?$/i.test(field.key)) {
+    return <div className="space-y-1">
+      <label className="text-sm font-medium">{field.label} <span className="text-xs text-text-muted">Read-only path — preserved</span></label>
+      <input readOnly className="w-full p-2 rounded border border-border bg-surface-2 font-mono text-xs" value={value || defaultValue} title={value || defaultValue} aria-label={`${field.label} (read-only path)`} />
+    </div>
+  }
   const inputBase =
     'w-full px-3 py-2 rounded-lg bg-surface-2 border border-border text-text text-sm ' +
     'placeholder:text-text-dim focus:outline-none focus:ring-2 focus:ring-ibad focus:border-ibad/50 ' +
@@ -2107,7 +2359,8 @@ function FieldRow({ field, value, onChange, disabled, isDirty, isSet, isCustom, 
   // Whether the current input already equals the Funcom default (numeric/bool
   // aware), so the reset button can be disabled when there's nothing to reset.
   const atDefault = valuesEqual(value, defaultValue)
-  const resetToDefault = () => { if (!disabled && !atDefault) onChange(defaultValue) }
+  const hasDefault = defaultValue.trim() !== ''
+  const resetToDefault = () => { if (!disabled && hasDefault && !atDefault) onChange(defaultValue) }
 
   return (
     <div className={fixedHeight ? 'h-32 overflow-hidden' : wide ? 'md:col-span-2' : ''}>
@@ -2119,9 +2372,16 @@ function FieldRow({ field, value, onChange, disabled, isDirty, isSet, isCustom, 
         <span className="flex items-center gap-1 shrink-0">
           <button
             type="button"
+            onClick={() => onChange('', true)}
+            disabled={disabled || (value.trim() === '' && (!isSet || isDirty))}
+            title="Remove this entry from the server INI on apply; local player files are not included"
+            className="text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-2 text-text-muted hover:text-text disabled:opacity-40"
+          >Clear</button>
+          <button
+            type="button"
             onClick={resetToDefault}
-            disabled={disabled || atDefault}
-            title={atDefault ? 'Already at the Funcom default' : `Reset to default (${formatDefaultDisplay(field, defaultValue)}) — removes the key from the INI on save`}
+            disabled={disabled || !hasDefault || atDefault}
+            title={!hasDefault ? 'No Funcom default is available; nothing will be added' : atDefault ? 'Already at the Funcom default' : `Set to Funcom default (${formatDefaultDisplay(field, defaultValue)}) — writes this value to the server INI on apply`}
             className="text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-2 text-text-muted hover:text-text hover:bg-surface-3 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
           >
             <Icon name="RotateCcw" size={10} /> Default
@@ -2132,7 +2392,7 @@ function FieldRow({ field, value, onChange, disabled, isDirty, isSet, isCustom, 
             </span>
           )}
           {field.consoleVar && (
-            <span className="text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-2 text-text-muted" title="Console variable — saving alone changes nothing on a running server. It takes effect when the battlegroup restarts and rebuilds its startup command: use “Apply INIs & restart” in the bar at the bottom of this page. DST also offers to mirror console variables into this PC’s client Engine.ini; some are client-enforced and need every player to carry a matching value.">
+            <span className="text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-2 text-text-muted" title="Console variable — saving alone changes nothing on a running server. It takes effect when the battlegroup restarts and rebuilds its startup command: use “Apply server settings” in the bar at the bottom of this page. DST also offers to mirror console variables into this PC’s client Engine.ini; some are client-enforced and need every player to carry a matching value.">
               CVar
             </span>
           )}
@@ -2153,9 +2413,9 @@ function FieldRow({ field, value, onChange, disabled, isDirty, isSet, isCustom, 
               {field.risk}
             </span>
           )}
-          {field.clientApply && !field.consoleVar && (
-            <span className="text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-2 text-text-muted" title="Client-enforced — each player also needs a matching (or equal/higher) value in their own client INI before this takes full effect. Use “Player config” to get the exact lines to hand out.">
-              Client
+          {RETAIL_CLIENT_COMPATIBILITY_TARGETS.has(`${field.file}||${field.key}`.toLowerCase()) && (
+            <span className="text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-2 text-text-muted" title="This control edits the server file. A separate player-PC copy is available under Player compatibility. Server apply does not change any player’s files.">
+              PC copy available
             </span>
           )}
           {isCustom ? (
@@ -2174,6 +2434,7 @@ function FieldRow({ field, value, onChange, disabled, isDirty, isSet, isCustom, 
           <span className="text-[10px] font-mono text-text-dim uppercase tracking-wider">{field.file}</span>
         </span>
       </label>
+      <div className="mb-1.5 text-[10px] text-text-dim">Server · {field.file === 'engine' ? 'UserEngine.ini' : 'UserGame.ini'}{field.consoleVar ? ' · startup command on restart' : ' · deploy on start/restart'}</div>
 
       {/* When this field overrides the default, show the uneditable default beneath the name. */}
       {isCustom && (
@@ -2234,6 +2495,9 @@ function FieldRow({ field, value, onChange, disabled, isDirty, isSet, isCustom, 
           <span className="text-[10px] font-mono text-text-dim ml-auto truncate" title={`${field.section} / ${field.key}`}>{field.key}</span>
         )}
       </div>
+      {['Dune.GlobalMiningOutputMultiplier', 'Dune.GlobalVehicleMiningOutputMultiplier'].includes(field.key) && (
+        <p className="mt-2 text-xs text-text-muted">Server file only. Overlaps Gathering Amount in Official server controls. DST preserves both values separately; their in-game precedence has not been verified. This is not a player-PC setting.</p>
+      )}
     </div>
   )
 }
@@ -2273,11 +2537,12 @@ function BoolToggle({ on, off, value, disabled, onChange }: { on: string; off: s
 // -----------------------------------------------------------------------------
 
 function DefaultsCatalogBrowser({
-  vmRunning, onSaved, excludedTargets,
+  vmRunning, onSaved, excludedTargets, serverPaths,
 }: {
   vmRunning: boolean
   onSaved: () => void
   excludedTargets?: Set<string>
+  serverPaths?: { game: string; engine: string }
 }) {
   const { open, setOpen } = useCardCollapse('gameconfig.defaultsCatalog', false)
   const [data, setData] = useState<GameConfigDefaultsResponse | null>(null)
@@ -2298,6 +2563,7 @@ function DefaultsCatalogBrowser({
   // discard a pending edit.
   const [arrayExpanded, setArrayExpanded] = useState<Set<string>>(() => new Set())
   const [saving, setSaving] = useState(false)
+  const [review, setReview] = useState<GameConfigRawUpdate[] | null>(null)
   const [saveErr, setSaveErr] = useState<string | null>(null)
   const [savedMsg, setSavedMsg] = useState<string | null>(null)
 
@@ -2354,11 +2620,11 @@ function DefaultsCatalogBrowser({
     })
   }
 
-  const setEdit = (sectionName: string, key: string, value: string, original: string) => {
+  const setEdit = (sectionName: string, key: string, value: string, original: string, force = false) => {
     setEdits(prev => {
       const next = new Map(prev)
       const id = `${sectionName}||${key}`
-      if (value === original) next.delete(id)
+      if (value === original && !force) next.delete(id)
       else next.set(id, value)
       return next
     })
@@ -2470,12 +2736,7 @@ function DefaultsCatalogBrowser({
       }
 
       if (updates.length === 0) return
-      await saveGameConfigRaw(updates)
-      setSavedMsg(`Saved ${updates.length} change${updates.length === 1 ? '' : 's'}.`)
-      setEdits(new Map())
-      setArrayEdits(new Map())
-      await load(false)
-      onSaved()
+      setReview(updates)
     } catch (e) {
       setSaveErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -2501,6 +2762,11 @@ function DefaultsCatalogBrowser({
         </span>
       </button>
 
+      {review && <LabSaveReview updates={review} serverAvailable={vmRunning} serverPaths={serverPaths} onServerSave={() => saveGameConfigRaw(review)}
+        onCancel={() => setReview(null)} onDone={message => {
+          setReview(null); setSavedMsg(message); setEdits(new Map()); setArrayEdits(new Map())
+          void load(false); onSaved()
+        }} />}
       {open && (
         <div className="mt-4 space-y-3">
           {!vmRunning && (
@@ -2584,7 +2850,7 @@ function DefaultsCatalogBrowser({
                     onToggle={() => toggleSection(s.name)}
                     editsCount={sectionEditCount(s.name)}
                     getEdit={(key) => edits.get(`${s.name}||${key}`)}
-                    onEdit={(key, value, original) => setEdit(s.name, key, value, original)}
+                    onEdit={(key, value, original, force) => setEdit(s.name, key, value, original, force)}
                     getArrayEdit={(key, idx) => getArrayEdit(s.name, key, idx)}
                     onArrayEdit={(key, idx, value, original) => setArrayEdit(s.name, key, idx, value, original)}
                     isArrayRowExpanded={(key, idx) => isArrayRowExpanded(s.name, key, idx)}
@@ -2615,7 +2881,7 @@ function DefaultsCatalogBrowser({
                   <button
                     type="button"
                     onClick={() => void onSave()}
-                    disabled={dirtyCount === 0 || saving || !vmRunning}
+                    disabled={dirtyCount === 0 || saving || (!vmRunning && !isLocalViewer())}
                     className="btn-primary"
                   >
                     <Icon name={saving ? 'Loader2' : 'Save'} size={14} className={saving ? 'animate-spin' : ''} />
@@ -2640,7 +2906,7 @@ function DefaultsSectionCard({
   onToggle: () => void
   editsCount: number
   getEdit: (key: string) => string | undefined
-  onEdit: (key: string, value: string, original: string) => void
+  onEdit: (key: string, value: string, original: string, force?: boolean) => void
   getArrayEdit: (key: string, idx: number) => string | undefined
   onArrayEdit: (key: string, idx: number, value: string, original: string) => void
   isArrayRowExpanded: (key: string, idx: number) => boolean
@@ -2700,7 +2966,7 @@ function DefaultsSectionCard({
               k={k}
               rowIdx={idx}
               pending={getEdit(k.key)}
-              onChange={(v) => onEdit(k.key, v, k.current)}
+              onChange={(v, force) => onEdit(k.key, v, k.current, force)}
               arrayPending={getArrayEdit(k.key, idx)}
               onArrayChange={(v) => onArrayEdit(k.key, idx, v, k.current)}
               expanded={isArrayRowExpanded(k.key, idx)}
@@ -2713,14 +2979,14 @@ function DefaultsSectionCard({
   )
 }
 
-function DefaultsKeyRow({
+export function DefaultsKeyRow({
   k, rowIdx, pending, onChange,
   arrayPending, onArrayChange, expanded, onToggleExpand,
 }: {
   k: GameConfigDefaultKey
   rowIdx: number
   pending: string | undefined
-  onChange: (v: string) => void
+  onChange: (v: string, force?: boolean) => void
   arrayPending: string | undefined
   onArrayChange: (v: string) => void
   expanded: boolean
@@ -2729,6 +2995,7 @@ function DefaultsKeyRow({
   const displayed = pending ?? k.current
   const isDirty = pending !== undefined
   const isArray = k.isArray
+  const pathReference = /[\\/]/.test(`${k.default} ${k.current}`) || /(path|directory|folder|datatable|assetreference)(name)?$/i.test(k.key)
   // For array rows the effective value tracks arrayPending, and dirty state
   // includes cleared entries (delete-a-row).
   const arrayDisplayed = arrayPending !== undefined ? arrayPending : k.current
@@ -2740,7 +3007,11 @@ function DefaultsKeyRow({
     'focus:outline-none focus:ring-2 focus:ring-accent/40 disabled:opacity-60'
 
   let control: ReactElement
-  if (isArray) {
+  if (pathReference) {
+    control = <input type="text" readOnly value={k.current || k.default} className={inputCls}
+      aria-label={`${k.key} (read-only path)`}
+      title={`${k.current || k.default} (${k.hasOverride ? 'saved override; preserved' : 'Funcom default; inherited'})`} />
+  } else if (isArray) {
     // Array (+/-) rows: single-line preview with an expand toggle. Expanded
     // view shows a multi-line textarea (Unreal struct syntax can be long)
     // plus Reset-this-entry and Delete-this-entry actions. On save, the
@@ -2841,6 +3112,7 @@ function DefaultsKeyRow({
         <input
           type="text"
           value={displayed}
+          placeholder={!displayed && k.hasOverride === false ? 'No override — uses Funcom default' : undefined}
           onChange={e => onChange(e.target.value)}
           className={inputCls}
         />
@@ -2867,7 +3139,14 @@ function DefaultsKeyRow({
         {arrayIsDeleted && <span className="px-1 rounded bg-danger/15 text-danger font-semibold uppercase">delete</span>}
         {arrayIsDirty && !arrayIsDeleted && <span className="px-1 rounded bg-success/15 text-success font-semibold uppercase">edited</span>}
         {!isDirty && !arrayIsDirty && k.overridden && <span className="px-1 rounded bg-accent/15 text-accent-bright font-semibold uppercase">overridden</span>}
+        {!isArray && !isDirty && k.hasOverride === false && <span>No override</span>}
+        {!isArray && !isDirty && k.hasOverride === true && !displayed.trim() && <span className="text-warning">Empty override — Clear to inherit</span>}
         <span className="truncate">default: {k.default || <span className="text-text-dim/60">∅</span>}</span>
+        {pathReference && <span>Read-only path — preserved</span>}
+        {!isArray && !pathReference && <>
+          <button type="button" className="btn-ghost px-1 text-[10px]" onClick={() => onChange('', true)} disabled={!displayed.trim() && !(k.hasOverride && !isDirty)} title="Remove this scalar override from the selected INI files on save">Clear</button>
+          <button type="button" className="btn-ghost px-1 text-[10px]" onClick={() => onChange(k.default)} disabled={!k.default.trim() || displayed === k.default} title={k.default.trim() ? 'Write this Funcom default to the server INI on save' : 'No Funcom default is available; nothing will be added'}>Default</button>
+        </>}
       </div>
     </div>
   )
@@ -3067,12 +3346,12 @@ function ClientApplyReviewModal({
           <div>
             <h3 id={titleId} className="font-semibold text-text flex items-center gap-2">
               <Icon name="MonitorCog" size={16} className="text-accent-bright" />
-              {mode === 'legacy' ? 'Review WindowsClient migration' : 'Review advanced compatibility overrides'}
+              {mode === 'legacy' ? 'Review WindowsClient migration' : mode === 'comparison' ? 'Review selected local INI changes' : 'Review advanced compatibility overrides'}
             </h3>
             <p className="mt-1 text-xs text-text-muted">
               {mode === 'legacy'
                 ? 'This imports only recognized, non-default compatibility values with direct current-Retail evidence. Whole files and unrelated settings are never copied.'
-                : 'This writes only customized, non-default compatibility overrides with direct current-Retail evidence of local evaluation. It does not copy every server INI setting.'}
+                : 'Review the selected compatibility changes before changing this PC. Removing a server override can remove the related local entry only if you approve it here. Unrelated settings are preserved.'}
             </p>
           </div>
           <button
@@ -3117,14 +3396,14 @@ function ClientApplyReviewModal({
                           ? item.state === 'conflict'
                             ? 'Conflict: the active Windows file has a different value. Review both values before selecting this item.'
                             : 'Missing from the active Windows file and preselected for import from WindowsClient.'
-                          : 'Offered because current Retail field testing shows this advanced value is evaluated from the local client config.'}
+                          : mode === 'comparison' ? 'Optional server/local difference. Apply only if you want the server value in this local file; this does not verify its gameplay effect.' : 'Offered because current Retail field testing shows this advanced value is evaluated from the local client config.'}
                       </span>
                       <span className="mt-1 grid gap-1 text-xs font-mono sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
                         <span className="text-text-muted break-all">[{item.section}] {item.key}</span>
                         <span className="text-text break-all sm:text-right">
                           {mode === 'legacy'
                             ? <>old: {item.value}{item.currentValue ? ` • current: ${item.currentValue}` : ' • current: missing'}</>
-                            : item.value}
+                            : item.remove ? 'Remove local override (server entry is missing or cleared)' : item.value}
                         </span>
                       </span>
                     </span>
@@ -3136,7 +3415,8 @@ function ClientApplyReviewModal({
           <p className="text-xs text-text-muted">
             Game.ini compatibility values do not require Engine.ini management. Engine.ini entries appear here only after
             that separate opt-in is enabled. Existing destination files are backed up before an atomic, verified write.
-            This changes this PC only; other players must review and apply their own matching values.
+            This changes this PC only and is not limited to the selected server. The game may read these local values
+            when joining other servers; other players' files and server-controlled settings are unchanged.
           </p>
         </div>
 

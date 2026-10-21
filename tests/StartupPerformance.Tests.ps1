@@ -4,7 +4,6 @@ Describe 'Cold-start performance guardrails' {
         $script:entry = Get-Content (Join-Path $repo 'app\DuneServer.ps1') -Raw
         $script:http = Get-Content (Join-Path $repo 'app\server\HttpServer.ps1') -Raw
         $script:scheduler = Get-Content (Join-Path $repo 'app\server\lib\RestartSchedule.ps1') -Raw
-        $script:dashboard = Get-Content (Join-Path $repo 'webui\src\pages\Dashboard.tsx') -Raw
         $script:statusRoute = Get-Content (Join-Path $repo 'app\server\routes\Status.ps1') -Raw
     }
 
@@ -29,10 +28,6 @@ Describe 'Cold-start performance guardrails' {
         $ready | Should -BeLessThan $wait
         $script:entry | Should -Not -Match 'Initialize-DuneMobileBridge'
         $script:scheduler | Should -Match 'Initialize-DuneMobileBridge -ServerDir \$DuneSchedulerServerDir'
-    }
-
-    It 'loads dashboard links only once on mount' {
-        $script:dashboard | Should -Match 'useEffect\(\(\) => \{ void refreshLinks\(\) \}, \[refreshLinks\]\)'
     }
 
     Context 'Deferred startup workers' {
@@ -73,7 +68,7 @@ Describe 'Cold-start performance guardrails' {
             Copy-Item $script:cacheSource (Join-Path $lib.FullName 'PlatformCache.ps1')
             Set-Content (Join-Path $lib.FullName 'DuneLog.ps1') @'
     function Set-DuneLogPath { param($Path) }
-    function Write-DuneLog { param($Message, $Level) }
+    function Write-DuneLog { param($Message, $Level); if ($Message -like 'Platform cache background hydration complete*' -or $Message -like 'Platform cache background startup failed*' -and -not $CancellationToken.IsCancellationRequested) { $script:DuneApiLockTable.testControl.refreshed.Set() } }
 '@
             Set-Content (Join-Path $lib.FullName 'PlatformRuntime.ps1') '# no live-source operations in startup tests'
             Set-Content (Join-Path $lib.FullName 'MapPlatform.ps1') @'
@@ -103,7 +98,7 @@ Describe 'Cold-start performance guardrails' {
             Set-Content (Join-Path $lib.FullName 'InventoryCache.ps1') @'
     function Start-DuneInventoryCacheStartupRefresh {
         param($ServerDir, $AppDir)
-        $script:DuneApiLockTable.testControl.refreshed.Set()
+        throw 'Inventory must not refresh at startup.'
         return $true
     }
     function Stop-DuneInventoryCacheRefresh {
@@ -207,7 +202,7 @@ Describe 'Cold-start performance guardrails' {
             $script:refreshed.IsSet | Should -BeFalse
         }
 
-        It 'owns and cancels both production refresh runners after deferred hydration' {
+        It 'owns the map refresh runner without starting inventory after hydration' {
             $lib = Join-Path $script:serverDir 'lib'
             $productionLib = Split-Path $script:cacheSource -Parent
             Copy-Item (Join-Path $productionLib 'MapPlatform.ps1') (Join-Path $lib 'MapPlatform.ps1') -Force
@@ -243,10 +238,11 @@ function Invoke-DuneInventoryCacheRefreshLoop {
             [void](Start-DunePlatformCacheStartup -ServerDir $script:serverDir -HttpReady $script:ready -DelaySec 0)
             $script:entered.Wait(5000) | Should -BeTrue
             $script:refreshed.Wait(5000) | Should -BeTrue
+            $script:control.inventoryStopped | Should -BeFalse
             [object]::ReferenceEquals($state, $script:control.mapState) | Should -BeTrue
             (Stop-DunePlatformCacheStartup) | Should -BeTrue
             $script:control.mapStopped | Should -BeTrue
-            $script:control.inventoryStopped | Should -BeTrue
+            $script:control.inventoryStopped | Should -BeFalse
         }
 
         It 'starts headless hydration and answers HTTP while that hydration is still blocked' {

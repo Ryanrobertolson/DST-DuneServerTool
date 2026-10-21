@@ -4,6 +4,70 @@ BeforeAll {
 }
 
 Describe 'Solo Mode route registration' {
+    It 'keeps blueprint settings local-only and blocks stale profiles before writing' {
+        $result = & {
+            function Register-DuneRoute {
+                param($Method, $Path, [switch]$LocalOnly, $Handler)
+                [pscustomobject]@{ method=$Method; path=$Path; localOnly=[bool]$LocalOnly; handler=$Handler }
+            }
+            $routes = @(. $script:RouteFile) | Where-Object path -eq '/api/solo/blueprint-settings'
+            $script:blueprintCalled = $false
+            $script:blueprintStatus = 0
+            function Invoke-WithDuneLock { param($Name, $Script); & $Script }
+            function Assert-DuneSoloExpectedProfile { throw 'The active Solo save changed since this page loaded.' }
+            function Set-DuneSoloBlueprintSettings { $script:blueprintCalled = $true }
+            function Write-DuneJson {}
+            function Write-DuneError { param($Response, $Status, $Message); $script:blueprintStatus=$Status }
+            & ($routes | Where-Object method -eq 'PUT').handler $null $null $null @{enabled=$true;expectedProfileToken='stale';confirm='APPLY SOLO BLUEPRINT SETTINGS'}
+            [pscustomobject]@{count=@($routes).Count;localOnly=@($routes | Where-Object { -not $_.localOnly }).Count;called=$script:blueprintCalled;status=$script:blueprintStatus}
+        }
+        $result.count | Should -Be 2
+        $result.localOnly | Should -Be 0
+        $result.called | Should -BeFalse
+        $result.status | Should -Be 409
+    }
+    It 'rejects a stale profile before any main quest write' {
+        $result = & {
+            function Register-DuneRoute {
+                param($Method, $Path, [switch]$LocalOnly, $Handler)
+                [pscustomobject]@{ path=$Path; localOnly=[bool]$LocalOnly; handler=$Handler }
+            }
+            $route = @(. $script:RouteFile) | Where-Object path -eq '/api/solo/progression/main-quest/unlock'
+            $script:questCalled = $false
+            $script:questStatus = 0
+            function Invoke-WithDuneLock { param($Name, $Script); & $Script }
+            function Assert-DuneSoloExpectedProfile { throw 'The active Solo save changed since this page loaded.' }
+            function Unlock-DuneSoloMainQuest { $script:questCalled = $true }
+            function Write-DuneJson {}
+            function Write-DuneError { param($Response, $Status, $Message); $script:questStatus=$Status }
+            & $route.handler $null $null $null @{quest='DA_MQ_ANewBeginning';expectedProfileToken='stale';confirm='UNLOCK SOLO MAIN QUEST'}
+            [pscustomobject]@{localOnly=$route.localOnly;called=$script:questCalled;status=$script:questStatus}
+        }
+        $result.localOnly | Should -BeTrue
+        $result.called | Should -BeFalse
+        $result.status | Should -Be 409
+    }
+    It 'keeps bulk grants local-only and rejects a changed profile before writing' {
+        $result = & {
+            function Register-DuneRoute {
+                param($Method, $Path, [switch]$LocalOnly, $Handler)
+                [pscustomobject]@{ path=$Path; localOnly=[bool]$LocalOnly; handler=$Handler }
+            }
+            $route = @(. $script:RouteFile) | Where-Object path -eq '/api/solo/grant-unlocks'
+            $script:bulkCalled = $false
+            $script:bulkError = $null
+            function Invoke-WithDuneLock { param($Name, $Script); & $Script }
+            function Assert-DuneSoloExpectedProfile { throw 'The active Solo save changed since this page loaded.' }
+            function Invoke-DuneSoloGrantUnlocks { $script:bulkCalled = $true }
+            function Write-DuneJson {}
+            function Write-DuneError { param($Response, $Status, $Message); $script:bulkError=$Status }
+            & $route.handler $null $null $null @{kind='building-sets';expectedProfileToken='old'}
+            [pscustomobject]@{localOnly=$route.localOnly;called=$script:bulkCalled;status=$script:bulkError}
+        }
+        $result.localOnly | Should -BeTrue
+        $result.called | Should -BeFalse
+        $result.status | Should -Be 409
+    }
     It 'keeps diagnostic export and specialization edits local-only' {
         $routes = @(& {
             function Register-DuneRoute {
@@ -37,7 +101,7 @@ Describe 'Solo Mode route registration' {
             function Reset-DuneSoloSpecializationRewards { $script:specializationCalled = $true }
             function Invoke-WithDuneLock { param($Name, $Script); & $Script }
             function Assert-DuneSoloExpectedProfile {
-                if ($stale) { throw 'Solo profile changed in another window.' }
+                if ($stale) { throw 'The active Solo save changed since this page loaded.' }
             }
             function Write-DuneJson {}
             function Write-DuneError {

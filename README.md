@@ -9,12 +9,17 @@ Solo saves.
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/coastal-ms/DST-DuneServerTool?sort=semver)](https://github.com/coastal-ms/DST-DuneServerTool/releases/latest)
 
-**[Website and feature tour](https://coastal-ms.github.io/DST-DuneServerTool/) ·
-[Install guide](https://coastal-ms.github.io/DST-DuneServerTool/install) ·
+**[Website and feature tour](https://duneservertool.com/) ·
+[Install guide](https://duneservertool.com/install) ·
 [Changelog](CHANGELOG.md) ·
 [Discord](https://discord.gg/tj2x7cywSC)**
 
-Current stable release: **v15.2.3**
+Current stable release: **v16.0.0**
+
+Choose **Solo only** or **Self-Hosted + Solo** during installation. Solo only
+opens local save tools in the Classic interface without server setup or server
+background services. Both options share the same Solo tools; your installation
+choice and existing configuration are preserved during updates.
 
 A targeted live database contract check against Dune: Awakening 1.5.3.5 on
 September 30, 2026 confirmed that all 61 tables and 25 functions referenced by DST
@@ -38,9 +43,7 @@ guarded controls in one native Windows app.
   shutdown and boot recovery, with operator-visible status and rollback.
 - Use the responsive full Browser Portal from a phone, tablet, or PC with
   optional host-managed Owner and Admin accounts.
-- Use Tailscale Funnel and the Browser Portal for new remote setups. v15 keeps
-  existing Cloudflare custom-domain configuration but disables its legacy portal
-  by default; the host can explicitly re-enable it in local Settings.
+- Use Tailscale Funnel and the Browser Portal for remote access. Native mobile apps and legacy Cloudflare remote tunnels are retired.
 
 ### Solo Mode
 
@@ -50,6 +53,7 @@ guarded controls in one native Windows app.
 - Edit typed Solo and confirmed Engine settings.
 - Manage items, packages, vehicle kits, cosmetics, currencies, and fillables.
 - Max augments and run verified specialization, Find the Fremen, and skill actions.
+- Unlock the five main quests through Journey unlocks, with retained backups.
 
 Solo mutations require Dune to be closed. DST retains the current save, writes
 atomically, verifies the result, and rolls back automatically on failure.
@@ -284,21 +288,28 @@ spice, scheduled restarts, memory warnings, interfaces, and log exports.
 
 Typed `UserGame.ini` and `UserEngine.ini` controls, Funcom defaults, backups,
 plus a separate **Official Retail Server Settings** card showing the live
-`Config/LinuxServer/ServerCustomSettings.ini` values used by Retail's
-multiplayer Server Settings preview. Funcom regenerates that runtime file at
-battlegroup startup, so DST writes only the durable BattleGroup
-`global.userIniConfig` source while the battlegroup is fully stopped. Every save
+`UserSettings/UserServerCustomSettings.ini` values used by Retail's
+multiplayer Server Settings preview. This persistent Linux file is authoritative:
+Refresh reads manual edits, and Save writes changes to the same file while the
+battlegroup is fully stopped. Save synchronizes the physical Linux runtime INI
+and BattleGroup operator configuration; startup refreshes them from the source
+file so later manual edits apply. Every save
 backs up the complete current file, preserves comments/order/unknown keys, and
 uses revision and exact-readback guards; unknown future keys remain read-only
 and visible rather than being discarded.
 All 47 supported settings remain visible even when absent from the source, with
 an explicit **Not configured** state rather than an assumed live value.
-**Default Settings** drafts the documented defaults for editable settings;
-saving adds only the requested keys. Boolean values accept case variations.
+Existing YAML settings are backed up and migrated on the first stopped-BG Save
+or Start, preserving existing overrides. A mismatch notice directs users to
+**Read current settings**, which loads YAML as a draft; Save copies its complete
+settings block into the UserSettings file. **Default Settings** drafts Custom
+difficulty and all missing documented defaults. Existing PvP mode is preserved.
+Boolean values accept case variations.
 Existing operator INI files and fields are preserved. An incompatible existing
 operator mount path blocks saving instead of being silently changed; failed
-readback restores the original operator field, including removing newly added
-configuration.
+readback restores both Linux files and the original operator field, including
+removing newly added configuration. Concurrent file edits are preserved when
+rollback would overwrite newer contents.
 Rollback atomically checks both the resource version and the value DST wrote;
 concurrent operator changes are not overwritten.
 DST-managed blocks, local-client mirroring, and isolated Experimental features.
@@ -370,7 +381,7 @@ guarded World Restart testing.
 <details>
 <summary><strong>Settings</strong></summary>
 
-![Unconfigured v15 Settings including the disabled Legacy Cloudflare section](docs/img/settings.png)
+![Settings overview](docs/img/settings.png)
 
 Updates, installation, themes, warnings, Remote Device Access, Browser Portal
 accounts, Hyper-V over LAN, Hyper-V VM lifecycle, Public IP/DDNS, browser ping,
@@ -382,10 +393,14 @@ and host-local preferences.
 
 ![Browser Portal sign-in on a phone-sized screen with empty account fields](docs/img/browser-portal.png)
 
-Responsive remote access with host-created accounts. Tailscale Funnel is the
-forward path; retained legacy Cloudflare configuration stays disabled by
-default until explicitly re-enabled in local Settings. The screenshot is the
-offline sign-in screen, not a connected remote session.
+Responsive remote access with host-created accounts over Tailscale Funnel. Native mobile apps and legacy Cloudflare remote access are retired. The screenshot is the offline sign-in screen.
+
+Hosts can choose **Player** when creating an account and must link it to a game
+character. Player accounts open a dedicated portal with server status, maps,
+map warming, and management of that character, including item grants. They
+cannot run server commands or manage other characters. Actions that edit saved
+character data still require the character to be offline. Changing an account's
+role or character link signs out its existing sessions.
 </details>
 
 ## Safety model
@@ -419,7 +434,7 @@ offline sign-in screen, not a connected remote session.
 - For Solo Mode: a supported local Dune Solo save. No VM is required.
 
 Full setup, remote access, Hyper-V-over-LAN, and path guidance:
-**[Install guide](https://coastal-ms.github.io/DST-DuneServerTool/install)**.
+**[Install guide](https://duneservertool.com/install)**.
 
 ## Local paths
 
@@ -435,7 +450,7 @@ Full setup, remote access, Hyper-V-over-LAN, and path guidance:
 - Questions and community help: [DST Discord](https://discord.gg/tj2x7cywSC)
 - Reproducible bugs: [open an issue](https://github.com/coastal-ms/DST-DuneServerTool/issues/new/choose)
 - Stable and named test builds: [GitHub Releases](https://github.com/coastal-ms/DST-DuneServerTool/releases)
-- Active test guidance: [testing page](https://coastal-ms.github.io/DST-DuneServerTool/testing)
+- Active test guidance: [testing page](https://duneservertool.com/testing)
 - Full release history: [CHANGELOG.md](CHANGELOG.md)
 
 Diagnostics are available from **Help -> Export diagnostics**. Attach the

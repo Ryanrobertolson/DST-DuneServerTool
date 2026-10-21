@@ -4,6 +4,7 @@
 // Reads /api/gameplay/players for the list + /api/gameplay/players/summary
 // for the server overview. Each section component owns its own data fetch.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSearch } from '../../router'
 import { Icon } from '../../components/Icon'
 import {
   getPlayers, getPlayerSummary,
@@ -25,6 +26,8 @@ const isOnline = (s: string) => s.toLowerCase().includes('online')
 
 export function PlayersTab() {
   const contextual = useCommandDeck()
+  const routeSearch = useSearch()
+  const routeParams = new URLSearchParams(routeSearch)
   const [players, setPlayers]   = useState<Player[]>([])
   const [source, setSource]     = useState<DataSource>('demo')
   const [liveError, setLive]    = useState<string | undefined>()
@@ -38,12 +41,19 @@ export function PlayersTab() {
   const [gmNoticeDismissed, setGmNoticeDismissed] = useState<boolean>(() => {
     try { return localStorage.getItem('dst.players.gmNoticeDismissed') === '1' } catch { return false }
   })
-  const [selectedId, setSel]    = useState<number | null>(null)
-  const [section, setSection]   = useState<SectionId>('stats')
+  const [selectedId, setSel]    = useState<number | null>(() => Number(routeParams.get('player_id')) || null)
+  const [section, setSection]   = useState<SectionId>(() => routeParams.get('section') === 'inventory' || routeParams.get('view') === 'inventory' ? 'inventory' : 'stats')
   const [directoryOpen, setDirectoryOpen] = useState(false)
-  const [flash, setFlash]       = useState<{ msg: string; kind: 'ok' | 'err' } | null>(null)
+  const [flash, setFlash]       = useState<{ msg: string; kind: 'ok' | 'err' | 'info' } | null>(null)
   const [refreshKey, setRefresh] = useState(0)
   const [summary, setSummary]   = useState<PlayerSummaryResponse | null>(null)
+
+  useEffect(() => {
+    const params = new URLSearchParams(routeSearch)
+    const player = Number(params.get('player_id'))
+    if (Number.isSafeInteger(player) && player > 0) setSel(player)
+    if (params.get('section') === 'inventory' || params.get('view') === 'inventory') setSection('inventory')
+  }, [routeSearch])
 
   const loadList = useCallback(async () => {
     setLoading(true); setError(null)
@@ -308,9 +318,9 @@ export function PlayersTab() {
           {flash && (
             <div
               role="status"
-              className={`player-action-notice fixed bottom-4 right-4 z-50 max-w-sm card p-3 text-xs flex items-start gap-2 shadow-lg break-words border-l-2 ${flash.kind === 'ok' ? 'text-success border-success' : 'text-danger border-danger'}`}
+              className={`player-action-notice fixed bottom-4 right-4 z-50 max-w-sm card p-3 text-xs flex items-start gap-2 shadow-lg break-words border-l-2 ${flash.kind === 'ok' ? 'text-success border-success' : flash.kind === 'info' ? 'text-text-muted border-border' : 'text-danger border-danger'}`}
             >
-              <Icon name={flash.kind === 'ok' ? 'CheckCircle2' : 'AlertCircle'} size={14} className="mt-0.5 shrink-0" />
+              <Icon name={flash.kind === 'ok' ? 'CheckCircle2' : flash.kind === 'info' ? 'Info' : 'AlertCircle'} size={14} className="mt-0.5 shrink-0" />
               <span>{flash.msg}</span>
               <button type="button" aria-label="Dismiss action result" onClick={() => setFlash(null)}><Icon name="X" size={14} /></button>
             </div>

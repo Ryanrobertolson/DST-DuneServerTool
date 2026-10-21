@@ -23,6 +23,7 @@ internal sealed class MainForm : Form
     private const int SW_RESTORE = 9;
 
     private readonly WebView2 _web = new();
+    private readonly HashSet<AtlasMapForm> _atlasPopouts = new();
     private readonly Label _status = new();
 
     private readonly string? _initialUrl;
@@ -50,6 +51,10 @@ internal sealed class MainForm : Form
     private bool _closeRequestedByPortal;
     private FormWindowState _restoreState = FormWindowState.Normal;
     private Rectangle _restoreBounds;
+    private Rectangle? _widgetRestoreBounds;
+    private Rectangle? _widgetBounds = WidgetWindowPlacement.Load(WidgetStateFile);
+    private FormWindowState _widgetRestoreState;
+    private bool _changingWidgetMode;
 
     public MainForm(string? initialUrl, bool useWaitFile)
     {
@@ -68,6 +73,7 @@ internal sealed class MainForm : Form
         BuildTrayIcon();
 
         Resize += OnResizeToTray;
+        ResizeEnd += (_, _) => SaveWidgetBounds();
 
         FormClosing += (_, e) =>
         {
@@ -92,6 +98,10 @@ internal sealed class MainForm : Form
         // just the WebView and a transient status label — no MenuStrip.
         BuildWebView();
         BuildStatus();
+        FormClosed += (_, _) =>
+        {
+            foreach (var popup in _atlasPopouts.ToArray()) popup.Close();
+        };
 
         Load += async (_, _) => await InitializeAsync();
     }
@@ -528,7 +538,7 @@ internal sealed class MainForm : Form
             CloseWhenFinished(operation, new object());
     }
 
-    private void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
+    private async void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
     {
         // window.open / target=_blank routing:
         //   * Same-origin as the portal's own URL (loopback + same port) -> keep
@@ -540,6 +550,29 @@ internal sealed class MainForm : Form
         //     shell off the portal instead.
         e.Handled = true;
         if (!Uri.TryCreate(e.Uri, UriKind.Absolute, out var u)) return;
+
+        if (Uri.TryCreate(_targetUrl, UriKind.Absolute, out var atlasPortal) &&
+            AtlasPopupPolicy.IsAtlasPopup(atlasPortal, u))
+        {
+            var deferral = e.GetDeferral();
+            AtlasMapForm? popup = null;
+            try
+            {
+                popup = new AtlasMapForm(OpenExternal);
+                _atlasPopouts.Add(popup);
+                popup.FormClosed += (_, _) => _atlasPopouts.Remove(popup);
+                popup.Show();
+                await popup.InitializeAsync(_web.CoreWebView2.Environment);
+                e.NewWindow = popup.Core;
+            }
+            catch (Exception ex)
+            {
+                popup?.Close();
+                AppendDiagnosticLine($"[atlas-popout] {ex.GetType().Name}: {ex.Message}");
+            }
+            finally { deferral.Complete(); }
+            return;
+        }
 
         bool keepInShell = false;
         if (u.IsLoopback &&
@@ -701,6 +734,51 @@ internal sealed class MainForm : Form
             return;
         }
 
+        if (string.Equals(messageType, "widget.set", StringComparison.Ordinal))
+        {
+            try
+            {
+                if (!message.TryGetProperty("enabled", out var enabled) ||
+                    enabled.ValueKind is not (System.Text.Json.JsonValueKind.True or System.Text.Json.JsonValueKind.False))
+                    throw new InvalidDataException("Widget mode requires enabled.");
+                if (enabled.GetBoolean() && _widgetRestoreBounds is null)
+                {
+                    _widgetRestoreState = WindowState;
+                    _widgetRestoreBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+                    _changingWidgetMode = true;
+                    try
+                    {
+                        bool soloMap = message.TryGetProperty("layout", out var layout) && layout.GetString() == "solo-map";
+                        MinimumSize = soloMap ? new Size(740, 780) : new Size(360, 240);
+                        WindowState = FormWindowState.Normal;
+                        // Discard legacy placement inherited from the management frame.
+                        Rectangle target = WidgetWindowPlacement.Resolve(_widgetBounds, _widgetRestoreBounds.Value);
+                        if (soloMap) target.Size = new Size(Math.Max(target.Width, 740), Math.Max(target.Height, 780));
+                        target = ClampToVisible(target, soloMap ? new Size(740, 780) : new Size(740, 285));
+                        Bounds = target;
+                        _widgetBounds = target;
+                        _restoreBounds = target;
+                    }
+                    finally { _changingWidgetMode = false; }
+                    Text = "DST — Widget";
+                }
+                else if (!enabled.GetBoolean() && _widgetRestoreBounds is Rectangle original)
+                {
+                    SaveWidgetBounds();
+                    // End Widget ownership before restoring management geometry.
+                    _widgetRestoreBounds = null;
+                    MinimumSize = new Size(960, 600);
+                    Bounds = original;
+                    WindowState = _widgetRestoreState;
+                    Text = "Dune Server Tool";
+                    SaveWindowState();
+                }
+                PostShellResponse(requestId, "widget.set.result", true);
+            }
+            catch (Exception ex) { PostShellResponse(requestId, "widget.set.result", false, ex.Message); }
+            return;
+        }
+
         if (string.Equals(messageType, "preferences.set", StringComparison.Ordinal))
         {
             try
@@ -728,6 +806,33 @@ internal sealed class MainForm : Form
             catch (Exception ex)
             {
                 PostPreferencesResult(requestId, false, ex.Message);
+            }
+            return;
+        }
+
+        if (string.Equals(messageType, "folder.open", StringComparison.Ordinal))
+        {
+            try
+            {
+                if (!Uri.TryCreate(_targetUrl, UriKind.Absolute, out var portal) || !portal.IsLoopback)
+                    throw new InvalidOperationException("Local folders can be opened only from the host portal.");
+                string? path = GetStringProperty(message, "path");
+                if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path) || path.StartsWith(@"\\"))
+                    throw new InvalidDataException("Choose an existing local folder.");
+                path = Path.GetFullPath(path);
+                if (!Directory.Exists(path)) throw new DirectoryNotFoundException("The folder does not exist.");
+                var start = new ProcessStartInfo
+                {
+                    FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                    UseShellExecute = true,
+                };
+                start.ArgumentList.Add(path);
+                Process.Start(start);
+                PostShellResponse(requestId, "folder.open.result", true);
+            }
+            catch (Exception ex)
+            {
+                PostShellResponse(requestId, "folder.open.result", false, ex.Message);
             }
             return;
         }
@@ -1356,15 +1461,29 @@ internal sealed class MainForm : Form
         }
     }
 
+    private static string WidgetStateFile => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DuneServer", "shell-widget.json");
+
+    private void SaveWidgetBounds()
+    {
+        if (_widgetRestoreBounds is null || _changingWidgetMode || !Visible || WindowState != FormWindowState.Normal) return;
+        Rectangle bounds = Bounds;
+        if (bounds.Width < 360 || bounds.Height < 240) return;
+        _widgetBounds = ClampToVisible(bounds, new Size(740, 245));
+        WidgetWindowPlacement.Save(WidgetStateFile, _widgetBounds.Value);
+    }
+
     private void SaveWindowState()
     {
+        SaveWidgetBounds();
         try
         {
             // Persist the *normal* bounds even when maximized/minimized so the
             // restored size is sensible, plus a flag to reopen maximized.
-            Rectangle b = Visible
+            Rectangle b = _widgetRestoreBounds ?? (Visible
                 ? (WindowState == FormWindowState.Normal ? Bounds : RestoreBounds)
-                : _restoreBounds;
+                : _restoreBounds);
             b = ClampToVisible(b, new Size(2000, 1300));
             var st = new WinState
             {
@@ -1372,7 +1491,7 @@ internal sealed class MainForm : Form
                 Y = b.Y,
                 W = b.Width,
                 H = b.Height,
-                Max = WindowState == FormWindowState.Maximized,
+                Max = (_widgetRestoreBounds is null ? WindowState : _widgetRestoreState) == FormWindowState.Maximized,
                 MinTray = _minimizeToTray
             };
             string dir = Path.GetDirectoryName(WindowStateFile)!;

@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { SettingsApplyContext, useSettingsDraft } from './settingsApplyContext'
 import { CollapsibleCard } from '../../components/CollapsibleCard'
 import { Icon } from '../../components/Icon'
 import { getRetailServerSettings, saveRetailServerSettings } from '../../api/gameconfig'
 import type { RetailServerSetting, RetailServerSettingsResponse } from '../../api/types'
+import { RESPAWN_SETTING_GUIDANCE } from '../../util/respawnSettingGuidance'
 
 const INTEGER_SLIDER_MIN = 0
-const FLOAT_SLIDER_MIN = 0.1
-const NUMERIC_SLIDER_MAX = 25
+const FLOAT_SLIDER_MIN = 0
+const NUMERIC_SLIDER_MAX = 10
 const FLOAT_DECIMAL_PLACES = 6
 
 type RetailSettingGuidance = {
@@ -14,17 +16,19 @@ type RetailSettingGuidance = {
   effect: string
 }
 
-// Patch 1.5 defaults from Red-Blink/dune-awakening-selfhost-docker at acc3d43c.
+// Patch 1.5 default values from Red-Blink/dune-awakening-selfhost-docker at acc3d43c.
+// Reviewed against CubeCoders AMPTemplates aa716232 (including its newer 16-hour backup default).
+// Effect descriptions are DST guidance, not verbatim Funcom documentation.
 export const RETAIL_SETTING_GUIDANCE: Record<string, RetailSettingGuidance> = {
-  DifficultyLevel: { defaultValue: 'Custom', effect: 'Selects the overall difficulty preset. Managed server settings use Custom.' },
+  DifficultyLevel: { defaultValue: 'Custom', effect: 'DST supports only Custom mode for managed server settings. Difficulty Level is not adjustable here. Other presets can override these values and must be configured manually outside DST.' },
   PVPMode: { defaultValue: 'Limited', effect: 'Controls where and under which rules player-versus-player combat is allowed.' },
-  GatheringAmount: { defaultValue: '1.000000', effect: 'Higher values yield more resources per gathering action; lower values yield less.' },
+  GatheringAmount: { defaultValue: '1.000000', effect: 'Higher values yield more resources per gathering action; lower values yield less. The server template identifies this as overlapping the Advanced hand-mining and vehicle-mining multipliers. These are all server settings; different values are not reconciled automatically, and their in-game precedence has not been verified.' },
   CraftingCost: { defaultValue: '1.000000', effect: 'Higher values require more crafting materials; lower values require fewer materials.' },
-  WaterExtractionRate: { defaultValue: '1.000000', effect: 'Higher values extract water faster; lower values extract it slower.' },
+  WaterExtractionRate: { defaultValue: '1.000000', effect: 'Scales water extraction. Current AMP guidance says higher values extract faster; older Funcom configuration comments say the opposite. Direction has not been verified in-game.' },
   CraftingTimeMultiplier: { defaultValue: '1.000000', effect: 'Higher values make crafting take longer; lower values make it faster.' },
   BuildingCostMultiplier: { defaultValue: '1.000000', effect: 'Higher values require more building materials; lower values require fewer materials.' },
-  ResourceRespawnSpeed: { defaultValue: '1.000000', effect: 'Higher values make world resources return faster; lower values make them return slower.' },
-  LootRespawnSpeed: { defaultValue: '1.000000', effect: 'Higher values make loot return faster; lower values make it return slower.' },
+  ResourceRespawnSpeed: { defaultValue: '1.000000', effect: RESPAWN_SETTING_GUIDANCE.ResourceRespawnSpeed.effect },
+  LootRespawnSpeed: { defaultValue: '1.000000', effect: RESPAWN_SETTING_GUIDANCE.LootRespawnSpeed.effect },
   FuelBurnTimeMultiplier: { defaultValue: '1.000000', effect: 'Higher values make fuel last longer; lower values shorten its burn time.' },
   InventoryVolumeMultiplier: { defaultValue: '1.000000', effect: 'Higher values increase inventory capacity; lower values reduce it.' },
   PlayerDamageToPlayer: { defaultValue: '1.000000', effect: 'Higher values increase player damage to other players; lower values reduce it.' },
@@ -42,7 +46,7 @@ export const RETAIL_SETTING_GUIDANCE: Record<string, RetailSettingGuidance> = {
   GatheringXp: { defaultValue: '1.000000', effect: 'Higher values increase gathering XP gains; lower values slow gathering progression.' },
   MissionXp: { defaultValue: '1.000000', effect: 'Higher values increase mission XP rewards; lower values slow mission progression.' },
   ItemDurabilityDrainMultiplier: { defaultValue: '1.000000', effect: 'Higher values wear items faster; lower values make equipment last longer.' },
-  bEnableItemMaxDurabilityLoss: { defaultValue: 'True', effect: 'Enabled allows items to lose maximum durability; disabled preserves their maximum.' },
+  bEnableItemMaxDurabilityLoss: { defaultValue: 'True', effect: 'Enabled allows repairs to reduce an item\'s maximum durability; disabled preserves its maximum.' },
   PlayerShieldDamageAbsorptionMultiplier: { defaultValue: '1.000000', effect: 'Higher values increase damage absorbed by player shields; lower values reduce shield absorption.' },
   NPCShieldDamageAbsorptionMultiplier: { defaultValue: '1.000000', effect: 'Higher values increase damage absorbed by NPC shields; lower values reduce shield absorption.' },
   HeatBuildupRate: { defaultValue: '1.000000', effect: 'Higher values build heat faster; lower values make heat exposure more forgiving.' },
@@ -58,7 +62,7 @@ export const RETAIL_SETTING_GUIDANCE: Record<string, RetailSettingGuidance> = {
   FiefdomLimit: { defaultValue: '3', effect: 'Higher values allow more sub-fiefs; lower values allow fewer.' },
   BuildingPieceLimitMultiplier: { defaultValue: '1.000000', effect: 'Higher values allow more building pieces; lower values allow fewer.' },
   bBuildingInfiniteStability: { defaultValue: 'False', effect: 'Enabled enforces building stability limits; disabled gives buildings infinite stability.' },
-  BaseBackupToolTimeRestriction: { defaultValue: '10.000000', effect: 'Controls the time restriction applied to the base backup tool.' },
+  BaseBackupToolTimeRestriction: { defaultValue: '16.000000', effect: 'Window in hours after a base was built or last backed up during which its sub-fief console can still be backed up. Higher values allow a longer window. This is not a cooldown between backups.' },
   LandsraadContributionMultiplier: { defaultValue: '1.000000', effect: 'Higher values increase Landsraad contribution gains; lower values reduce them.' },
   LandsraadSpecializationXpMultiplier: { defaultValue: '1.000000', effect: 'Higher values increase Landsraad specialization XP; lower values reduce it.' },
   LandsraadFactionStandingMultiplier: { defaultValue: '1.000000', effect: 'Higher values increase Landsraad faction standing gains; lower values reduce them.' },
@@ -75,8 +79,18 @@ function normalizeSettingValue(setting: RetailServerSetting, value: string): str
   return Number.isFinite(parsed) ? parsed.toFixed(FLOAT_DECIMAL_PLACES) : value
 }
 
+// Defaults can set the required difficulty and initialize an absent PvP mode;
+// neither read-only field becomes a freely editable control.
+function isDefaultSettingUpdate(setting: RetailServerSetting, value: string): boolean {
+  return setting.supported && (
+    (setting.key === 'DifficultyLevel' && value === 'Custom')
+    || (setting.key === 'PVPMode' && setting.present === false && value === 'Limited')
+  )
+}
+
 function getDraftValidationError(setting: RetailServerSetting, value: string): string | null {
-  if (setting.present === false && !value.trim()) return null
+  if (!value.trim()) return null // Clearing removes the server-file entry on apply.
+  if (setting.type === 'float') return value.trim() && Number.isFinite(Number(value)) ? null : `${setting.label} must be a finite number.`
   if (setting.type !== 'int') return null
   const parsed = Number(value)
   return /^-?\d+$/.test(value) && Number.isFinite(parsed) && Number.isInteger(parsed)
@@ -98,24 +112,47 @@ function NumericSettingControl({
   onCommit: () => void
 }) {
   const sliderMin = setting.type === 'float' ? FLOAT_SLIDER_MIN : INTEGER_SLIDER_MIN
+  const sliderMax = setting.key === 'CraftingTimeMultiplier' ? 5 : NUMERIC_SLIDER_MAX
+  const showSlider = setting.key !== 'BaseBackupToolTimeRestriction'
   const parsedValue = Number(value)
   const sourceValue = Number(setting.value)
   const sliderSource = Number.isFinite(parsedValue)
     ? parsedValue
     : (Number.isFinite(sourceValue) ? sourceValue : sliderMin)
-  const sliderValue = Math.min(NUMERIC_SLIDER_MAX, Math.max(sliderMin, sliderSource))
+  const sliderValue = Math.min(sliderMax, Math.max(sliderMin, sliderSource))
   const belowSliderRange = Number.isFinite(parsedValue) && parsedValue < sliderMin
-  const aboveSliderRange = Number.isFinite(parsedValue) && parsedValue > NUMERIC_SLIDER_MAX
+  const aboveSliderRange = Number.isFinite(parsedValue) && parsedValue > sliderMax
   const sliderStep = setting.type === 'int' ? 1 : 0.1
   const inputStep = setting.type === 'int' ? 1 : 'any'
-  const rangeDescription = `${sliderMin} to ${NUMERIC_SLIDER_MAX}`
+  const rangeDescription = `${sliderMin} to ${sliderMax}`
   const sliderDisplayValue = setting.type === 'float'
-    ? sliderValue.toFixed(FLOAT_DECIMAL_PLACES)
+    ? String(Number(sliderValue.toFixed(FLOAT_DECIMAL_PLACES)))
     : String(sliderValue)
+  const controls = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const element = controls.current
+    if (!element) return
+    const onWheel = (event: WheelEvent) => {
+      const input = event.target
+      if (disabled || event.ctrlKey || event.metaKey || !(input instanceof HTMLInputElement) || input !== document.activeElement
+        || !['number', 'range'].includes(input.type) || !event.deltaY || !value.trim()) return
+      const current = Number(input.type === 'range' ? input.value : value)
+      if (!Number.isFinite(current)) return
+      event.preventDefault()
+      const next = current + (event.deltaY < 0 ? sliderStep : -sliderStep)
+      const bounded = input.type === 'range' ? Math.min(sliderMax, Math.max(sliderMin, next)) : next
+      onChange(setting.type === 'float' ? bounded.toFixed(FLOAT_DECIMAL_PLACES) : String(bounded))
+    }
+    // Native non-passive handling prevents a single wheel event from both
+    // editing a focused control and scrolling the page / taking a browser step.
+    element.addEventListener('wheel', onWheel, { passive: false })
+    return () => element.removeEventListener('wheel', onWheel)
+  }, [disabled, onChange, setting.type, sliderMax, sliderMin, sliderStep, value])
 
   return (
-    <div className="flex w-full min-w-0 flex-wrap items-center justify-end gap-2">
-      {setting.valid && value.trim() !== '' && (
+    <div ref={controls} className="flex w-full min-w-0 flex-wrap items-center justify-end gap-2">
+      {showSlider && setting.valid && value.trim() !== '' && (
         <div className="flex min-w-0 flex-[1_1_220px] items-center gap-2">
           <input
             aria-label={`${setting.label} slider, range ${rangeDescription}`}
@@ -123,8 +160,9 @@ function NumericSettingControl({
               ? `${sliderValue}, slider ${aboveSliderRange ? 'maximum' : 'minimum'}; exact value ${value} is preserved`
               : sliderDisplayValue}
             type="range"
+            data-settings-fine-wheel="true"
             min={sliderMin}
-            max={NUMERIC_SLIDER_MAX}
+            max={sliderMax}
             step={sliderStep}
             value={sliderValue}
             onChange={event => onChange(setting.type === 'float'
@@ -141,23 +179,24 @@ function NumericSettingControl({
               : undefined}
           >
             {aboveSliderRange
-              ? `${NUMERIC_SLIDER_MAX} / ${NUMERIC_SLIDER_MAX} max`
+              ? `${sliderMax} / ${sliderMax} max`
               : belowSliderRange
-                ? `${sliderDisplayValue} / ${NUMERIC_SLIDER_MAX} min`
-                : `${sliderDisplayValue} / ${NUMERIC_SLIDER_MAX}`}
+                ? `${sliderDisplayValue} / ${sliderMax} min`
+                : `${sliderDisplayValue} / ${sliderMax}`}
           </span>
         </div>
       )}
       <input
         aria-label={`${setting.label} exact value`}
         type="number"
+        data-settings-fine-wheel="true"
         inputMode={setting.type === 'int' ? 'numeric' : 'decimal'}
         step={inputStep}
         value={value}
         onChange={event => onChange(event.target.value)}
         onBlur={onCommit}
         disabled={disabled}
-        title={`Exact value ${value}. Values outside the slider's ${rangeDescription} convenience range remain unchanged.`}
+        title={showSlider ? `Exact value ${value}. Values outside the slider's ${rangeDescription} convenience range remain unchanged.` : 'Backup window in hours. No documented maximum; existing values are preserved.'}
         className="w-28 max-w-full shrink-0 border border-border bg-surface px-2 py-1 text-right font-mono text-xs tabular-nums text-text focus:outline-none focus:ring-2 focus:ring-ibad disabled:cursor-not-allowed disabled:opacity-60"
       />
     </div>
@@ -173,6 +212,7 @@ export function OfficialRetailServerSettingsCard({
   statusRefreshKey?: string
   onActionStateChange?: (busy: boolean) => void
 }) {
+  const coordinated = useContext(SettingsApplyContext)
   const [state, setState] = useState<RetailServerSettingsResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -183,8 +223,9 @@ export function OfficialRetailServerSettingsCard({
     sequence: 0,
     controller: null,
   })
+  const automaticRefreshKey = coordinated ? undefined : statusRefreshKey
 
-  const load = async () => {
+  const load = async (source?: 'operator') => {
     if (!vmRunning) return
     const sequence = loadRequest.current.sequence + 1
     loadRequest.current.sequence = sequence
@@ -196,12 +237,13 @@ export function OfficialRetailServerSettingsCard({
     setError(null)
     setMessage(null)
     try {
-      const next = await getRetailServerSettings(controller.signal)
+      const next = await getRetailServerSettings(controller.signal, source)
       if (controller.signal.aborted || sequence !== loadRequest.current.sequence) return
       setState(next)
       setValues(Object.fromEntries(
         (next.settings ?? []).map(setting => [setting.key, normalizeSettingValue(setting, setting.value)]),
       ))
+      if (source === 'operator') setMessage('Current YAML settings loaded as a draft. Save writes them into the Linux UserSettings file.')
     } catch (e) {
       if (controller.signal.aborted || sequence !== loadRequest.current.sequence) return
       setError(e instanceof Error ? e.message : String(e))
@@ -216,11 +258,12 @@ export function OfficialRetailServerSettingsCard({
 
   useEffect(() => {
     void load()
+    const requests = loadRequest.current
     // The card owns its endpoint so it can move to a dedicated page without
     // changing the Retail settings API or coupling to legacy Game Config state.
+    return () => requests.controller?.abort()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    return () => loadRequest.current.controller?.abort()
-  }, [vmRunning, statusRefreshKey])
+  }, [vmRunning, automaticRefreshKey])
 
   const groups = useMemo(() => {
     const grouped = new Map<string, RetailServerSetting[]>()
@@ -238,10 +281,12 @@ export function OfficialRetailServerSettingsCard({
         current: normalizeSettingValue(setting, setting.value),
         draft: normalizeSettingValue(setting, values[setting.key] ?? setting.value),
       }))
-      .filter(({ setting, current, draft }) => setting.editable && draft !== current)
+      .filter(({ setting, current, draft }) =>
+        (setting.editable || isDefaultSettingUpdate(setting, draft)) && draft !== current,
+      )
       .map(({ setting, draft }) => [setting.key, draft]),
   ), [state, values])
-  const dirtyCount = Object.keys(updates).length
+  const dirtyCount = Object.keys(updates).length + (state?.operatorRevision ? 1 : 0)
   const draftValidationErrors = useMemo(() => Object.fromEntries(
     (state?.settings ?? [])
       .filter(setting => setting.editable)
@@ -258,38 +303,42 @@ export function OfficialRetailServerSettingsCard({
     && dirtyCount > 0
     && !hasDraftValidationErrors
     && !saving
+    && !loading
 
   const applyDefaults = () => {
-    if (!state?.available || !state.target.stopped || state.target.serverPodCount !== 0 || saving) return
+    if (!state?.available || (!coordinated && (!state.target.stopped || state.target.serverPodCount !== 0)) || saving) return
     setValues(previous => {
       const next = { ...previous }
       for (const setting of state.settings) {
         const guidance = RETAIL_SETTING_GUIDANCE[setting.key]
-        if (setting.supported && setting.editable && guidance) {
+        if (setting.supported && guidance
+          && (setting.editable || isDefaultSettingUpdate(setting, guidance.defaultValue))) {
           next[setting.key] = normalizeSettingValue(setting, guidance.defaultValue)
         }
       }
       return next
     })
     setError(null)
-    setMessage('Default settings loaded as a draft. Review the changes, then use Save to apply them.')
+    setMessage('Default settings and Custom difficulty loaded as a draft. Review the changes, then use Save to apply them.')
   }
 
-  const save = async () => {
-    if (!state?.revision || !canSave) return
+  const save = async (fromReview = false) => {
+    if (!state?.revision || (!fromReview && !canSave)) return
     onActionStateChange?.(true)
     setSaving(true)
     setError(null)
     setMessage(null)
     try {
-      const result = await saveRetailServerSettings(state.revision, updates)
+      const result = await saveRetailServerSettings(state.revision, updates, state.operatorRevision ?? undefined)
       const nextSettings = result.settings
       setState(previous => previous ? {
         ...previous,
         readOnly: false,
-        source: 'funcom-servergroup-user-ini-config',
-        authority: 'Funcom BattleGroup operator configuration',
+        source: 'funcom-persistent-user-settings',
+        authority: 'Linux UserSettings/UserServerCustomSettings.ini',
         revision: result.revision,
+        operatorRevision: null,
+        operatorMismatch: false,
         sectionFound: true,
         settings: nextSettings,
         target: {
@@ -308,32 +357,53 @@ export function OfficialRetailServerSettingsCard({
       setMessage(`${result.applied} setting${result.applied === 1 ? '' : 's'} saved with backup ${result.backup.path}. Start the battlegroup to apply them.`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+      if (fromReview) throw e
     } finally {
       setSaving(false)
       onActionStateChange?.(false)
     }
   }
 
+  useSettingsDraft('official', {
+    ready: state?.available === true && !!state.revision && !loading && !saving && !hasDraftValidationErrors,
+    changes: [
+      ...Object.entries(updates).map(([key, after]) => ({
+        label: state?.settings.find(setting => setting.key === key)?.label ?? key,
+        before: state?.settings.find(setting => setting.key === key)?.value ?? '', after: after.trim() ? after : 'Remove from server file',
+        target: 'Server · ServerCustomSettings.ini · after start',
+      })),
+      ...(state?.operatorRevision ? [{ label: 'Import current deployment settings', before: 'Persistent file', after: 'Reviewed deployment values', target: 'Server · ServerCustomSettings.ini' }] : []),
+    ],
+    validate: async () => {
+      const current = await getRetailServerSettings()
+      if (!current.available || current.revision !== state?.revision) {
+        throw new Error('Official settings changed outside this form. Refresh and review them before applying; your draft is still here.')
+      }
+    },
+    apply: () => save(true),
+  })
+
   return (
     <CollapsibleCard
       id="gameconfig.officialRetailServerSettings"
       icon="ServerCog"
       iconClassName="text-accent-bright shrink-0"
-      title="Official Retail Server Settings"
+      title="Official server settings"
       titleClassName="text-sm font-semibold text-text"
       className="mb-4 border-accent/30"
-      headerClassName="px-4 pt-4 pb-2"
+      headerClassName="flex-wrap px-4 pt-4 pb-2"
+      headerRightClassName="flex w-full flex-wrap items-center gap-2"
       bodyClassName="px-4 pb-4"
       headerRight={(
         <>
-          <span className="pill-info" title="Saved through Funcom's BattleGroup operator configuration">
-            <Icon name="ShieldCheck" size={12} /> Operator managed
+          <span className="pill-info" title="Reads and saves the persistent Linux UserSettings file">
+            <Icon name="ShieldCheck" size={12} /> Linux file
           </span>
           <button
             type="button"
             className="btn-secondary"
             onClick={() => void load()}
-            disabled={!vmRunning || loading}
+            disabled={!vmRunning || loading || saving || dirtyCount > 0}
           >
             <Icon name={loading ? 'Loader2' : 'RefreshCw'} size={14} className={loading ? 'animate-spin' : ''} />
             Refresh
@@ -342,36 +412,57 @@ export function OfficialRetailServerSettingsCard({
             type="button"
             className="btn-secondary"
             onClick={applyDefaults}
-            disabled={!state?.available || !state.target.stopped || state.target.serverPodCount !== 0 || saving}
-            title="Load Funcom Patch 1.5 defaults into this draft without saving"
+            disabled={!state?.available || (!coordinated && (!state.target.stopped || state.target.serverPodCount !== 0)) || saving || loading}
+            title="Draft Custom difficulty and documented defaults, including missing settings, without saving"
           >
             <Icon name="RotateCcw" size={14} />
             Default Settings
           </button>
           <button
             type="button"
+            className="btn-secondary"
+            onClick={() => void load('operator')}
+            disabled={!vmRunning || loading || saving || dirtyCount > 0 || !state?.target.upstreamConfigured}
+            title="Read current YAML settings as a draft; Save writes them into the Linux UserSettings file"
+          >
+            <Icon name="Download" size={14} />
+            Read current settings
+          </button>
+          {dirtyCount > 0 && <button type="button" className="btn-secondary" disabled={saving || loading} onClick={() => {
+            setValues(Object.fromEntries((state?.settings ?? []).map(setting => [setting.key, normalizeSettingValue(setting, setting.value)])))
+            if (state?.operatorRevision) { void load() }
+          }}>Discard draft</button>}
+          <button
+            type="button"
             className="btn-primary"
-            onClick={() => void save()}
-            disabled={!canSave}
+            onClick={() => coordinated ? coordinated.review() : void save()}
+            disabled={coordinated ? dirtyCount === 0 || loading || saving || hasDraftValidationErrors : !canSave}
             title={hasDraftValidationErrors
               ? 'Correct invalid setting values before saving'
               : state?.target.stopped
-                ? 'Save changed settings to Funcom operator configuration'
+                ? 'Save changed settings to the Linux UserSettings file'
               : 'Stop the battlegroup fully before saving'}
           >
             <Icon name={saving ? 'Loader2' : 'Save'} size={14} className={saving ? 'animate-spin' : ''} />
-            {saving ? 'Saving…' : `Save${dirtyCount ? ` (${dirtyCount})` : ''}`}
+            {saving ? 'Saving…' : `${coordinated ? 'Review & Apply' : 'Save'}${dirtyCount ? ` (${dirtyCount})` : ''}`}
           </button>
         </>
       )}
     >
       <div className="mb-3 rounded-lg border border-warning/30 bg-warning/5 p-3 text-xs text-text-muted">
-        <strong className="text-text">Funcom operator-managed settings.</strong>{' '}
-        These values drive the greyed-out multiplayer Server Settings preview. Direct file edits are regenerated.
-        DST saves only through the BattleGroup&apos;s official <span className="font-mono">global.userIniConfig</span>{' '}
-        source, while the battlegroup is fully stopped.
+        <strong className="text-text">Official server controls · all players.</strong>{' '}
+        Refresh reads manual edits to <span className="font-mono">UserSettings/UserServerCustomSettings.ini</span>.
+        {coordinated ? ' Edit a draft, then Review & Apply saves it while the battlegroup is fully stopped.' : ' Save writes changes to that same file while the battlegroup is fully stopped.'}
+        {' '}Starting the battlegroup synchronizes those values to its Linux runtime configuration when DST management is enabled.
       </div>
-      {state?.available && !state.target.stopped && (
+      {state?.operatorMismatch && (
+        <div className="mb-3 rounded-lg border border-warning/30 bg-warning/5 p-3 text-xs text-warning" role="status">
+          {state.operatorRevision
+            ? 'Current YAML settings are loaded as a draft. Review them, then Save to write them into the Linux UserSettings file.'
+            : 'The Linux UserSettings file and current YAML settings differ. Read current settings first to review the YAML values before saving.'}
+        </div>
+      )}
+      {state?.available && !state.target.stopped && !coordinated && (
         <div className="mb-3 border-y border-border py-2 text-xs text-text-muted">
           Stop the battlegroup to unlock edits. Saving creates a timestamped copy of the complete current file;
           start the battlegroup afterward to mount the new settings into every game pod.
@@ -406,21 +497,18 @@ export function OfficialRetailServerSettingsCard({
       {state?.available && (
         <>
           <div className="mb-3 grid gap-1 text-[11px] text-text-dim">
-            {!state.target.upstreamConfigured && (
-              <div><span className="text-text-muted">Generated File Browser output:</span> <span className="font-mono">{state.target.path}</span></div>
-            )}
+            <div><span className="text-text-muted">Authoritative Linux file:</span> <span className="font-mono">{state.target.path}</span></div>
             <div><span className="text-text-muted">Game pod:</span> <span className="font-mono">{state.target.gamePath}</span></div>
             <div>
               <span className="text-text-muted">Source:</span> {state.authority}
               {state.modifiedAt ? ` • updated ${new Date(state.modifiedAt).toLocaleString()}` : ''}
             </div>
-            <div>
-              <span className="text-text-muted">Durable operator field:</span>{' '}
-              <span className="font-mono">{state.target.upstreamField}</span>{' '}
-              <span className={state.target.upstreamConfigured ? 'text-success' : 'text-warning'}>
-                • {state.target.upstreamConfigured ? 'configured' : 'not configured'}
-              </span>
-            </div>
+            {state.source === 'existing-operator-settings-pending-migration' && (
+              <div className="text-warning">
+                Existing YAML settings are preserved. The next stopped-battlegroup Save or Start backs them up
+                and migrates them into the Linux file before file edits become authoritative.
+              </div>
+            )}
             {state.target.upstreamConfigured && (
               <div>
                 <span className="text-text-muted">Operator mount:</span>{' '}
@@ -438,7 +526,7 @@ export function OfficialRetailServerSettingsCard({
           {state.settings.some(setting => setting.present === false) && (
             <div className="mb-3 border-y border-border py-2 text-xs text-text-muted">
               Settings marked Not configured are absent from the source file; their effective game values are not known.
-              Enter a value or use Default Settings to draft the documented defaults for editable settings.
+              Enter a value or use Default Settings to draft Custom difficulty and the documented defaults, including missing settings.
               Only drafted changes are added when you save; no settings are written automatically.
             </div>
           )}
@@ -493,7 +581,7 @@ export function OfficialRetailServerSettingsCard({
                             aria-label={setting.label}
                             value={values[setting.key] ?? setting.value}
                             onChange={event => setValues(previous => ({ ...previous, [setting.key]: event.target.value }))}
-                            disabled={!state.target.stopped || state.target.serverPodCount !== 0 || saving}
+                            disabled={(!coordinated && (!state.target.stopped || state.target.serverPodCount !== 0)) || saving}
                             className="min-w-28 border border-border bg-surface px-2 py-1 text-xs font-semibold text-text disabled:cursor-not-allowed disabled:opacity-60"
                           >
                             {setting.present === false && <option value="">Not configured</option>}
@@ -505,7 +593,7 @@ export function OfficialRetailServerSettingsCard({
                             aria-label={setting.label}
                             value={values[setting.key] ?? setting.value}
                             onChange={event => setValues(previous => ({ ...previous, [setting.key]: event.target.value }))}
-                            disabled={!state.target.stopped || state.target.serverPodCount !== 0 || saving}
+                            disabled={(!coordinated && (!state.target.stopped || state.target.serverPodCount !== 0)) || saving}
                             className="min-w-36 border border-border bg-surface px-2 py-1 text-xs text-text disabled:cursor-not-allowed disabled:opacity-60"
                           >
                             {setting.present === false && <option value="">Not configured</option>}
@@ -515,7 +603,7 @@ export function OfficialRetailServerSettingsCard({
                           <NumericSettingControl
                             setting={setting}
                             value={values[setting.key] ?? setting.value}
-                            disabled={!state.target.stopped || state.target.serverPodCount !== 0 || saving}
+                            disabled={(!coordinated && (!state.target.stopped || state.target.serverPodCount !== 0)) || saving}
                             onChange={value => setValues(previous => ({ ...previous, [setting.key]: value }))}
                             onCommit={() => setValues(previous => ({
                               ...previous,
@@ -524,7 +612,8 @@ export function OfficialRetailServerSettingsCard({
                           />
                         ) : (
                           <span className="min-w-20 border border-border bg-surface px-2 py-1 text-center text-xs font-semibold text-text">
-                            {setting.displayValue}
+                            {isDefaultSettingUpdate(setting, values[setting.key] ?? '')
+                              ? values[setting.key] : setting.displayValue}
                           </span>
                         )}
                       </div>

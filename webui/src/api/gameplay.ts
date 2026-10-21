@@ -25,6 +25,7 @@ export interface InventoryItemMetadata {
   volume: number
   vendorPrice: number
   isGradeable: boolean
+  baseMaxDurability?: number
 }
 
 export interface SharedInventoryItem {
@@ -513,6 +514,10 @@ export function refreshSharedInventory() {
   })
 }
 
+export function getInventoryPlayers() {
+  return api<{ players: { id: number; name: string }[] }>('/api/v1/inventory/players')
+}
+
 export function getSharedInventoryOccurrences(query: SharedInventoryOccurrencesQuery) {
   return api<SharedInventoryOccurrencesResponse>(
     `/api/v1/inventory/items/occurrences${qs({
@@ -761,6 +766,7 @@ export interface CurrencyBalance {
 }
 
 export interface PlayerDetailResponse {
+  inventory_has_more?: boolean
   inventory: InventoryItem[]
   specs: SpecTrack[]
   currency: CurrencyBalance[]
@@ -778,9 +784,9 @@ export function getPlayers(demo?: boolean) {
   return api<PlayersResponse>(`/api/gameplay/players${qs({ demo: demo ? 1 : undefined })}`)
 }
 
-export function getPlayerDetail(pawnId: number, controllerId: number, demo?: boolean) {
+export function getPlayerDetail(pawnId: number, controllerId: number, demo?: boolean, inventoryOffset?: number, inventoryKind: 'item' | 'emote' | 'contract' = 'item') {
   return api<PlayerDetailResponse>(`/api/gameplay/players/detail${qs({
-    pawn: pawnId, controller: controllerId, demo: demo ? 1 : undefined,
+    pawn: pawnId, controller: controllerId, demo: demo ? 1 : undefined, inventory_offset: inventoryOffset, inventory_kind: inventoryOffset === undefined ? undefined : inventoryKind,
   })}`)
 }
 
@@ -1410,6 +1416,12 @@ export function renameStorage(containerId: number, name: string) {
   })
 }
 
+export function repairStorageContents(containerId: number) {
+  return api<WriteResult>('/api/gameplay/storage/repair-all', {
+    method: 'POST', body: JSON.stringify({ container_id: containerId }),
+  })
+}
+
 // Trigger a client-side download of an exported blueprint/base JSON file.
 export function downloadBlueprintFile(blueprint: BlueprintFile, filename: string) {
   const blob = new Blob([JSON.stringify(blueprint, null, 2)], { type: 'application/json' })
@@ -1520,7 +1532,7 @@ export function getItemCatalog(): Promise<CatalogItem[]> {
 // by GET /api/catalog/cosmetics (from gameplay-item-data names). These aren't in
 // the standard item catalog; granting one delivers it via the normal give-item
 // path so the player unlocks the appearance.
-export interface CosmeticEntry { template: string; name: string; group: string }
+export interface CosmeticEntry { template: string; name: string; group: string; bulk_building_set?: boolean; bulk_exclusion?: string }
 interface CosmeticsResponse { templates?: CosmeticEntry[]; total?: number }
 let _cosmeticsCache: CosmeticEntry[] | null = null
 let _cosmeticsPromise: Promise<CosmeticEntry[]> | null = null
@@ -1536,15 +1548,33 @@ export function getHouseSwatchCosmetics(catalog: CosmeticEntry[], kind: HouseSwa
     .sort((a, b) => a.name.localeCompare(b.name) || a.template.localeCompare(b.template))
 }
 
+export function getBuildingSetCosmetics(catalog: CosmeticEntry[]): CosmeticEntry[] {
+  return catalog.filter(entry => entry.bulk_building_set === true)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.template.localeCompare(b.template))
+}
+
+export type SkinKind = 'armor' | 'weapon' | 'vehicle' | 'dyes'
+export function getSkinCosmetics(catalog: CosmeticEntry[], kind: SkinKind): CosmeticEntry[] {
+  const group = { armor: 'Armor & Suit Sets', weapon: 'Weapon Skins', vehicle: 'Vehicle Skins', dyes: 'Swatches (Dyes)' }[kind]
+  return catalog.filter(entry => entry.group === group && !entry.bulk_exclusion)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.template.localeCompare(b.template))
+}
+export function grantSkins(pawnId: number, accountId: number, kind: SkinKind) {
+  return api<WriteResult>('/api/gameplay/players/grant-skins', {
+    method: 'POST', body: JSON.stringify({ pawn_id: pawnId, account_id: accountId, kind }),
+  })
+}
+
 export function filterCosmeticsCatalog(catalog: CosmeticEntry[], query: string): CosmeticEntry[] {
   const q = query.trim().toLowerCase()
   if (!q) return catalog
-  const normalizedQuery = q.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()
+  const normalize = (value: string) => value.replace(/[’']/g, '').replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()
+  const normalizedQuery = normalize(q)
   return catalog.filter(entry => {
     const fields = [entry.name, entry.template, entry.group]
     return fields.some(field => {
       const lower = field.toLowerCase()
-      const normalized = lower.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()
+      const normalized = normalize(lower)
       return lower.includes(q) || (normalizedQuery.length > 0 && normalized.includes(normalizedQuery))
     })
   })
@@ -1568,13 +1598,15 @@ export function getCosmeticsCatalog(): Promise<CosmeticEntry[]> {
 export interface OwnedCosmeticsResponse {
   account_id: number
   owned: string[]
+  unlocked?: string[]
+  pending?: string[]
   total: number
   source: DataSource
   liveError?: string
 }
 
-export function getPlayerOwnedCosmetics(accountId: number) {
-  return api<OwnedCosmeticsResponse>(`/api/gameplay/players/cosmetics-owned${qs({ account_id: accountId })}`)
+export function getPlayerOwnedCosmetics(accountId: number, signal?: AbortSignal) {
+  return api<OwnedCosmeticsResponse>(`/api/gameplay/players/cosmetics-owned${qs({ account_id: accountId })}`, { signal })
 }
 
 // ===========================================================================
@@ -2128,8 +2160,8 @@ export interface VehicleDeletionQueue {
   last_error?: string
 }
 
-export function getVehicleFleet() {
-  return api<{ vehicles: VehicleFleetRow[]; total: number; source: DataSource; observed_at?: string; stale_after_seconds?: number; database_scope?: string }>('/api/gameplay/vehicles')
+export function getVehicleFleet(playerId?: number) {
+  return api<{ vehicles: VehicleFleetRow[]; total: number; source: DataSource; observed_at?: string; stale_after_seconds?: number; database_scope?: string }>(`/api/gameplay/vehicles${qs({ player_id: playerId })}`)
 }
 
 export function getVehicleIntegrity(vehicleId: number) {
@@ -2263,6 +2295,12 @@ export interface HouseSwatchGrantResponse extends WriteResult {
 export function grantHouseSwatches(pawnId: number, accountId: number, kind: HouseSwatchKind = 'all') {
   return api<HouseSwatchGrantResponse>('/api/gameplay/players/grant-house-swatches', {
     method: 'POST', body: JSON.stringify({ pawn_id: pawnId, account_id: accountId, kind }),
+  })
+}
+
+export function grantBuildingSets(pawnId: number, accountId: number) {
+  return api<WriteResult>('/api/gameplay/players/grant-building-sets', {
+    method: 'POST', body: JSON.stringify({ pawn_id: pawnId, account_id: accountId }),
   })
 }
 
@@ -2502,6 +2540,11 @@ export function unlockTrainer(accountId: number, job: string) {
     method: 'POST', body: JSON.stringify({ account_id: accountId, job }),
   })
 }
+export function unlockTestingStations(pawnId: number, controllerId: number, accountId: number, station: string) {
+  return api<WriteResult>('/api/gameplay/players/unlock-testing-stations', {
+    method: 'POST', body: JSON.stringify({ pawn_id: pawnId, controller_id: controllerId, account_id: accountId, station, confirm: 'UNLOCK TESTING STATIONS' }),
+  })
+}
 export function resetTrainerSkills(accountId: number, job: string) {
   return api<WriteResult>('/api/gameplay/players/reset-job-skills', {
     method: 'POST', body: JSON.stringify({ account_id: accountId, job }),
@@ -2733,5 +2776,19 @@ export function saveWelcomeBack(patch: {
   return api<WelcomeBackState>('/api/gameplay/welcome-back', {
     method: 'PUT',
     body: JSON.stringify(patch),
+  })
+}
+export function grantReviewedCustomization(pawn_id: number, controller_id: number, account_id: number, customizationId = 'StillSCharDyepackImota') {
+  return api<WriteResult>('/api/gameplay/players/reviewed-customization', {
+    method: 'POST', body: JSON.stringify({ pawn_id, controller_id, account_id, customizationId, confirm: 'GRANT REVIEWED CUSTOMIZATION' }),
+  })
+}
+export function getReviewedGrantCounts(pawn_id: number, controller_id: number, account_id: number, customizationId: string) {
+  return api<{result: {total: number; owned: number; remaining: number}}>('/api/gameplay/players/reviewed-customization', {
+    method: 'POST', body: JSON.stringify({pawn_id, controller_id, account_id, customizationId, checkOnly: true}),
+  }).then(response => {
+    const counts = response.result
+    if (!counts || ![counts.total, counts.owned, counts.remaining].every(Number.isFinite)) throw new Error('Character counts unavailable')
+    return counts
   })
 }

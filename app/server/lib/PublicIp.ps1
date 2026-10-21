@@ -290,6 +290,21 @@ function Invoke-DunePublicIpRemoteScript {
     return $clean
 }
 
+function Invoke-DunePublicIpWatchdogRefresh {
+    param([Parameter(Mandatory)][string]$Ip)
+    $installerPath = Join-Path $PSScriptRoot '..\..\resources\remote-scripts\dune-dnat-watch-install.sh'
+    if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+        throw 'Bundled forwarding helper is missing. Repair the DST installation before updating the IP.'
+    }
+    $installer = [IO.File]::ReadAllText($installerPath) -replace "`r", ''
+    $payload = "sudo -n sh -s <<'DST_DNAT_INSTALLER'`n" + $installer + "`nDST_DNAT_INSTALLER`n"
+    $raw = Invoke-DunePublicIpRemoteScript -Ip $Ip -Script $payload -TimeoutSec 45
+    if ($raw -notmatch '(?m)^DUNE_DNAT_WATCH_OK\s*$') {
+        throw 'Forwarding helper refresh did not verify healthy. The IP update was stopped before changing network settings.'
+    }
+    return $raw
+}
+
 function New-DunePublicIpStepResult {
     param([string]$Id, [string]$Label, [string]$Status, [string]$Detail = '', [string]$Raw = '')
     return @{ id=$Id; label=$Label; status=$Status; detail=$Detail; raw=$Raw }
@@ -318,39 +333,6 @@ function Get-DunePublicIpStatus {
         } catch {}
     }
     return $status
-}
-
-# ----------------------------------------------------------------------------
-# Login distribution across game pods, parsed from the per-pod probe output.
-# Split out as a pure function so the collapsed-port-range decision is testable
-# without SSH, a cluster, or a DB.
-#
-# A collapsed forward looks like this: every external port in 7777-7810 is sent
-# to ONE internal port, so all clients arrive on whichever map owns that port.
-# The director granted them a different map/port, finds no matching completion
-# record, and refuses the login with Funcom's own `[Failure] FlowType:"Login"`
-# (surfaced to players as 2G2). Both conditions are required — logins funnelled
-# into a single pod AND Funcom actually rejecting them — so a quiet server, or a
-# server where everyone happens to be on one map legitimately, never fires it.
-#
-# `failures` is a presence signal, NOT a count of affected players: Funcom logs
-# that same failure line twice per rejection, so it runs at roughly double the
-# real number of attempts. Never present it to the user as an attempt count and
-# never build a ratio or threshold on it.
-# ----------------------------------------------------------------------------
-function Get-DuneP34LoginDistribution {
-    param([string]$ProbeOutput)
-    $pods = New-Object System.Collections.Generic.List[string]
-    $failures = 0
-    foreach ($m in [regex]::Matches([string]$ProbeOutput, 'POD=(\S+)\s+LOGIN=(\d+)\s+FAIL=(\d+)')) {
-        if ([int]$m.Groups[2].Value -gt 0) { $pods.Add($m.Groups[1].Value) | Out-Null }
-        $failures += [int]$m.Groups[3].Value
-    }
-    return [ordered]@{
-        pods      = @($pods)
-        failures  = $failures
-        collapsed = ($failures -gt 0 -and $pods.Count -eq 1)
-    }
 }
 
 function Resolve-DunePublicIpDiagnosticTarget {
@@ -386,6 +368,34 @@ function Resolve-DunePublicIpDiagnosticTarget {
 # this same Settings card, which rewrites the battlegroup CR + K3s ExternalIP
 # and restarts the servers so they re-register farm_state with the right IP.
 # ----------------------------------------------------------------------------
+function Get-DuneWidgetStatus {
+    # One narrow game-state read shared by all widget viewers. No diagnostics,
+    # inventory projection or autonomous refresh worker.
+    Invoke-DunePlatformSingleFlight -Key 'widget:status' -ResultReuseSec 15 -TimeoutSec 15 -Script {
+        $ctx = Get-DuneDbContext
+        if (-not $ctx.ok) { throw $ctx.message }
+        $csv = Invoke-DuneSqlRaw -Ip $ctx.ip -Sql 'SELECT map, ready, alive, server_id IN (SELECT * FROM dune.active_server_ids) AS is_current FROM dune.farm_state ORDER BY map;' -Csv -TimeoutSec 10
+        if (Test-DunePsqlError -Output $csv) { throw (Get-DunePsqlErrorMessage -Output $csv) }
+        $rows = @($csv -split "`r?`n" | Where-Object { $_ -ne '' } | ConvertFrom-Csv)
+        $maps = @(foreach ($group in ($rows | Group-Object map)) {
+            $current = @($group.Group | Where-Object { [string]$_.is_current -eq 't' })
+            if (-not $current.Count) {
+                # Retired instances are history, not additional live maps. Keep
+                # core-map outages visible even when their DB session is gone.
+                if ($group.Name -in @('DeepDesert_1', 'Overmap', 'Survival_1')) {
+                    @{ map = [string]$group.Name; ready = $false; alive = $false }
+                }
+                continue
+            }
+            # Prefer a healthy current instance, without combining readiness
+            # from one server with liveness from a different server.
+            $chosen = $current | Sort-Object @{ Expression = { [string]$_.alive -eq 't' }; Descending = $true }, @{ Expression = { [string]$_.ready -eq 't' }; Descending = $true } | Select-Object -First 1
+            @{ map = [string]$group.Name; ready = ([string]$chosen.ready -eq 't'); alive = ([string]$chosen.alive -eq 't') }
+        })
+        return @{ observedAt = [DateTime]::UtcNow.ToString('o'); maps = $maps }
+    }
+}
+
 function Get-DuneP34Diagnostic {
     $result = [ordered]@{
         ok             = $false
@@ -405,14 +415,6 @@ function Get-DuneP34Diagnostic {
         staleK3sIp     = $false
         vmPublicIpUsable = $false
         serversReady   = $true
-        # Collapsed port-forward range: the router maps the external 7777-7810
-        # range onto ONE internal port, so every client lands on whichever map
-        # owns that port. The director issued a grant for a different map/port,
-        # finds no matching completion record, and refuses the login with 2G2.
-        # Detected from Funcom's own login-stage failure, never from a threshold.
-        loginPods      = @()
-        loginFailures  = 0
-        portsCollapsed = $false
         verdict        = 'unknown'
         summary        = $null
         error          = $null
@@ -599,41 +601,9 @@ fi
         default        { '' }
     }
 
-    # Collapsed port-forward range. When every external port in 7777-7810 is
-    # forwarded to ONE internal port, all clients arrive on whichever map owns
-    # that port. The director granted them a different map/port, so it finds no
-    # completion record and refuses the login with Funcom's own
-    # `[Failure] FlowType:"Login"` / `sb2G2$` error. We read that failure rather
-    # than inferring anything: ports being open is not the same as ports being
-    # forwarded to the right place, so the reachability checks above pass while
-    # nobody can actually join. Requires more than one game pod - on a
-    # single-map server every login landing on one pod is correct, not a fault.
-    if (@($maps).Count -gt 1) {
-        $logProbe = @'
-NS=$(sudo kubectl get battlegroup -A --no-headers -o custom-columns=:metadata.namespace 2>/dev/null | head -1)
-[ -z "$NS" ] && exit 0
-for p in $(sudo kubectl get pods -n "$NS" --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -- "-sg-"); do
-  L=$(sudo kubectl logs -n "$NS" "$p" --tail=3000 2>/dev/null | grep -c "flowtype=Login")
-  F=$(sudo kubectl logs -n "$NS" "$p" --tail=3000 2>/dev/null | grep -c '\[Failure\] FlowType:"Login"')
-  echo "POD=$p LOGIN=$L FAIL=$F"
-done
-'@ -replace "`r", ''
-        try {
-            $logRaw = (Invoke-V6Ssh -Ip $ctx.ip -Cmd $logProbe -TimeoutSec 45) -join "`n"
-            $collapse = Get-DuneP34LoginDistribution -ProbeOutput $logRaw
-            $result.loginPods = @($collapse.pods)
-            $result.loginFailures = [int]$collapse.failures
-            $result.portsCollapsed = [bool]$collapse.collapsed
-        } catch {}
-    }
-
-    # Verdict, most-actionable first.
-    if ($result.portsCollapsed) {
-        $onePod = @($result.loginPods)[0]
-        $result.verdict = 'ports-collapsed'
-        $result.summary = "Players are reaching this server, but every connection is arriving on a single port. Your maps each listen on their own port ($((@($maps | ForEach-Object { $_.port } | Sort-Object -Unique) -join ', '))), and the server hands each player the port for the map they are joining — but every login attempt landed on one map server ($onePod), so the server refused them. That refusal is the ""2G2"" error players see. This is a port-forwarding rule that sends the whole external UDP 7777-7810 range to one internal port: set the internal/local port range to 7777-7810 as well (or leave it blank) so each port maps straight through, then try joining again."
-    }
-    elseif ($result.datacenterPrivate) {
+    # Login log distribution does not establish router forwarding rules.
+    # Diagnose only the advertised addresses and readiness observed above.
+    if ($result.datacenterPrivate) {
         # The persistent root: the director is pinned to advertise a private/LAN
         # address to every client. Ranked first because it's actionable even when
         # the servers look "down" from outside, and it's the explanation behind a
@@ -787,6 +757,14 @@ function Invoke-DunePublicIpApply {
             $steps[$steps.Count - 1] = New-DunePublicIpStepResult 'preflight' 'Preflight host and VM' 'done' "VM $($vm.ip) reachable."
             & $pub
 
+            # Upgrade stale helpers before changing any IP surfaces. The worker
+            # follows subsequent ExternalIP changes and newly bound game ports.
+            $steps.Add((New-DunePublicIpStepResult 'forwarding' 'Prepare game connection forwarding' 'running' 'Refreshing game connection forwarding.')) | Out-Null
+            & $pub
+            $rawForwarding = Invoke-DunePublicIpWatchdogRefresh -Ip $vm.ip
+            $steps[$steps.Count - 1] = New-DunePublicIpStepResult 'forwarding' 'Prepare game connection forwarding' 'done' 'Game connection forwarding is ready for the IP update.' $rawForwarding
+            & $pub
+
             $hostRouteEnabled = Get-DunePublicIpHostRouteEnabled
             $hostRouteAction = if ($hostRouteEnabled) { "Adding route for $target." } else { "Removing the matching DST route for $target." }
             $steps.Add((New-DunePublicIpStepResult 'host-route' 'Reconcile Windows host route' 'running' $hostRouteAction)) | Out-Null
@@ -924,11 +902,14 @@ fi
 
 step runner
 runner=/usr/local/bin/k3s-custom-runner.sh
-target="dynamic_ip=$NEW_IP"
+# Keep the node/control-plane address on the VM's LAN. The public or relay
+# address belongs only to the external advertisement, including after reboot.
+target="dynamic_ip=$VM_IP"
+external_target="external_ip=$NEW_IP # DST_MANAGED_EXTERNAL_IP"
 if [ -f "$runner" ]; then
   sudo cp "$runner" "$runner.bak.$(date -u +%Y%m%d%H%M%S)"
   # DST_K3S_RUNNER_AWK_BEGIN
-  awk -v target="$target" '
+  awk -v target="$target" -v external_target="$external_target" '
     BEGIN { dynamic_done=0; exec_done=0 }
     /^dynamic_ip=/ {
       print target
@@ -941,7 +922,7 @@ if [ -f "$runner" ]; then
         print target
         dynamic_done=1
       }
-      print "external_ip=$dynamic_ip # DST_MANAGED_EXTERNAL_IP"
+      print external_target
       print
       exec_done=1
       next
@@ -955,7 +936,7 @@ if [ -f "$runner" ]; then
   sudo install -m 0755 /tmp/dst-runner "$runner"
   rm -f /tmp/dst-runner
   grep -F "$target" "$runner"
-  grep -F 'external_ip=$dynamic_ip # DST_MANAGED_EXTERNAL_IP' "$runner"
+  grep -F "$external_target" "$runner"
 fi
 
 step k3s
@@ -1232,58 +1213,6 @@ for POD in $(sudo kubectl get pods -n "$BG_NS" --no-headers -o custom-columns=':
   sudo kubectl delete pod -n "$BG_NS" "$POD" --wait=false 2>&1 | sed 's/^/  /'
 done
 
-step audit-ip-surfaces
-# Cross-place IP audit: verify every surface that should hold NEW_IP actually
-# does. Adds an authoritative check after the operator has had a chance to
-# reconcile (~10s post pod-delete). Reports AUDIT_OK or per-surface mismatches
-# so the PowerShell side can surface them to the user. Also flags CGNAT
-# (100.64.0.0/10) and private amqpAddress values -- the amqpAddress must be a
-# publicly routable IP so clients can queue to join. Requires jq.
-if command -v jq >/dev/null 2>&1; then
-  sleep 10  # give the operator a moment to repopulate status after pod deletes
-  AUDIT_MISMATCHES=0
-  AUDIT_REPORT=""
-
-  # Utility envs -- every HOST_DATACENTER_IP_ADDRESS should equal NEW_IP.
-  for u in director serverGateway textRouter; do
-    val=$(sudo kubectl get battlegroup "$BG_NAME" -n "$BG_NS" -o json 2>/dev/null | jq -r ".spec.utilities.$u.spec.envVars // [] | map(select(.name==\"HOST_DATACENTER_IP_ADDRESS\")) | .[0].value // \"MISSING\"")
-    if [ "$val" != "$NEW_IP" ]; then
-      AUDIT_REPORT="$AUDIT_REPORT  MISMATCH utilities.$u HOST_DATACENTER_IP_ADDRESS: got '$val' expected '$NEW_IP'\n"
-      AUDIT_MISMATCHES=$((AUDIT_MISMATCHES + 1))
-    fi
-  done
-
-  # amqpAddress (game + admin). host portion must equal NEW_IP.
-  for mq in game admin; do
-    val=$(sudo kubectl get battlegroup "$BG_NAME" -n "$BG_NS" -o json 2>/dev/null | jq -r ".status.utilities.messageQueues.statuses.$mq.amqpAddress // \"MISSING\"")
-    host=$(printf '%s' "$val" | cut -d: -f1)
-    if [ "$host" != "$NEW_IP" ]; then
-      AUDIT_REPORT="$AUDIT_REPORT  MISMATCH status.utilities.messageQueues.statuses.$mq.amqpAddress: got '$val' expected '$NEW_IP:*'\n"
-      AUDIT_MISMATCHES=$((AUDIT_MISMATCHES + 1))
-    fi
-    # Sora's rule: amqpAddress must be publicly routable (not private, not CGNAT).
-    case "$host" in
-      10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*)
-        AUDIT_REPORT="$AUDIT_REPORT  PRIVATE-AMQP-ADDR $mq.amqpAddress='$val' -- LAN address, players cannot join.\n"
-        AUDIT_MISMATCHES=$((AUDIT_MISMATCHES + 1))
-        ;;
-      100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*)
-        AUDIT_REPORT="$AUDIT_REPORT  CGNAT-AMQP-ADDR $mq.amqpAddress='$val' -- behind Carrier-Grade NAT (100.64.0.0/10); contact ISP.\n"
-        AUDIT_MISMATCHES=$((AUDIT_MISMATCHES + 1))
-        ;;
-    esac
-  done
-
-  if [ "$AUDIT_MISMATCHES" -eq 0 ]; then
-    echo "AUDIT_OK all IP surfaces match $NEW_IP"
-  else
-    printf 'AUDIT_MISMATCH count=%d\n' "$AUDIT_MISMATCHES"
-    printf '%b' "$AUDIT_REPORT"
-  fi
-else
-  echo "AUDIT_SKIP jq not available"
-fi
-
 step change-ip
 # LAST because this restarts the battlegroup, which cycles every game/gateway/
 # director/rmq pod and typically severs any stdio inherited from SSH. Firing
@@ -1381,6 +1310,51 @@ ALIAS_OK=no
 BGPHASE=$(sudo kubectl -n "$BG_NS" get battlegroup "$BG_NAME" -o jsonpath='{.status.phase}' 2>/dev/null || true)
 printf 'EXTERNALIP=%s\nALIAS_OK=%s\nBG_PHASE=%s\n' "$EXT" "$ALIAS_OK" "$BGPHASE"
 sudo kubectl -n "$BG_NS" get serverset 2>/dev/null | awk 'NR==1 || /survival-1|overmap|deepdesert-1/' || true
+# Audit the final advertised addresses after the detached restart has settled.
+if command -v jq >/dev/null 2>&1; then
+  AUDIT_MISMATCHES=0
+  AUDIT_REPORT=""
+
+  # Utility envs -- every HOST_DATACENTER_IP_ADDRESS should equal NEW_IP.
+  for u in director serverGateway textRouter; do
+    val=$(sudo kubectl get battlegroup "$BG_NAME" -n "$BG_NS" -o json 2>/dev/null | jq -r ".spec.utilities.$u.spec.envVars // [] | map(select(.name==\"HOST_DATACENTER_IP_ADDRESS\")) | .[0].value // \"MISSING\"")
+    if [ "$val" != "$NEW_IP" ]; then
+      AUDIT_REPORT="$AUDIT_REPORT  MISMATCH utilities.$u HOST_DATACENTER_IP_ADDRESS: got '$val' expected '$NEW_IP'\n"
+      AUDIT_MISMATCHES=$((AUDIT_MISMATCHES + 1))
+    fi
+  done
+
+  # amqpAddress (game + admin). host portion must equal NEW_IP.
+  for mq in game admin; do
+    val=$(sudo kubectl get battlegroup "$BG_NAME" -n "$BG_NS" -o json 2>/dev/null | jq -r ".status.utilities.messageQueues.statuses.$mq.amqpAddress // \"MISSING\"")
+    host=$(printf '%s' "$val" | cut -d: -f1)
+    if [ "$host" != "$NEW_IP" ]; then
+      AUDIT_REPORT="$AUDIT_REPORT  MISMATCH status.utilities.messageQueues.statuses.$mq.amqpAddress: got '$val' expected '$NEW_IP:*'\n"
+      AUDIT_MISMATCHES=$((AUDIT_MISMATCHES + 1))
+    fi
+    # Sora's rule: amqpAddress must be publicly routable (not private, not CGNAT).
+    case "$host" in
+      10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*)
+        AUDIT_REPORT="$AUDIT_REPORT  PRIVATE-AMQP-ADDR $mq.amqpAddress='$val' -- LAN address, players cannot join.\n"
+        AUDIT_MISMATCHES=$((AUDIT_MISMATCHES + 1))
+        ;;
+      100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*)
+        AUDIT_REPORT="$AUDIT_REPORT  CGNAT-AMQP-ADDR $mq.amqpAddress='$val' -- behind Carrier-Grade NAT (100.64.0.0/10); contact ISP.\n"
+        AUDIT_MISMATCHES=$((AUDIT_MISMATCHES + 1))
+        ;;
+    esac
+  done
+
+  if [ "$AUDIT_MISMATCHES" -eq 0 ]; then
+    echo "AUDIT_OK all IP surfaces match $NEW_IP"
+  else
+    printf 'AUDIT_MISMATCH count=%d\n' "$AUDIT_MISMATCHES"
+    printf '%b' "$AUDIT_REPORT"
+  fi
+else
+  echo "AUDIT_SKIP jq not available"
+fi
+
 echo "BGIP_VERIFY_DONE"
 '@
             $rawVerify = Invoke-DunePublicIpRemoteScript -Ip $vm.ip -Script $remoteVerify -Arguments @($target, $vm.ip, $bgNs, $bgName) -TimeoutSec 60
@@ -1397,7 +1371,7 @@ echo "BGIP_VERIFY_DONE"
             # value didn't reconcile cleanly. Non-fatal — reported but the
             # step still completes so the rest of the apply flow finishes.
             $bgStatus = 'done'
-            if ($rawMutate -match '(?m)^AUDIT_MISMATCH count=(\d+)') {
+            if ($rawVerify -match '(?m)^AUDIT_MISMATCH count=(\d+)') {
                 $bgDetail = "$bgDetail`nAudit found $($Matches[1]) IP-surface mismatch(es) — see raw output."
                 $bgStatus = 'warning'
             }
@@ -1423,52 +1397,24 @@ echo "BGIP_VERIFY_DONE"
             # --- Verify --------------------------------------------------------
             $steps.Add((New-DunePublicIpStepResult 'verify' 'Verify external IP + RabbitMQ port' 'running' "Checking node ExternalIP and TCP $target:31982.")) | Out-Null
             & $pub
-            # The battlegroup restart above brings the mq-game pod (which serves
-            # RabbitMQ on the DNAT'd port 31982) back cold; its endpoint isn't
-            # ready for ~30-90s after the restart. A single TCP probe fires
-            # during that boot gap and false-FAILs even though the server is
-            # fine moments later (the header "31982 TCP" pill goes green on its
-            # own). So poll with backoff up to ~90s and exit early on the first
-            # success. Discovered live 2026-07-07: verify printed FAILED while
-            # node ExternalIP, eth0 alias, DNAT -d, and 31982 were all correct
-            # ~1 min later.
-            $tcp = $false
-            $verifyAttempts = 10
-            $verifyTick     = 9
-            for ($vi = 1; $vi -le $verifyAttempts; $vi++) {
-                $vwait = New-DunePublicIpStepResult 'verify' 'Verify external IP + RabbitMQ port' 'running' "Checking TCP $target:31982 (attempt $vi/$verifyAttempts, up to $($verifyAttempts * $verifyTick)s)..."
-                $steps[$steps.Count - 1] = $vwait
-                & $pub
-                try { $tcp = Test-NetConnection -ComputerName $target -Port 31982 -InformationLevel Quiet -WarningAction SilentlyContinue } catch { $tcp = $false }
-                if ($tcp) { break }
-                if ($vi -lt $verifyAttempts) { Start-Sleep -Seconds $verifyTick }
-            }
+            # Use the same independent observers as the header. A client-side
+            # connection tests router hairpin behavior, not outside reachability.
+            $verdict = 'unknown'
+            try { $verdict = Test-DunePortBuiltin -PublicIp $target -Port 31982 -Protocol TCP } catch { }
             $extOk = ($extIp -eq $target)
-            if (-not $tcp) {
-                $detail = "TCP $target:31982 not reachable after $verifyAttempts attempts (~$($verifyAttempts * $verifyTick)s)"
-                if (-not $ready) { $detail += ' (servers still starting)' }
-                # If the external probe never succeeded BUT every internal signal
-                # is healthy — node ExternalIP == target, the eth0 alias is up,
-                # and the battlegroup reached Healthy — the server is actually
-                # reconciled. A TCP probe from the host itself can false-negative
-                # on routers without NAT loopback (hairpin), so don't scream
-                # FAILED: downgrade to a warning that says to confirm 31982 from
-                # an outside network.
-                $aliasOk   = ($rawVerify -match '(?m)^ALIAS_OK=yes\s*$')
-                $bgHealthy = $ready -or ($rawVerify -match '(?m)^BG_PHASE=Healthy\s*$')
-                if ($extOk -and $aliasOk -and $bgHealthy) {
-                    $wdetail = "$detail, but internal signals are healthy (node ExternalIP=$target, eth0 alias present, battlegroup Healthy). This host's external TCP probe can false-negative on routers without NAT loopback (hairpin) - confirm port 31982 from an outside network. Watch the header's '31982 TCP' status pill, which reflects the live port."
-                    $steps[$steps.Count - 1] = New-DunePublicIpStepResult 'verify' 'Verify external IP + RabbitMQ port' 'warning' $wdetail $rawVerify
-                    & $pub
-                } else {
-                    throw "$detail. Node ExternalIP=$extIp. If servers are still booting, retry the check from Server Health shortly."
-                }
+            $aliasOk = ($rawVerify -match '(?m)^ALIAS_OK=yes\s*$')
+            $bgHealthy = $ready -or ($rawVerify -match '(?m)^BG_PHASE=Healthy\s*$')
+            if ($verdict -eq 'open') {
+                $steps[$steps.Count - 1] = New-DunePublicIpStepResult 'verify' 'Verify external IP + RabbitMQ port' 'done' "External observers reached TCP ${target}:31982. Node ExternalIP=$extIp."
+            } elseif ($extOk -and $aliasOk -and $bgHealthy) {
+                $detail = if ($verdict -eq 'closed') {
+                    "External observers reported TCP ${target}:31982 closed. Check the router's TCP 31982 forwarding to this VM."
+                } else { "External TCP check unavailable. Check reachability from another network." }
+                $steps[$steps.Count - 1] = New-DunePublicIpStepResult 'verify' 'Verify external IP + RabbitMQ port' 'warning' "$detail Server network and battlegroup reconciliation succeeded." $rawVerify
             } else {
-                $vdetail = "TCP $target:31982 reachable."
-                if ($extOk) { $vdetail += " Node ExternalIP=$target." } else { $vdetail += " WARNING: node ExternalIP reported '$extIp'." }
-                $steps[$steps.Count - 1] = New-DunePublicIpStepResult 'verify' 'Verify external IP + RabbitMQ port' 'done' $vdetail
-                & $pub
+                throw "Server reconciliation is incomplete. Node ExternalIP=$extIp; external TCP result=$verdict. Retry Server Health after startup."
             }
+            & $pub
 
             Save-DuneConfig -Config @{
                 PublicIpMode = $Mode

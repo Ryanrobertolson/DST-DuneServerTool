@@ -6,6 +6,41 @@
 # §3 — Items / inventory
 # ---------------------------------------------------------------------------
 
+Register-DuneRoute -Method POST -Path '/api/gameplay/players/codex/grant' -Handler {
+    param($req, $res, $routeParams, $body)
+    try {
+        $account = Get-DuneBodyInt -Body $body -Name 'account_id'
+        $ids = @(Get-DuneBodyValue -Body $body -Name 'ids')
+        $confirm = [string](Get-DuneBodyValue -Body $body -Name 'confirm')
+        if ($null -eq $account -or $account -le 0) { throw 'A current character account is required.' }
+        $null = Get-DuneCodexSelection -Ids $ids
+        Invoke-WithDuneLock -Name 'codex-grants' -Script {
+            Invoke-DunePlayerWriteRoute -Response $res -Action {
+                param($ip) Invoke-DunePlayerCodexGrant -Ip $ip -AccountId $account -Ids $ids -Confirm $confirm
+            }
+        }
+    } catch { Write-DuneError -Response $res -Status 400 -Message $_.Exception.Message }
+}
+
+Register-DuneRoute -Method POST -Path '/api/gameplay/players/unlock-testing-stations' -Handler {
+    param($req, $res, $routeParams, $body)
+    try {
+        $pawn = Get-DuneBodyInt -Body $body -Name 'pawn_id'
+        $controller = Get-DuneBodyInt -Body $body -Name 'controller_id'
+        $account = Get-DuneBodyInt -Body $body -Name 'account_id'
+        $station = [string](Get-DuneBodyValue -Body $body -Name 'station')
+        $confirm = [string](Get-DuneBodyValue -Body $body -Name 'confirm')
+        if ($null -eq $pawn -or $pawn -le 0 -or $null -eq $controller -or $controller -le 0 -or $null -eq $account -or $account -le 0 -or $confirm -cne 'UNLOCK TESTING STATIONS') {
+            Write-DuneError -Response $res -Status 400 -Message 'Confirm the unlock for a current selected character.'; return
+        }
+        $null = @(Get-DuneTestingStationSelection -Station $station)
+        Invoke-DunePlayerWriteRoute -Response $res -Action {
+            param($ip)
+            Invoke-DunePlayerUnlockTestingStations -Ip $ip -PawnId $pawn -ControllerId $controller -AccountId $account -Station $station
+        }
+    } catch { Write-DuneError -Response $res -Status 400 -Message $_.Exception.Message }
+}
+
 # POST /api/gameplay/players/give-items  { pawn_id, items:[{template,qty,quality}], allow_overflow? }
 Register-DuneRoute -Method POST -Path '/api/gameplay/players/give-items' -Handler {
     param($req, $res, $routeParams, $body)
@@ -42,6 +77,42 @@ Register-DuneRoute -Method POST -Path '/api/gameplay/players/grant-house-swatche
         }
     } catch {
         Write-DuneError -Response $res -Status 500 -Message "Grant House Swatches failed: $($_.Exception.Message)"
+    }
+}
+
+# POST /api/gameplay/players/grant-building-sets { pawn_id, account_id }
+Register-DuneRoute -Method POST -Path '/api/gameplay/players/grant-building-sets' -Handler {
+    param($req, $res, $routeParams, $body)
+    try {
+        $pawn = Get-DuneBodyInt -Body $body -Name 'pawn_id'
+        $account = Get-DuneBodyInt -Body $body -Name 'account_id'
+        if ($null -eq $pawn -or $pawn -le 0) { Write-DuneError -Response $res -Status 400 -Message 'pawn_id is required.'; return }
+        if ($null -eq $account -or $account -le 0) { Write-DuneError -Response $res -Status 400 -Message 'account_id is required.'; return }
+        Invoke-DunePlayerWriteRoute -Response $res -Action {
+            param($ip)
+            Invoke-DunePlayerGrantBuildingSets -Ip $ip -PawnId $pawn -AccountId $account
+        }
+    } catch {
+        Write-DuneError -Response $res -Status 500 -Message "Grant building sets failed: $($_.Exception.Message)"
+    }
+}
+
+# POST /api/gameplay/players/grant-skins { pawn_id, account_id, kind: armor | weapon | vehicle | dyes }
+Register-DuneRoute -Method POST -Path '/api/gameplay/players/grant-skins' -Handler {
+    param($req, $res, $routeParams, $body)
+    try {
+        $pawn = Get-DuneBodyInt -Body $body -Name 'pawn_id'
+        $account = Get-DuneBodyInt -Body $body -Name 'account_id'
+        $kind = [string](Get-DuneBodyValue -Body $body -Name 'kind')
+        if ($kind -notin @('armor','weapon','vehicle','dyes')) { Write-DuneError -Response $res -Status 400 -Message 'kind must be armor, weapon, vehicle or dyes.'; return }
+        if ($null -eq $pawn -or $pawn -le 0) { Write-DuneError -Response $res -Status 400 -Message 'pawn_id is required.'; return }
+        if ($null -eq $account -or $account -le 0) { Write-DuneError -Response $res -Status 400 -Message 'account_id is required.'; return }
+        Invoke-DunePlayerWriteRoute -Response $res -Action {
+            param($ip)
+            Invoke-DunePlayerGrantSkins -Ip $ip -PawnId $pawn -AccountId $account -Kind $kind
+        }
+    } catch {
+        Write-DuneError -Response $res -Status 500 -Message "Grant skins failed: $($_.Exception.Message)"
     }
 }
 
@@ -667,4 +738,30 @@ Register-DuneRoute -Method POST -Path '/api/gameplay/players/update-tags' -Handl
     } catch {
         Write-DuneError -Response $res -Status 500 -Message "Update tags failed: $($_.Exception.Message)"
     }
+}
+Register-DuneRoute -Method POST -Path '/api/gameplay/players/reviewed-customization' -Handler {
+    param($req, $res, $routeParams, $body)
+    try {
+        $pawn = Get-DuneBodyInt -Body $body -Name 'pawn_id'
+        $controller = Get-DuneBodyInt -Body $body -Name 'controller_id'
+        $account = Get-DuneBodyInt -Body $body -Name 'account_id'
+        $id = [string](Get-DuneBodyValue -Body $body -Name 'customizationId')
+        if ((Get-DuneBodyValue -Body $body -Name 'checkOnly') -eq $true) {
+            $statusSql = Get-DuneReviewedGrantStatusSql $pawn $controller $account $id
+            Invoke-DunePlayerWriteRoute -Response $res -Action {
+                param($ip)
+                $result = Invoke-DuneSqlQuery -Ip $ip -Sql $statusSql -ReadOnly $true -MaxRows 1 -TimeoutSec 30 -Bulk
+                $rows = ConvertTo-DuneRowMaps -Result $result
+                if (-not $result.ok -or $rows.Count -ne 1) { return @{ok=$false;error='Character grant counts are unavailable.'} }
+                return @{ok=$true;total=[int]$rows[0]['total'];owned=[int]$rows[0]['owned'];remaining=([int]$rows[0]['total']-[int]$rows[0]['owned'])}
+            }
+            return
+        }
+        if ([string](Get-DuneBodyValue -Body $body -Name 'confirm') -cne 'GRANT REVIEWED CUSTOMIZATION') { throw 'Confirm the selected customization.' }
+        $null = Get-DuneReviewedCustomization -CustomizationId $id
+        Invoke-DunePlayerWriteRoute -Response $res -Action {
+            param($ip)
+            Invoke-DunePlayerReviewedCustomization -Ip $ip -PawnId $pawn -ControllerId $controller -AccountId $account -CustomizationId $id
+        }
+    } catch { Write-DuneError -Response $res -Status 400 -Message $_.Exception.Message }
 }

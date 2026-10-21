@@ -17,6 +17,64 @@ FutureRetailKey=27
 "@
 }
 
+Describe 'Clearing official server-file values' {
+    It 'removes the full assignment including duplicates and leaves untouched bytes intact' {
+        $raw = "[$script:RetailSection]`r`nGatheringAmount=1.0 ; test`r`nFutureRetailKey=27`r`nGatheringAmount=0.5`r`n[Other]`r`nGatheringAmount=9`r`n"
+        $out = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $raw -Updates @{GatheringAmount='  '}
+        $out | Should -Be "[$script:RetailSection]`r`nFutureRetailKey=27`r`n[Other]`r`nGatheringAmount=9`r`n"
+        $again = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $out -Updates @{FiefdomLimit='4'}
+        ($again -split '\[Other\]')[0] | Should -Not -Match 'GatheringAmount\s*='
+    }
+
+    It 'does not create a blank entry when clearing an already absent key, but preserves zero' {
+        $out = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $script:RetailRaw -Updates @{GatheringAmount=''}
+        $out | Should -Be $script:RetailRaw
+        $zero = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $script:RetailRaw -Updates @{GatheringAmount='0'}
+        $zero | Should -Match '(?m)^GatheringAmount=0\r?$'
+    }
+}
+
+Describe 'Server Settings startup synchronization preference' {
+    BeforeEach {
+        $script:RetailSyncPreferenceTestPath=Join-Path $TestDrive ([guid]::NewGuid().ToString('N')+'.json')
+        Mock Get-DuneRetailStartupSyncPreferencePath { $script:RetailSyncPreferenceTestPath }
+    }
+    It 'defaults enabled and persists both opt-out and re-enable' {
+        (Get-DuneRetailStartupSyncPreference).enabled | Should -BeTrue
+        (Set-DuneRetailStartupSyncPreference -Enabled $false).enabled | Should -BeFalse
+        (Get-DuneRetailStartupSyncPreference).enabled | Should -BeFalse
+        (Set-DuneRetailStartupSyncPreference -Enabled $true).enabled | Should -BeTrue
+        (Get-DuneRetailStartupSyncPreference).injectionsApplied | Should -BeFalse
+        Test-DuneConfigurationInjectionEnabled | Should -BeFalse
+        Set-DuneRetailStartupSyncPreference -Enabled $true -Applied | Out-Null
+        Test-DuneConfigurationInjectionEnabled | Should -BeTrue
+    }
+    It 'records pending cleanup for a disconnected server without enabling writers' {
+        Set-DuneRetailStartupSyncPreference -Enabled $false -CleanupPending | Out-Null
+        $state = Get-DuneRetailStartupSyncPreference
+        $state.cleanupPending | Should -BeTrue
+        $state.scope | Should -Be 'Self-hosted battlegroup'
+        Test-DuneConfigurationInjectionEnabled | Should -BeFalse
+    }
+    It 'honors an existing enabled preference without an injection-state field' {
+        '{"enabled":true}' | Set-Content -LiteralPath $script:RetailSyncPreferenceTestPath
+        Test-DuneConfigurationInjectionEnabled | Should -BeTrue
+    }
+    It 'skips every remote read and write when startup synchronization is disabled' {
+        Set-DuneRetailStartupSyncPreference -Enabled $false | Out-Null
+        Mock Get-DuneRetailServerSettingsSnapshot { throw 'Remote read must not run' }
+        Mock Set-DuneRetailServerSettings { throw 'Remote settings must not change' }
+        $result=Sync-DuneRetailServerSettingsForStartup -Ip '192.0.2.10'
+        $result.disabled | Should -BeTrue
+        Should -Invoke Get-DuneRetailServerSettingsSnapshot -Times 0
+        Should -Invoke Set-DuneRetailServerSettings -Times 0
+    }
+    It 'rejects malformed stored preferences instead of silently claiming an opt-out' {
+        '{"enabled":"false"}' | Set-Content -LiteralPath $script:RetailSyncPreferenceTestPath
+        {Get-DuneRetailStartupSyncPreference} | Should -Throw '*preference is invalid*'
+    }
+}
+
 Describe 'Official Retail Server Settings parsing' -Tag 'GameConfig', 'RetailServerSettings' {
     It 'accepts a Retail section on the first line after a UTF-8 BOM' {
         $raw = [char]0xFEFF + "[$script:RetailSection]`nFiefdomLimit=3"
@@ -151,11 +209,11 @@ FiefdomLimit=99
         @((ConvertFrom-DuneRetailServerSettingsRaw -Raw $updated).settings | Where-Object present).Count | Should -Be 1
         { ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw '' -Updates @{ FutureRetailKey = '1' } } |
             Should -Throw '*not editable*'
-        { ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw '' -Updates @{ DifficultyLevel = 'Custom' } } |
+        { ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw '' -Updates @{ DifficultyLevel = 'Medium' } } |
             Should -Throw '*not editable*'
     }
 
-    It 'initializes the 45 editable documented defaults with catalogue-valid values' {
+    It 'initializes all 47 documented defaults including Custom difficulty from an empty source' {
         $card = Get-Content (Join-Path (Get-DstRepoRoot) 'webui\src\pages\gameconfig\OfficialRetailServerSettingsCard.tsx') -Raw
         $guidance = [regex]::Matches($card, "(?m)^  (\w+): \{ defaultValue: '([^']+)'")
         $guidance.Count | Should -Be 47
@@ -163,15 +221,33 @@ FiefdomLimit=99
         foreach ($entry in $guidance) {
             $definition = Get-DuneRetailServerSettingDefinition -Key $entry.Groups[1].Value
             $definition | Should -Not -BeNullOrEmpty
-            if ($definition.editable) { $updates[$entry.Groups[1].Value] = $entry.Groups[2].Value }
+            $updates[$entry.Groups[1].Value] = $entry.Groups[2].Value
         }
-        $updates.Count | Should -Be 45
+        $updates.Count | Should -Be 47
         $updated = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw '' -Updates $updates
         $parsed = ConvertFrom-DuneRetailServerSettingsRaw -Raw $updated
-        @($parsed.settings | Where-Object present).Count | Should -Be 45
+        @($parsed.settings | Where-Object present).Count | Should -Be 47
         @($parsed.settings | Where-Object { -not $_.valid }).Count | Should -Be 0
-        ($parsed.settings | Where-Object key -eq 'DifficultyLevel').present | Should -BeFalse
-        ($parsed.settings | Where-Object key -eq 'PVPMode').present | Should -BeFalse
+        ($parsed.settings | Where-Object key -eq 'DifficultyLevel').value | Should -BeExactly 'Custom'
+        ($parsed.settings | Where-Object key -eq 'PVPMode').value | Should -BeExactly 'Limited'
+    }
+
+    It 'sets Custom only when explicitly requested and preserves existing PvP and unrelated content' {
+        $raw = "; heading`r`n[$script:RetailSection]`r`nDifficultyLevel=Medium ; preset`r`nPVPMode=Full`r`nFutureRetailKey=keep`r`n[Other]`r`nDifficultyLevel=Hard`r`n"
+        $updated = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $raw -Updates @{
+            DifficultyLevel = 'Custom'
+            CraftingCost = '1.000000'
+        }
+        $updated | Should -Match 'DifficultyLevel=Custom ; preset'
+        $updated | Should -Match 'PVPMode=Full'
+        $updated | Should -Match 'FutureRetailKey=keep'
+        $updated | Should -Match '\[Other\]\r\nDifficultyLevel=Hard'
+        (ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $raw -Updates @{ CraftingCost = '0.000000' }) |
+            Should -Match 'DifficultyLevel=Medium ; preset'
+        { ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $raw -Updates @{ PVPMode = 'Limited' } } |
+            Should -Throw '*not editable*'
+        { ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw '' -Updates @{ PVPMode = 'Full' } } |
+            Should -Throw '*not editable*'
     }
 
     It 'updates only requested values while preserving comments, order, and unknown keys' {
@@ -286,14 +362,14 @@ Describe 'Official Retail Server Settings discovery' -Tag 'GameConfig', 'RetailS
         $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($raw))
         Mock Invoke-V6Ssh {
             if ($Cmd -like '*get pods*') { return $podJson }
-            return @('__DST_META__', '1789707124|321', ('a' * 64), '__DST_CONTENT__', $encoded)
+            return @('__DST_META__', '1789707124|321', (Get-DuneRetailServerSettingsTextSha256 -Value $raw), '__DST_CONTENT__', $encoded)
         }
 
         $result = Get-DuneRetailServerSettings -Ip '192.0.2.10'
 
         $result.available | Should -BeTrue
         $result.readOnly | Should -BeFalse
-        $result.target.path | Should -Be '/srv/Config/LinuxServer/ServerCustomSettings.ini'
+        $result.target.path | Should -Be '/srv/UserSettings/UserServerCustomSettings.ini'
         $result.target.gamePath | Should -Be '/home/dune/server/DuneSandbox/Saved/Config/LinuxServer/ServerCustomSettings.ini'
         $result.target.persistentVolumeClaim | Should -Be 'retail-test-pvc'
         $result.applyBehavior.restartRequired | Should -BeTrue
@@ -302,7 +378,7 @@ Describe 'Official Retail Server Settings discovery' -Tag 'GameConfig', 'RetailS
         @($result.settings | Where-Object present).Count | Should -Be $(if ($Empty) { 0 } else { 7 })
     }
 
-    It 'returns an explicit unavailable state when the generated file is missing' {
+    It 'allows missing persistent settings to be initialized with defaults' {
         $podJson = @{
             items = @(@{
                 metadata = @{ name = 'retail-test-fb-deploy-abc' }
@@ -325,12 +401,12 @@ Describe 'Official Retail Server Settings discovery' -Tag 'GameConfig', 'RetailS
 
         $result = Get-DuneRetailServerSettings -Ip '192.0.2.10'
 
-        $result.available | Should -BeFalse
-        $result.reason | Should -Match 'runtime file is missing'
-        @($result.settings).Count | Should -Be 0
+        $result.available | Should -BeTrue
+        @($result.settings).Count | Should -Be 47
+        @($result.settings | Where-Object present).Count | Should -Be 0
     }
 
-    It 'prefers the configured operator source over the stale PVC projection' {
+    It 'preserves existing YAML before migration, then reflects manual file edits after migration' {
         $script:UpstreamRetailRaw = $script:RetailRaw.Replace('FiefdomLimit=3', 'FiefdomLimit=4')
         Mock Get-V6Battlegroup {
             @{
@@ -371,15 +447,35 @@ Describe 'Official Retail Server Settings discovery' -Tag 'GameConfig', 'RetailS
                 }
             })
         } | ConvertTo-Json -Depth 8 -Compress
-        Mock Invoke-V6Ssh { return $podJson }
+        $script:FileAuthorityEnabled = $false
+        Mock Invoke-V6Ssh {
+            if ($Cmd -like '*get pods*') { return $podJson }
+            if ($script:FileAuthorityEnabled) { '__DST_FILE_AUTHORITY__' }
+            '__DST_META__'
+            '1789707124|321'
+            Get-DuneRetailServerSettingsTextSha256 -Value $script:RetailRaw
+            '__DST_CONTENT__'
+            [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script:RetailRaw))
+        }
 
         $result = Get-DuneRetailServerSettings -Ip '192.0.2.10'
 
-        $result.source | Should -Be 'funcom-servergroup-user-ini-config'
+        $result.source | Should -Be 'existing-operator-settings-pending-migration'
         $result.target.upstreamConfigured | Should -BeTrue
         $result.PSObject.Properties['raw'] | Should -BeNullOrEmpty
         ($result.settings | Where-Object key -eq 'FiefdomLimit').value | Should -Be '4'
-        Should -Invoke Invoke-V6Ssh -Times 1
+        $script:FileAuthorityEnabled = $true
+        $result = Get-DuneRetailServerSettings -Ip '192.0.2.10'
+        $result.source | Should -Be 'funcom-persistent-user-settings'
+        ($result.settings | Where-Object key -eq 'FiefdomLimit').value | Should -Be '3'
+        Should -Invoke Invoke-V6Ssh -Times 4
+        $result = Get-DuneRetailServerSettings -Ip '192.0.2.10' -ReadOperator
+        $result.source | Should -Be 'operator-import-draft'
+        $result.operatorMismatch | Should -BeTrue
+        $result.revision | Should -Be (Get-DuneRetailServerSettingsTextSha256 -Value $script:RetailRaw)
+        $result.operatorRevision | Should -Be (Get-DuneRetailServerSettingsTextSha256 -Value $script:UpstreamRetailRaw)
+        ($result.settings | Where-Object key -eq 'FiefdomLimit').value | Should -Be '4'
+        Should -Invoke Invoke-V6Ssh -Times 0 -ParameterFilter { $Cmd -like '*kubectl patch*' }
     }
 
     It 'refuses discovery when the File Browser mount is not the Saved PVC' {
@@ -447,6 +543,19 @@ Describe 'Official Retail Server Settings route safety' -Tag 'GameConfig', 'Reta
         function Test-DunePlayerGuard {}
         Mock Get-DuneGameConfigContext { @{ ok = $true; ip = '192.0.2.10' } }
         Mock Test-DunePlayerGuard { $true }
+        Mock Write-DuneRetailServerSettingsFile {}
+        Mock Set-DuneRetailServerSettingsFileAuthority {}
+        Mock Get-DuneRetailServerSettingsRuntimeSnapshot {
+            $future = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $script:CommentedRetailRaw -Updates @{ FiefdomLimit='4' }
+            @{ available=$true; fileExists=$true; raw=$future; revision=Get-DuneRetailServerSettingsTextSha256 -Value $future }
+        }
+        Mock Get-DuneRetailServerSettingsSnapshot {
+            @{
+                available = $true; raw = $script:CommentedRetailRaw
+                revision = Get-DuneRetailServerSettingsTextSha256 -Value $script:CommentedRetailRaw
+                target = Resolve-DuneRetailServerSettingsTarget -Ip '192.0.2.10'
+            }
+        }
         Mock Resolve-DuneRetailServerSettingsTarget {
             @{
                 available = $true
@@ -559,6 +668,12 @@ function Get-DuneRetailServerSettingsSnapshot {
 }
 function Get-V6Battlegroup { @{ Bg = $script:document } }
 function Backup-DuneRetailServerSettingsContent { @{ path = 'mock-backup' } }
+function Write-DuneRetailServerSettingsFile {}
+function Set-DuneRetailServerSettingsFileAuthority {}
+function Get-DuneRetailServerSettingsRuntimeSnapshot {
+    $raw = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw '' -Updates @{ bAllowSandworms='false' }
+    @{ available=$true; fileExists=$true; raw=$raw; revision=Get-DuneRetailServerSettingsTextSha256 -Value $raw }
+}
 function Invoke-V6Ssh {
     param($Ip, $Cmd, $TimeoutSec, $StdinData)
     $ops = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($StdinData)) | ConvertFrom-Json
@@ -641,10 +756,18 @@ Describe 'Official Retail operator configuration preservation' -Tag 'GameConfig'
             metadata = @{ resourceVersion = '100' }
             spec = @{ stop = $true; serverGroup = @{ template = @{ spec = [ordered]@{} } } }
         }
+        Mock Get-DuneRetailStartupSyncPreference { @{ enabled=$true } }
         $script:OperatorPatches = [Collections.Generic.List[object]]::new()
         $script:OperatorTransport = [Collections.Generic.List[object]]::new()
         $script:OperatorSource = ''
         $script:OperatorReads = 0
+        Mock Write-DuneRetailServerSettingsFile {}
+        Mock Set-DuneRetailServerSettingsFileAuthority {}
+        Mock Get-DuneRetailServerSettingsRuntimeSnapshot {
+            $future = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $script:OperatorSource -Updates @{ FiefdomLimit='4' }
+            @{ available=$true; fileExists=$true; raw=$future; revision=Get-DuneRetailServerSettingsTextSha256 -Value $future
+                target=@{ path='/srv/Config/LinuxServer/ServerCustomSettings.ini'; namespace='funcom-test'; pod='retail-test-fb-deploy-abc' } }
+        }
         $script:FailReadback = $false
         $script:OmitSiblingOnReadback = $false
         $script:ConcurrentBeforeRollbackRead = $false
@@ -690,6 +813,165 @@ Describe 'Official Retail operator configuration preservation' -Tag 'GameConfig'
             }
             Invoke-RetailTestJsonPatch -Cmd $Cmd -StdinData $StdinData
         }
+    }
+
+    It 'stages explicit restart YAML without overwriting the running game runtime INI' {
+        Mock Get-DuneRetailServerSettingsSnapshot {
+            @{available=$true;fileExists=$true;fileAuthority=$true;raw=$script:OperatorSource;fileRaw=$script:OperatorSource;revision=Get-DuneRetailServerSettingsTextSha256 -Value $script:OperatorSource;
+                target=@{namespace='funcom-test';battlegroup='retail-test';pod='retail-test-fb-deploy-abc';path='/srv/UserSettings/UserServerCustomSettings.ini';resourceVersion='100';stopped=$false;serverPodCount=2}}
+        }
+        Mock Get-DuneRetailServerSettingsRuntimeSnapshot {
+            @{available=$true;fileExists=$true;raw='runtime stays';revision='old';target=@{path='/srv/Config/LinuxServer/ServerCustomSettings.ini'}}
+        }
+        (Set-DuneRetailServerSettings -Ip '192.0.2.10' -Updates @{} -ExpectedRevision (Get-DuneRetailServerSettingsTextSha256 -Value $script:OperatorSource) -SynchronizeOnly -StageForRestart).ok | Should -BeTrue
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 0
+        Should -Invoke Invoke-V6Ssh -Times 1 -ParameterFilter {$Cmd -like '*kubectl patch battlegroup*'}
+    }
+    It 'migrates the entire existing YAML file before marking Linux file authority' {
+        $script:OperatorSource = "; existing YAML`n[$script:RetailSection]`nDifficultyLevel=Custom`nPVPMode=Full`nCraftingCost=0.500000`nFutureKey=keep`n"
+        $disk = "[$script:RetailSection]`nDifficultyLevel=Medium`nCraftingCost=1.000000`n"
+        $script:OperatorDocument.spec.serverGroup.template.spec.global = @{ userIniConfig = @{
+            mountPath = '/home/dune/server/DuneSandbox/Saved/Config/LinuxServer'
+            files = @{ 'ServerCustomSettings.ini' = $script:OperatorSource; 'Other.ini' = 'untouched' }
+        } }
+        Mock Get-DuneRetailServerSettingsSnapshot {
+            @{
+                available=$true; fileExists=$true; fileAuthority=$false; needsMigration=$true
+                raw=$script:OperatorSource; fileRaw=$disk
+                revision=Get-DuneRetailServerSettingsTextSha256 -Value $script:OperatorSource
+                target=@{
+                    namespace='funcom-test'; battlegroup='retail-test'; pod='retail-test-fb-deploy-abc'
+                    path='/srv/UserSettings/UserServerCustomSettings.ini'; stopped=$true; serverPodCount=0
+                    resourceVersion='100'; upstreamConfigured=$true; upstreamFileName='ServerCustomSettings.ini'
+                    upstreamContent=$script:OperatorSource
+                }
+            }
+        }
+        $result = Sync-DuneRetailServerSettingsForStartup -Ip '192.0.2.10'
+        $result.ok | Should -BeTrue
+        Should -Invoke Backup-DuneRetailServerSettingsContent -Times 1 -ParameterFilter { $Raw -ceq $disk }
+        Should -Invoke Backup-DuneRetailServerSettingsContent -Times 0 -ParameterFilter { $Raw -ceq $script:OperatorSource }
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 1 -ParameterFilter {
+            $Content -ceq $script:OperatorSource -and $ExpectedExists -and
+            $ExpectedRevision -ceq (Get-DuneRetailServerSettingsTextSha256 -Value $disk)
+        }
+        Should -Invoke Set-DuneRetailServerSettingsFileAuthority -Times 1
+        $script:OperatorDocument.spec.serverGroup.template.spec.global.userIniConfig.files.'Other.ini' | Should -Be 'untouched'
+    }
+
+    It 'copies an explicitly read YAML draft to disk without losing unknown or read-only settings' {
+        $script:OperatorSource = "[$script:RetailSection]`nDifficultyLevel=Custom`nPVPMode=Full`nFutureKey=keep`n"
+        $disk = "[$script:RetailSection]`nDifficultyLevel=Medium`nPVPMode=Limited`n"
+        $script:OperatorDocument.spec.serverGroup.template.spec.global = @{ userIniConfig = @{
+            mountPath='/home/dune/server/DuneSandbox/Saved/Config/LinuxServer'
+            files=@{ 'ServerCustomSettings.ini'=$script:OperatorSource }
+        } }
+        Mock Get-DuneRetailServerSettingsSnapshot {
+            @{
+                available=$true; fileExists=$true; fileAuthority=$true; raw=$disk; fileRaw=$disk
+                revision=Get-DuneRetailServerSettingsTextSha256 -Value $disk
+                target=@{
+                    namespace='funcom-test'; battlegroup='retail-test'; pod='retail-test-fb-deploy-abc'
+                    path='/srv/UserSettings/UserServerCustomSettings.ini'; stopped=$true; serverPodCount=0
+                    resourceVersion='100'; upstreamConfigured=$true; upstreamFileName='ServerCustomSettings.ini'
+                    upstreamContent=$script:OperatorSource
+                }
+            }
+        }
+        $result = Set-DuneRetailServerSettings -Ip '192.0.2.10' -Updates @{} `
+            -ExpectedRevision (Get-DuneRetailServerSettingsTextSha256 -Value $disk) `
+            -ImportOperatorRevision (Get-DuneRetailServerSettingsTextSha256 -Value $script:OperatorSource)
+        $result.ok | Should -BeTrue
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 1 -ParameterFilter { $Content -ceq $script:OperatorSource }
+        Should -Invoke Set-DuneRetailServerSettingsFileAuthority -Times 0
+        ($result.settings | Where-Object key -eq 'PVPMode').value | Should -Be 'Full'
+        ($result.settings | Where-Object key -eq 'FutureKey').value | Should -Be 'keep'
+        { Set-DuneRetailServerSettings -Ip '192.0.2.10' -Updates @{} `
+            -ExpectedRevision (Get-DuneRetailServerSettingsTextSha256 -Value $disk) -ImportOperatorRevision ('a'*64) } |
+            Should -Throw '*YAML settings changed*'
+    }
+
+    It 'synchronizes a manual file edit to YAML on startup without rewriting the file' {
+        $script:OperatorSource = "[$script:RetailSection]`nFiefdomLimit=4`nFutureKey=manual`n"
+        Mock Get-DuneRetailServerSettingsSnapshot {
+            @{
+                available=$true; fileExists=$true; fileAuthority=$true; raw=$script:OperatorSource; fileRaw=$script:OperatorSource
+                revision=Get-DuneRetailServerSettingsTextSha256 -Value $script:OperatorSource
+                target=@{
+                    namespace='funcom-test'; battlegroup='retail-test'; pod='retail-test-fb-deploy-abc'
+                    path='/srv/UserSettings/UserServerCustomSettings.ini'; stopped=$true; serverPodCount=0; resourceVersion='100'
+                }
+            }
+        }
+        $result = Sync-DuneRetailServerSettingsForStartup -Ip '192.0.2.10'
+        $result.ok | Should -BeTrue
+        $script:OperatorDocument.spec.serverGroup.template.spec.global.userIniConfig.files.'ServerCustomSettings.ini' | Should -BeExactly $script:OperatorSource
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 0
+    }
+
+    It 'does not back up unchanged canonical settings when startup refreshes the runtime copy' {
+        $script:OperatorSource = "[$script:RetailSection]`nFiefdomLimit=4`n"
+        $script:OperatorDocument.spec.serverGroup.template.spec.global = @{ userIniConfig=@{
+            mountPath='/home/dune/server/DuneSandbox/Saved/Config/LinuxServer'
+            files=@{ 'ServerCustomSettings.ini'=$script:OperatorSource }
+        } }
+        Mock Get-DuneRetailServerSettingsSnapshot {
+            @{
+                available=$true; fileExists=$true; fileAuthority=$true; raw=$script:OperatorSource; fileRaw=$script:OperatorSource
+                revision=Get-DuneRetailServerSettingsTextSha256 -Value $script:OperatorSource
+                target=@{
+                    namespace='funcom-test'; battlegroup='retail-test'; pod='retail-test-fb-deploy-abc'
+                    path='/srv/UserSettings/UserServerCustomSettings.ini'; stopped=$true; serverPodCount=0; resourceVersion='100'
+                    upstreamConfigured=$true; upstreamFileName='ServerCustomSettings.ini'; upstreamContent=$script:OperatorSource
+                }
+            }
+        }
+        Mock Get-DuneRetailServerSettingsRuntimeSnapshot {
+            $old="[$script:RetailSection]`nFiefdomLimit=1`n"
+            @{ available=$true; fileExists=$true; raw=$old; revision=Get-DuneRetailServerSettingsTextSha256 -Value $old
+                target=@{path='/srv/Config/LinuxServer/ServerCustomSettings.ini';namespace='funcom-test';pod='retail-test-fb-deploy-abc'} }
+        }
+        $result=Sync-DuneRetailServerSettingsForStartup -Ip '192.0.2.10'
+        $result.ok | Should -BeTrue
+        Should -Invoke Backup-DuneRetailServerSettingsContent -Times 0 -ParameterFilter { $Target.path -eq '/srv/UserSettings/UserServerCustomSettings.ini' }
+        Should -Invoke Backup-DuneRetailServerSettingsContent -Times 1 -Exactly -ParameterFilter { $Target.path -eq '/srv/Config/LinuxServer/ServerCustomSettings.ini' }
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 0 -ParameterFilter { $Target.path -eq '/srv/UserSettings/UserServerCustomSettings.ini' }
+    }
+
+    It 'does not back up or rewrite a settings file when saving identical values' {
+        $script:OperatorSource="[$script:RetailSection]`nFiefdomLimit=4`n"
+        $result=Set-DuneRetailServerSettings -Ip '192.0.2.10' -Updates @{ FiefdomLimit='4' } -ExpectedRevision (Get-DuneRetailServerSettingsTextSha256 -Value $script:OperatorSource)
+        $result.ok | Should -BeTrue
+        Should -Invoke Backup-DuneRetailServerSettingsContent -Times 0
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 0
+    }
+
+    It 'restores disk as well as YAML when migration verification fails' {
+        $script:FailReadback=$true
+        { Set-DuneRetailServerSettings -Ip '192.0.2.10' -Updates @{ FiefdomLimit='4' } `
+            -ExpectedRevision (Get-DuneRetailServerSettingsTextSha256 -Value '') } | Should -Throw '*original operator configuration was restored*'
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 2
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 1 -ParameterFilter { $Content -ceq '' }
+        Should -Invoke Set-DuneRetailServerSettingsFileAuthority -Times 0
+    }
+
+    It 'backs up and restores both Linux files when the operator readback fails' {
+        $script:FailReadback=$true
+        $oldRuntime="[$script:RetailSection]`nFiefdomLimit=9`nFutureKey=retain`n"
+        Mock Get-DuneRetailServerSettingsRuntimeSnapshot {
+            @{ available=$true; fileExists=$true; raw=$oldRuntime
+                revision=Get-DuneRetailServerSettingsTextSha256 -Value $oldRuntime
+                target=@{ path='/srv/Config/LinuxServer/ServerCustomSettings.ini'; namespace='funcom-test'; pod='retail-test-fb-deploy-abc' } }
+        }
+        { Set-DuneRetailServerSettings -Ip '192.0.2.10' -Updates @{ FiefdomLimit='4' } `
+            -ExpectedRevision (Get-DuneRetailServerSettingsTextSha256 -Value '') } | Should -Throw '*original operator configuration was restored*'
+        Should -Invoke Backup-DuneRetailServerSettingsContent -Times 1 -Exactly -ParameterFilter { $Raw -ceq $oldRuntime }
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 4 -Exactly
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 1 -Exactly -ParameterFilter {
+            $Target.path -eq '/srv/Config/LinuxServer/ServerCustomSettings.ini' -and $Content -ceq $oldRuntime
+        }
+        Should -Invoke Write-DuneRetailServerSettingsFile -Times 1 -Exactly -ParameterFilter { $Content -ceq '' }
+        Should -Invoke Set-DuneRetailServerSettingsFileAuthority -Times 0
     }
 
     It 'preserves sibling files, unknown fields and the exact canonical mount spelling' -ForEach @(
@@ -896,6 +1178,12 @@ Describe 'Official Retail operator configuration preservation' -Tag 'GameConfig'
 Describe 'Official Retail Server Settings writes' -Tag 'GameConfig', 'RetailServerSettings' {
     BeforeEach {
         $script:PatchCount = 0
+        Mock Write-DuneRetailServerSettingsFile {}
+        Mock Set-DuneRetailServerSettingsFileAuthority {}
+        Mock Get-DuneRetailServerSettingsRuntimeSnapshot {
+            $future = ConvertTo-DuneRetailServerSettingsUpdatedRaw -Raw $script:WriteSourceRaw -Updates @{ FiefdomLimit='4' }
+            @{ available=$true; fileExists=$true; raw=$future; revision=Get-DuneRetailServerSettingsTextSha256 -Value $future }
+        }
         $script:WriteSourceRaw = $script:RetailRaw
         Mock Get-DuneRetailServerSettingsSnapshot {
             @{

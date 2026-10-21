@@ -7,7 +7,7 @@ name: Tests
 #   * the Vitest webui suite under webui/tests/           -> job `vitest`
 #
 # Triggered on:
-#   - pull_request to any branch: ALWAYS (no path filter). Same rationale as
+#   - ready pull_request to any branch (no path filter). Same rationale as
 #     lint.yml -- if these ever become required status checks, a path filter
 #     would make PRs that don't touch the filtered paths wait forever on a
 #     check that never runs. The jobs are cheap when there's nothing to test.
@@ -24,9 +24,16 @@ on:
       - 'webui/**'
       - '.github/workflows/test.yml'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Draft PRs run no jobs. Ready PRs validate each new head; superseded runs stop.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   pester:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     name: PowerShell (Pester)
     runs-on: windows-latest
     steps:
@@ -154,6 +161,13 @@ jobs:
           'PGDATABASE=dst_inventory' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "PGPASSWORD=$rolePassword" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Verify Solo mods and Deck transfers under Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $env:DST_PESTER_MODULE = (Get-Module -ListAvailable Pester | Sort-Object Version -Descending | Select-Object -First 1).Path
+          powershell.exe -NoProfile -Command 'Import-Module $env:DST_PESTER_MODULE; $result = Invoke-Pester -Path tests/SoloMods.Tests.ps1,tests/SoloDeck.Tests.ps1,tests/SoloDeckMods.Tests.ps1 -PassThru -Output Detailed; if ($result.FailedCount -gt 0) { exit 1 }'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run Pester suite
         shell: pwsh
         run: |
@@ -219,6 +233,7 @@ jobs:
           if-no-files-found: ignore
 
   vitest:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     name: WebUI (Vitest)
     runs-on: ubuntu-latest
     steps:
@@ -240,7 +255,28 @@ jobs:
         working-directory: webui
         run: npm test
 
+  deck-companion:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    name: SteamOS companion
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify companion packaging and Linux file operations
+        run: python3 -B -m unittest discover -s tests -p test_deck_companion.py -v
+      - name: Verify Atlas server build profiles
+        run: python3 -B -m unittest discover -s tests -p test_atlas_builds.py -v
+      - name: Verify Atlas Live recovery
+        run: python3 -B -m unittest discover -s tools/atlas -p test_live.py -v
+      - name: Verify clean-install map art and automatic ELF discovery
+        run: |
+          python3 -B -m unittest discover -s tools/atlas -p test_assets.py -v
+          python3 -B -m unittest discover -s tools/atlas -p test_elf.py -v
+      - name: Verify current game item catalog coverage
+        run: python3 -B -m unittest discover -s tests -p test_item_catalog_coverage.py -v
+
   solo-helper:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     name: Solo database helper
     runs-on: windows-latest
     steps:
@@ -263,5 +299,5 @@ jobs:
           if ($audit -match 'has the following vulnerable packages') {
             throw 'DuneSoloDb dependency audit found a vulnerable package.'
           }
-          dotnet run --project $project -c Release -- --command self-test
+          dotnet run --project $project -c Release -- --command self-test --adapter app/data/solo-retail-v1.json
           if ($LASTEXITCODE -ne 0) { throw 'DuneSoloDb self-test failed.' }

@@ -20,6 +20,7 @@ import { getCoriolisSeeds } from '../api/gameplay'
 import { getMapState } from '../api/maps'
 import { selectWickMapSeed, type WickMapSeedSource } from '../wickMapSeed'
 import data from '../data/wickmaps.json'
+import { getAtlasStationName } from '../atlasPoiNames'
 
 type Poi = { sector: string; subx: number; suby: number; type: string }
 type LegendEntry = { type: string; label: string; count: number }
@@ -73,14 +74,8 @@ function fmtCaptured(ts: string): string {
   return `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}`
 }
 
-const RELIABILITY: Record<SeedEntry['reliability'], { label: string; cls: string; icon: string }> = {
-  high: { label: 'High confidence', cls: 'text-ok border-ok/40', icon: 'CheckCircle2' },
-  medium: { label: 'Medium confidence', cls: 'text-text-dim border-border', icon: 'CircleDashed' },
-  low: { label: 'Low confidence', cls: 'text-warning border-warning/50', icon: 'AlertTriangle' },
-}
-
-export function WickMaps({ embedded = false }: { embedded?: boolean }) {
-  const [seed, setSeed] = useState<number>(PAYLOAD.availableSeeds[0] ?? 0)
+export function WickMaps({ embedded = false, solo = false, compact = false }: { embedded?: boolean; solo?: boolean; compact?: boolean }) {
+  const [seed, setSeed] = useState<number>(solo ? 11 : PAYLOAD.availableSeeds[0] ?? 0)
   const [currentSeed, setCurrentSeed] = useState<number | null>(null)
   const [seedSource, setSeedSource] = useState<WickMapSeedSource | null>(null)
   const [liveErr, setLiveErr] = useState<string | null>(null)
@@ -96,6 +91,7 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
   // so the source is checked first - showing a stand-in seed and calling it live
   // would be worse than admitting the seed is unknown.
   useEffect(() => {
+    if (solo) return
     let alive = true
     Promise.all([
       getCoriolisSeeds(),
@@ -132,11 +128,11 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
       })
       .catch(e => { if (alive) setLiveErr(e instanceof Error ? e.message : String(e)) })
     return () => { alive = false }
-  }, [])
+  }, [solo])
 
   const entry = useMemo(
-    () => PAYLOAD.seeds.find(s => s.seed === seed) ?? PAYLOAD.seeds[0],
-    [seed],
+    () => PAYLOAD.seeds.find(s => s.seed === (solo ? 11 : seed)) ?? PAYLOAD.seeds[0],
+    [seed, solo],
   )
 
   const toggleType = (t: string) =>
@@ -154,37 +150,32 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
 
   const labelFor = (t: string) =>
     entry.legend.find(l => l.type === t)?.label ?? t
+  const labelForPoi = (p: Poi) => getAtlasStationName(entry.seed, p.sector, p.type) ?? labelFor(p.type)
 
-  const rel = RELIABILITY[entry.reliability] ?? RELIABILITY.medium
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-3 xl:h-0 xl:min-h-full">
       {!embedded && (
         <PageHeader
-          title="DD Seed Maps"
+          title={solo ? 'Solo DD Map' : 'DD Seed Maps'}
           icon="Map"
-          description="Deep Desert point-of-interest layouts for each of the 12 Coriolis world seeds."
+          description={solo ? 'Single Player Deep Desert reference map.' : 'Deep Desert point-of-interest layouts for each of the 12 Coriolis world seeds.'}
         />
       )}
 
-      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px] gap-4 items-start">
+      <div className={compact ? "grid grid-cols-1 gap-3" : "grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px] gap-4 items-stretch"}>
         {/* ---------------------------------------------------------------- */}
         {/* Map                                                              */}
         {/* ---------------------------------------------------------------- */}
         <div className="card p-4 overflow-hidden">
           <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
             <div className="flex items-baseline gap-3">
-              <h2 className="text-sm font-semibold text-text">World Seed {entry.seed}</h2>
+              <h2 className="text-sm font-semibold text-text">{solo ? 'Solo Deep Desert' : `World Seed ${entry.seed}`}</h2>
               <span className="text-xs text-text-dim">
                 {visible.length} of {entry.poiCount} POIs
               </span>
             </div>
-            <span
-              className={`inline-flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded-full border ${rel.cls}`}
-              title={entry.note ?? entry.confidence}
-            >
-              <Icon name={rel.icon} size={11} /> {rel.label}
-            </span>
+
           </div>
 
           <div className="relative w-full flex justify-center">
@@ -193,7 +184,7 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
               className="h-auto max-w-full rounded-lg select-none"
               style={{
                 background: '#4a3220',
-                width: 'min(100%, calc(100dvh - 19rem))',
+                width: compact ? 'min(100%, calc(100dvh - 11rem))' : 'min(100%, calc(100dvh - 19rem))',
               }}
               role="img"
               aria-label={`Deep Desert point-of-interest map for world seed ${entry.seed}`}
@@ -283,22 +274,22 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
                     style={{ cursor: 'help' }}
                     role="button"
                     tabIndex={0}
-                    aria-label={`${labelFor(p.type)} — ${p.sector}`}
+                    aria-label={`${labelForPoi(p)} — ${p.sector}`}
                     onMouseEnter={() =>
-                      setHover({ x: cx, y: cy, text: `${labelFor(p.type)} — ${p.sector}` })
+                      setHover({ x: cx, y: cy, text: `${labelForPoi(p)} — ${p.sector}` })
                     }
                     onMouseLeave={() => setHover(null)}
                     onFocus={() =>
-                      setHover({ x: cx, y: cy, text: `${labelFor(p.type)} — ${p.sector}` })
+                      setHover({ x: cx, y: cy, text: `${labelForPoi(p)} — ${p.sector}` })
                     }
                     onBlur={() => setHover(null)}
                     onClick={() =>
-                      setHover({ x: cx, y: cy, text: `${labelFor(p.type)} — ${p.sector}` })
+                      setHover({ x: cx, y: cy, text: `${labelForPoi(p)} — ${p.sector}` })
                     }
                     onKeyDown={event => {
                       if (event.key === 'Enter' || event.key === ' ') {
                         event.preventDefault()
-                        setHover({ x: cx, y: cy, text: `${labelFor(p.type)} — ${p.sector}` })
+                        setHover({ x: cx, y: cy, text: `${labelForPoi(p)} — ${p.sector}` })
                       }
                     }}
                   />
@@ -334,8 +325,14 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
         {/* ---------------------------------------------------------------- */}
         {/* Side rail                                                        */}
         {/* ---------------------------------------------------------------- */}
-        <div className="flex flex-col gap-4">
+        <div className={compact ? "hidden" : "flex flex-col gap-4"}>
           {/* Seed selector */}
+          {solo ? (
+            <div className="card p-4 text-sm text-text-dim">
+              <div className="text-xs font-semibold uppercase tracking-widest text-accent mb-3">Single Player</div>
+              <p>The Single Player reference layout matches Seed 11. Use the legend to show or hide locations.</p>
+            </div>
+          ) : (
           <div className="card p-4">
             <div className="text-xs font-semibold uppercase tracking-widest text-accent mb-3">
               World Seed
@@ -403,9 +400,10 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
               )}
             </div>
           </div>
+          )}
 
           {/* Legend / filter */}
-          <div className="card p-4">
+          <div className="card p-4 xl:min-h-0 xl:flex-1 xl:overflow-y-auto">
             <div className="flex items-center justify-between mb-3">
               <div className="text-xs font-semibold uppercase tracking-widest text-accent">
                 Legend
@@ -427,7 +425,7 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
                     key={l.type}
                     onClick={() => toggleType(l.type)}
                     title={off ? `Show ${l.label}` : `Hide ${l.label}`}
-                    className={`flex min-h-11 items-center gap-2.5 px-2 py-1.5 rounded-lg text-sm transition-colors ${
+                    className={`flex min-h-11 xl:min-h-8 items-center gap-2.5 px-2 py-1 rounded-lg text-sm transition-colors ${
                       off
                         ? 'opacity-40 hover:opacity-70'
                         : 'hover:bg-surface-2'
@@ -440,15 +438,12 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
                 )
               })}
             </div>
-            <p className="mt-3 pt-3 border-t border-border/60 text-[11px] text-text-dim">
-              Click a row to hide or show that type on the map.
-            </p>
           </div>
 
           {/* Per-seed detail */}
-          <div className="card p-4 text-xs text-text-dim flex flex-col gap-2">
+          <div className="card p-4 text-xs text-text-dim flex shrink-0 flex-col gap-1.5">
             <div className="text-xs font-semibold uppercase tracking-widest text-accent mb-1">
-              Seed {entry.seed} detail
+              {solo ? 'Solo map detail' : `Seed ${entry.seed} detail`}
             </div>
             <div className="flex justify-between gap-3">
               <span>Large spice fields</span>
@@ -464,41 +459,8 @@ export function WickMaps({ embedded = false }: { embedded?: boolean }) {
               <span>Captured</span>
               <span className="font-mono text-text">{fmtCaptured(entry.capturedUtc)}</span>
             </div>
-            {entry.note && (
-              <p className="mt-1 pt-2 border-t border-border/60 leading-relaxed">
-                <Icon name="Info" size={11} className="inline mr-1 -mt-0.5" />
-                {entry.note}
-              </p>
-            )}
-          </div>
-        </div>
-      </div>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Static cards                                                       */}
-      {/* ------------------------------------------------------------------ */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
-        <div className="card p-4 border-warning/30">
-          <div className="text-xs font-semibold uppercase tracking-widest text-warning mb-2 flex items-center gap-1.5">
-            <Icon name="AlertTriangle" size={13} /> About this data
           </div>
-          <p className="text-sm text-text-dim leading-relaxed">{PAYLOAD.disclaimer}</p>
-          <p className="text-xs text-text-dim leading-relaxed mt-2">
-            Sub-cell positions within a sector are approximate, and the underlying spawn tables are
-            probabilistic — treat sectors as reliable and exact placement as a guide.
-          </p>
-        </div>
-
-        <div className="card p-4">
-          <div className="text-xs font-semibold uppercase tracking-widest text-accent mb-2">
-            Source
-          </div>
-          <p className="text-sm text-text-dim leading-relaxed">
-            Seed table by <strong className="text-text">Wick</strong>{' '}
-            (<span className="font-mono">@.arturiuss</span>), who brute-forced the 12 layouts.
-            Seed-0 spice pool by <strong className="text-text">DrkShrk</strong>{' '}
-            (<span className="font-mono">@drkshrk</span>).
-          </p>
         </div>
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from '../router'
 import { externalPortVerificationUrl, summarizeTcpPorts } from '../util/portStatusPresentation'
 import { PageHeader } from '../components/PageHeader'
@@ -211,8 +211,11 @@ export function Dashboard() {
   const [links, setLinks] = useState<LinksResponse | null>(null)
   const [linksLoading, setLinksLoading] = useState(false)
   const [linksError, setLinksError] = useState<string | null>(null)
+  const linksRequestPending = useRef(false)
 
   const refreshLinks = useCallback(async (force = false) => {
+    if (linksRequestPending.current) return
+    linksRequestPending.current = true
     setLinksLoading(true); setLinksError(null)
     try {
       const r = await getLinks({ force })
@@ -221,13 +224,18 @@ export function Dashboard() {
       setLinks(null)
       setLinksError(e instanceof ApiError ? e.message : String(e))
     } finally {
+      linksRequestPending.current = false
       setLinksLoading(false)
     }
   }, [])
 
-  // The links endpoint resolves battlegroup state itself. Depending on bgReady
-  // caused a duplicate cold-start request as soon as /api/status completed.
-  useEffect(() => { void refreshLinks() }, [refreshLinks])
+  // Resolve again after VM/BG startup instead of retaining the first unavailable
+  // response for the whole visit. Keep the cheap cadence and skip busy requests.
+  useEffect(() => {
+    void refreshLinks()
+    const timer = window.setInterval(() => { void refreshLinks() }, 60_000)
+    return () => window.clearInterval(timer)
+  }, [refreshLinks])
 
   // Log exports — run-command wrappers
   const [exportBusy, setExportBusy] = useState<string | null>(null)
@@ -307,14 +315,14 @@ export function Dashboard() {
         </div>
         <div className="card card-hover p-4 flex flex-col">
           <div className="flex items-center justify-between">
-            <span className="text-xs uppercase tracking-wider text-text-dim">Gameplay Admin</span>
-            <Icon name="Gamepad2" size={16} className="text-accent" />
+            <span className="text-xs uppercase tracking-wider text-text-dim">Live Maps</span>
+            <Icon name="Map" size={16} className="text-accent" />
           </div>
           <p className="text-sm text-text-muted mt-2 flex-1">
-            Native market, exchange, and bot tools — full gameplay administration, right here in one console.
+            View live map activity and server observations.
           </p>
-          <button className="btn-primary mt-3 self-start shrink-0" onClick={() => navigate('/gameplay')}>
-            <Icon name="ArrowRight" size={15} /> Open Gameplay Admin
+          <button className="btn-primary mt-3 self-start shrink-0" onClick={() => navigate('/map?view=live')}>
+            <Icon name="ArrowRight" size={15} /> Open Live Maps
           </button>
         </div>
       </section>

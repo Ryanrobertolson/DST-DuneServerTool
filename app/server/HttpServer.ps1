@@ -165,6 +165,7 @@ function Test-DunePortalOwnerOnlyPath {
 
 function Test-DunePortalOwnerOrAdminPath {
     param([string]$Path, [string]$Method = 'GET')
+    if ($Path.StartsWith('/api/v1/maps/atlas/')) { return $true }
     return (
         $Method -eq 'GET' -and
         (
@@ -306,6 +307,7 @@ function Add-DuneRouteContractContext {
         [Parameter(Mandatory)][string]$RequestId
     )
     $RouteParams['requestPrincipal'] = $Principal
+    $RouteParams['registeredPath'] = [string]$Route.Path
     $RouteParams['requestId'] = $RequestId
     if (Get-Command Get-DuneRouteClassification -ErrorAction SilentlyContinue) {
         $classification = Get-DuneRouteClassification $Route
@@ -316,7 +318,7 @@ function Add-DuneRouteContractContext {
 
 function Test-DuneDispatchPrincipalAccess {
     param([Parameter(Mandatory)]$Route, [Parameter(Mandatory)]$Principal)
-    if (-not (Get-Command Test-DuneRoutePrincipalAccess -ErrorAction SilentlyContinue)) { return $true }
+    if (-not (Get-Command Test-DuneRoutePrincipalAccess -ErrorAction SilentlyContinue)) { return ([string]$Principal.type -ne 'linked-player') }
     return [bool](Test-DuneRoutePrincipalAccess -Route $Route -Principal $Principal)
 }
 
@@ -620,7 +622,11 @@ function Invoke-DuneApiHandlerAsync {
             }
 
             $h = [scriptblock]::Create($handlerText)
-            $invoke = { & $h $req $res $routeParams $body }
+            $invoke = {
+                if ([string]$routeParams.requestPrincipal.type -eq 'linked-player' -and
+                    -not (Test-DunePlayerRequestAccess -Request $req -Response $res -RouteParams $routeParams -Body $body)) { return }
+                & $h $req $res $routeParams $body
+            }
             $admitted = Invoke-DuneWorldRestartAdmission -Method $method -Path $path -Action $invoke
             if ($admitted -is [System.Collections.IDictionary] -and $admitted.blocked) {
                 Write-DuneError -Response $res -Status 423 -Message 'World Restart maintenance is active. Wait for completion or use its rollback control.'
@@ -783,7 +789,7 @@ function Write-DuneFile {
     $Response.ContentType = Get-DuneMimeType $Path
 
     # Cache hashed assets aggressively, anything else not at all.
-    if ($Path -match '\\assets\\.+\-[A-Za-z0-9_-]{6,}\.(?:js|css|woff2?|png|jpg|svg)$') {
+    if ($Path -match '\\assets\\.+\-[A-Za-z0-9_-]{6,}\.(?:js|css|woff2?|png|jpg|svg)$' -or $Path -match '[\\/]item-icons[\\/][a-f0-9]{20}\.webp$') {
         $Response.Headers['Cache-Control'] = 'public, max-age=31536000, immutable'
     } else {
         $Response.Headers['Cache-Control'] = 'no-cache'
@@ -978,7 +984,7 @@ function Start-DuneHttpServer {
     }
 
     $httpReady = [Threading.ManualResetEventSlim]::new($false)
-    if (Get-Command Start-DunePlatformCacheStartup -ErrorAction SilentlyContinue) {
+    if (-not ((Get-Command Test-DuneSoloInstallation -ErrorAction SilentlyContinue) -and (Test-DuneSoloInstallation)) -and (Get-Command Start-DunePlatformCacheStartup -ErrorAction SilentlyContinue)) {
         try {
             [void](Start-DunePlatformCacheStartup -ServerDir $script:DuneServerDir -HttpReady $httpReady)
         } catch {
@@ -989,7 +995,7 @@ function Start-DuneHttpServer {
     # Launch the in-process scheduled-restart loop. It lives in this process, so
     # it only fires while DST is open and running (the UI states this). Failure
     # to start must not block the server from accepting requests.
-    if (Get-Command Start-DuneRestartScheduler -ErrorAction SilentlyContinue) {
+    if (-not ((Get-Command Test-DuneSoloInstallation -ErrorAction SilentlyContinue) -and (Test-DuneSoloInstallation)) -and (Get-Command Start-DuneRestartScheduler -ErrorAction SilentlyContinue)) {
         try { Start-DuneRestartScheduler -ServerDir $script:DuneServerDir -HttpReady $httpReady } catch {
             if (Get-Command Write-DuneLog -ErrorAction SilentlyContinue) {
                 Write-DuneLog "restart scheduler launch failed: $($_.Exception.Message)" 'WARN'
@@ -1129,6 +1135,10 @@ function Invoke-DuneContext {
             $res.OutputStream.Close()
             return
         }
+        if ((Get-Command Test-DuneSoloInstallation -ErrorAction SilentlyContinue) -and (Test-DuneSoloInstallation)) {
+            Write-DuneError -Response $res -Status 409 -Message 'Dedicated-server connections require the Self-Hosted + Solo installation.'
+            return
+        }
         foreach ($r in $script:DuneWsRoutes) {
             $m = $r.Regex.Match($rawPath)
             if ($m.Success) {
@@ -1261,6 +1271,10 @@ function Invoke-DuneContext {
                     $routeParams['remoteEmail'] = $auth.email
                     $routeParams['remoteRole']  = $auth.role
                     Add-DuneRouteContractContext -Route $r -RouteParams $routeParams -Principal $remotePrincipal -RequestId $requestId
+                    if ((Get-Command Test-DuneSoloInstallation -ErrorAction SilentlyContinue) -and (Test-DuneSoloServerApiPath -Path $rawPath -Method $method) -and (Test-DuneSoloInstallation)) {
+                        Write-DuneError -Response $res -Status 409 -Message 'Dedicated-server tools require the Self-Hosted + Solo installation.'
+                        return
+                    }
                     if (Test-DuneWorldRestartWriteBlocked -Method $method -Path $rawPath) {
                         Write-DuneError -Response $res -Status 423 -Message 'World Restart maintenance is active. Wait for completion or use its rollback control.'
                         return
@@ -1366,6 +1380,8 @@ function Invoke-DuneContext {
             return
         }
         if ((Test-DunePortalOwnerOrAdminPath -Path $rawPath -Method $method) -and
+            -not ($portalSessionAuth.ok -and $portalSessionAuth.account.role -eq 'player' -and
+                $method -eq 'GET' -and $rawPath.StartsWith('/api/v1/maps/')) -and
             -not (Test-DunePortalOwnerOrAdminAccess `
                 -AccountMode $accountMode `
                 -IsLocalRequest $isLocalRequest `
@@ -1409,6 +1425,10 @@ function Invoke-DuneContext {
                     $routeParams['portalAccountRole'] = [string]$portalSessionAuth.account.role
                 }
                 Add-DuneRouteContractContext -Route $r -RouteParams $routeParams -Principal $principal -RequestId $requestId
+                if ((Get-Command Test-DuneSoloInstallation -ErrorAction SilentlyContinue) -and (Test-DuneSoloServerApiPath -Path $rawPath -Method $method) -and (Test-DuneSoloInstallation)) {
+                    Write-DuneError -Response $res -Status 409 -Message 'This feature requires a Self-Hosted + Solo installation.'
+                    return
+                }
                 if (Test-DuneWorldRestartWriteBlocked -Method $method -Path $rawPath) {
                     Write-DuneError -Response $res -Status 423 -Message 'World Restart maintenance is active. Wait for completion or use its rollback control.'
                     return
@@ -1435,7 +1455,11 @@ function Invoke-DuneContext {
                         $body = ConvertFrom-DuneRequestJson -Raw $body
                     }
                 }
-                $invoke = { & $r.Handler $req $res $routeParams $body }
+                $invoke = {
+                    if ([string]$routeParams.requestPrincipal.type -eq 'linked-player' -and
+                        -not (Test-DunePlayerRequestAccess -Request $req -Response $res -RouteParams $routeParams -Body $body)) { return }
+                    & $r.Handler $req $res $routeParams $body
+                }
                 $admitted = Invoke-DuneWorldRestartAdmission -Method $method -Path $rawPath -Action $invoke
                 if ($admitted -is [System.Collections.IDictionary] -and $admitted.blocked) {
                     Write-DuneError -Response $res -Status 423 -Message 'World Restart maintenance is active. Wait for completion or use its rollback control.'

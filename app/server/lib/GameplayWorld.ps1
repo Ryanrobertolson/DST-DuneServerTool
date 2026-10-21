@@ -179,6 +179,66 @@ function Get-DuneStorageItemsDemo {
     }
 }
 
+function Invoke-DuneStorageRepairAll {
+    param([string]$Ip, [long]$ContainerId)
+    if ($ContainerId -le 0) { return @{ok=$false;error='container_id is required.'} }
+    $scope = @"
+SELECT p.id FROM dune.placeables p
+WHERE p.id = $ContainerId::bigint AND p.is_hologram = false
+  AND p.owner_entity_id IS NOT NULL AND p.owner_entity_id <> 0
+  AND EXISTS (SELECT 1 FROM dune.inventories inv WHERE inv.actor_id = p.id AND inv.inventory_type = 4)
+"@
+    $lookup = @"
+WITH target AS ($scope)
+SELECT i.id, i.template_id, i.stats::text AS original_stats,
+       COALESCE((i.stats->'FItemStackAndDurabilityStats'->1->>'MaxDurability')::float8,0) AS m,
+       COALESCE((i.stats->'FItemStackAndDurabilityStats'->1->>'CurrentDurability')::float8,0) AS c,
+       COALESCE((i.stats->'FItemStackAndDurabilityStats'->1->>'DecayedMaxDurability')::float8,0) AS d,
+       (i.stats->'FItemStackAndDurabilityStats'->1 ? 'CurrentDurability') AS has_c
+FROM target
+JOIN dune.inventories inv ON inv.actor_id = target.id AND inv.inventory_type = 4
+LEFT JOIN dune.items i ON i.inventory_id = inv.id AND i.stats ? 'FItemStackAndDurabilityStats';
+"@
+    $read = Invoke-DuneSqlQuery -Ip $Ip -Sql $lookup -ReadOnly $true -MaxRows 10001 -TimeoutSec 60
+    if (-not $read.ok) { return @{ok=$false;error=$read.error} }
+    $rows = ConvertTo-DuneRowMaps -Result $read
+    if (-not $rows.Count) { return @{ok=$false;error='Storage container not found. Refresh and try again.'} }
+    if ($read.truncated -or $rows.Count -gt 10000) { return @{ok=$false;error='Too many repairable items in this container; nothing was changed.'} }
+    $values = @()
+    foreach ($row in $rows) {
+        if (-not $row['id']) { continue }
+        $rule = Get-DuneGameplayItemRule -TemplateId ([string]$row['template_id'])
+        $target = Resolve-DuneRepairDurabilityTarget -CatalogMax (Get-DuneItemCatalogMaxDurability -TemplateId ([string]$row['template_id'])) -CatalogKnown ([bool]$rule.durability_known) -ItemMax ([double]$row['m']) -ItemCurrent ([double]$row['c']) -ItemDecayedMax ([double]$row['d']) -HasCurrent (ConvertTo-DuneBool $row['has_c'])
+        if ($target -le 0) { continue }
+        $id = [long]$row['id']
+        $amount = Format-DuneFloatForSql -Value $target
+        $stats = ConvertTo-DuneSqlString ([string]$row['original_stats'])
+        $values += "($id::bigint,$amount::float8,'$stats'::jsonb)"
+    }
+    if (-not $values.Count) { return @{ok=$true;repaired=0;message='No repairable equipment in this storage box.'} }
+    $sql = @"
+DO `$repair`$
+DECLARE repaired integer;
+BEGIN
+    UPDATE dune.items i
+    SET stats = jsonb_set(jsonb_set(jsonb_set(i.stats,
+        '{FItemStackAndDurabilityStats,1,MaxDurability}',to_jsonb(v.amount),true),
+        '{FItemStackAndDurabilityStats,1,CurrentDurability}',to_jsonb(v.amount),true),
+        '{FItemStackAndDurabilityStats,1,DecayedMaxDurability}',to_jsonb(v.amount),true)
+    FROM (VALUES $($values -join ',')) AS v(id,amount,original_stats), dune.inventories inv
+    WHERE i.id = v.id AND i.stats = v.original_stats AND i.inventory_id = inv.id
+      AND inv.inventory_type = 4 AND inv.actor_id IN ($scope);
+    GET DIAGNOSTICS repaired = ROW_COUNT;
+    IF repaired <> $($values.Count) THEN
+        RAISE EXCEPTION 'Container contents changed. Refresh and try again; no repairs were saved.';
+    END IF;
+END `$repair`$;
+"@
+    $write = Invoke-DuneSqlQuery -Ip $Ip -Sql $sql -ReadOnly $false -MaxRows 1 -TimeoutSec 60 -Bulk
+    if (-not $write.ok) { return @{ok=$false;error=$write.error} }
+    return @{ok=$true;repaired=$values.Count;message="Repaired $($values.Count) item(s) in this storage box. To reload repairs in-game, open DD Atlas > Lifecycle and restart the map containing this box (Restart Hagga or Restart Deep Desert). Players on that map will be disconnected."}
+}
+
 function Invoke-DuneStorageRename {
     param([string]$Ip, [long]$ContainerId, [string]$Name)
     $trimmedName = $Name.Trim()
@@ -762,37 +822,11 @@ function Invoke-DuneStorageGiveItem {
     $tv = Test-DuneValidGiveTemplate -TemplateId $Template
     if (-not $tv.ok) { return @{ ok = $false; error = $tv.error } }
     if ($Qty -le 0) { $Qty = 1 }
-    $safeTmpl = ConvertTo-DuneSqlString $Template
-    $statsJson = ConvertTo-DuneSqlString (Get-DuneGiveItemStatsJson -TemplateId $Template)
     # acquisition_time must be the current epoch: the game treats acquisition_time=0
     # (1970) items as fully decayed and drops them from the container on zone load,
     # so they show in DST but never appear in-game even after a restart.
-    $sql = @"
-WITH inv AS (
-    SELECT id, COALESCE(max_item_count, 0) AS maxc
-    FROM dune.inventories
-    WHERE actor_id = $ContainerId::bigint
-    ORDER BY id LIMIT 1
-),
-cur AS (
-    SELECT inv.id AS inv_id, inv.maxc, COUNT(i.id) AS cnt
-    FROM inv LEFT JOIN dune.items i ON i.inventory_id = inv.id
-    GROUP BY inv.id, inv.maxc
-),
-ins AS (
-    INSERT INTO dune.items (inventory_id, template_id, stack_size, quality_level, position_index, acquisition_time, stats)
-    SELECT cur.inv_id, '$safeTmpl', $Qty::bigint, $Quality::bigint,
-           COALESCE((SELECT MAX(position_index) + 1 FROM dune.items WHERE inventory_id = cur.inv_id), 0),
-           EXTRACT(EPOCH FROM now())::bigint,
-           '$statsJson'::jsonb
-    FROM cur
-    WHERE cur.maxc = 0 OR cur.cnt < cur.maxc
-    RETURNING id
-)
-SELECT (SELECT id FROM ins)  AS item_id,
-       (SELECT cnt FROM cur)  AS cnt,
-       (SELECT maxc FROM cur) AS maxc;
-"@
+    $stackMax=Resolve-DuneStackMax -Ip $Ip -Template $Template -Quality $Quality
+    $sql=Get-DuneStackedItemGrantSql -InventoryQuery "SELECT id,COALESCE(max_item_count,0) AS maxc FROM dune.inventories WHERE actor_id=$ContainerId::bigint ORDER BY id LIMIT 1 FOR UPDATE" -Template $Template -Qty $Qty -Quality $Quality -StatsJson (Get-DuneGiveItemStatsJson -TemplateId $Template) -StackMax $stackMax
     $res = Invoke-DuneSqlQuery -Ip $Ip -Sql $sql -ReadOnly $false -MaxRows 1 -TimeoutSec 30
     if (-not $res.ok) { return @{ ok = $false; error = $res.error } }
     $maps = ConvertTo-DuneRowMaps -Result $res

@@ -7,9 +7,11 @@ import type {
   SoloRangedWeapon,
 } from '../../api/solo'
 import { Icon } from '../Icon'
+import { useInventoryImages } from '../inventory/useInventoryImages'
 import { InventorySlot } from '../inventory/InventorySlot'
 import { DataState } from '../platform/DataState'
 import { DetailPanel } from '../platform/DetailPanel'
+import { CollapsibleCard } from '../CollapsibleCard'
 
 const emptyMetadata = {
   category: '',
@@ -104,9 +106,10 @@ export function SoloInventoryExplorer({
     quantity: number,
   ) => void
 }) {
+  const [loadImages, setLoadImages] = useInventoryImages()
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState<'name' | 'quantity'>('name')
-  const [destinationKey, setDestinationKey] = useState('')
+  const [chosenDestinationKey, setDestinationKey] = useState<string | null>(null)
   const [visibleCount, setVisibleCount] = useState(100)
   const [selected, setSelected] = useState<SharedInventoryGroup | null>(null)
   const [deleteQuantities, setDeleteQuantities] = useState<Record<number, string>>({})
@@ -114,6 +117,17 @@ export function SoloInventoryExplorer({
     () => buildSoloInventoryLocations(items, inventories),
     [inventories, items],
   )
+  const backpackKey = inventories.find(inventory => inventory.kind === 'backpack')?.key
+    ?? items.find(item => item.destinationKind === 'backpack')?.destinationKey
+    ?? locations[0]?.key
+    ?? ''
+  const destinationKey = chosenDestinationKey ?? backpackKey
+
+  useEffect(() => {
+    if (chosenDestinationKey && !locations.some(location => location.key === chosenDestinationKey)) {
+      setDestinationKey(null)
+    }
+  }, [chosenDestinationKey, locations])
   const groups = useMemo(() => {
     const needle = query.trim().toLowerCase()
     const visibleItems = filterSoloInventoryItemsByLocation(items, destinationKey)
@@ -140,21 +154,18 @@ export function SoloInventoryExplorer({
   }, [groups])
 
   return (
-    <section className="card p-5" aria-labelledby="solo-current-inventory-title">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 id="solo-current-inventory-title" className="flex items-center gap-2 font-semibold">
-            <Icon name="PackageSearch" size={16} />
-            Current inventory
-          </h2>
-          <p className="mt-1 text-sm text-text-muted">
-            Browse or remove items from the Backpack, Bank Storage, and supported built storage. The game must be fully closed before deletion.
-          </p>
-        </div>
+    <CollapsibleCard
+      id="solo-current-inventory"
+      title="Current inventory"
+      icon="PackageSearch"
+      subtitle="Browse items in the Backpack, worn equipment, equipped weapons and tools, Bank Storage, and supported built storage. Unequip equipment before deleting it. The game must be fully closed before deletion."
+      headerRight={
         <span className="pill border-info/40 bg-info/10 text-info">
           {groups.length} item type{groups.length === 1 ? '' : 's'}
         </span>
-      </div>
+      }
+      className="mb-0"
+    >
 
       {connected && items.length > 0 && (
         <>
@@ -194,15 +205,18 @@ export function SoloInventoryExplorer({
               </select>
             </label>
           </div>
+          <label className="mt-3 flex min-h-11 items-center gap-2 text-sm">
+            <input type="checkbox" checked={loadImages} onChange={event => setLoadImages(event.target.checked)} />Load images
+          </label>
           {groups.length === 0 ? (
             <div className="mt-4">
               <DataState state="empty" title="No matching Solo inventory items" message="Try another item, template, or location." />
             </div>
           ) : (
-            <ul className="mt-4 grid min-w-0 grid-cols-[repeat(auto-fill,minmax(min(6.5rem,100%),1fr))] gap-2.5" aria-label="Solo inventory results">
+            <ul className={loadImages ? "mt-4 grid min-w-0 grid-cols-[repeat(auto-fill,minmax(min(6.5rem,100%),1fr))] gap-2.5" : "mt-4 grid min-w-0 grid-cols-1 gap-1.5"} aria-label="Solo inventory results">
               {visibleGroups.map(group => (
                 <li key={group.groupKey} className="min-w-0">
-                  <InventorySlot item={group} onSelect={setSelected} />
+                  <InventorySlot item={group} showImages={loadImages} onSelect={setSelected} />
                 </li>
               ))}
             </ul>
@@ -242,7 +256,9 @@ export function SoloInventoryExplorer({
                       <p className="truncate font-medium text-text">{location.destinationLabel}</p>
                       <p className="text-xs text-text-muted">Item {occurrence.itemId} · quality {occurrence.quality} · stack x{occurrence.stackSize}</p>
                     </div>
-                    <div className="flex shrink-0 items-end gap-2">
+                    {location.destinationKind === 'equipment' ? (
+                      <span className="text-xs text-text-muted">Unequip to delete</span>
+                    ) : <div className="flex shrink-0 items-end gap-2">
                       <label className="text-xs font-medium text-text-muted">
                         Delete quantity
                         <input
@@ -269,7 +285,7 @@ export function SoloInventoryExplorer({
                       >
                         <Icon name={busyItemId === occurrence.itemId ? 'LoaderCircle' : 'Trash2'} size={15} className={busyItemId === occurrence.itemId ? 'animate-spin' : undefined} />
                       </button>
-                    </div>
+                    </div>}
                   </li>
                 )
               }))}
@@ -277,7 +293,7 @@ export function SoloInventoryExplorer({
           </div>
         )}
       </DetailPanel>
-    </section>
+    </CollapsibleCard>
   )
 }
 

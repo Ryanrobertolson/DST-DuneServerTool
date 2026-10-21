@@ -1,4 +1,4 @@
-# Tests the building-set additions to the cosmetics catalog: the group-mapping
+﻿# Tests the building-set additions to the cosmetics catalog: the group-mapping
 # helper (pure), the building-sets.json loader, and that Get-DuneCosmeticsCatalog
 # surfaces the full grantable building-set universe (Observer Twitch set, collab
 # murals, statues/decor, furniture, movie sets, faction/house sets, base-game
@@ -56,17 +56,17 @@ Describe 'Get-DuneCosmeticsCatalog includes the full building-set universe' -Tag
         $script:cat.total | Should -BeGreaterThan 0
     }
     It 'surfaces the full grantable building-set universe (200+ ids)' {
-        @($script:cat.templates | Where-Object { $_.group -like 'Building Sets*' }).Count | Should -BeGreaterThan 200
+        @($script:cat.templates | Where-Object { $_.group -like 'Building Sets*' }).Count | Should -BeGreaterThan 150
     }
     It 'surfaces the 39 Observer Twitch building pieces under one group' {
         $observer = @($script:cat.templates | Where-Object { $_.template -like 'MTX_Choam_TwitchReward_*' })
         $observer.Count | Should -Be 39
         ($observer | ForEach-Object group | Select-Object -Unique) | Should -Be 'Building Sets - Observer (Twitch)'
     }
-    It 'includes base-game faction sets and crafting stations (not just MTX)' {
+    It 'excludes base-game progression recipes while retaining cosmetic decorations' {
         $script:cat.templates.template | Should -Contain 'AtreidesSet'
         $script:cat.templates.template | Should -Contain 'HarkonnenSet'
-        $script:cat.templates.template | Should -Contain 'SmallSpiceRefinery'
+        $script:cat.templates.template | Should -Not -Contain 'SmallSpiceRefinery'
         $script:cat.templates.template | Should -Contain 'MTX_Neut_MuralPainting_01_Patent'
     }
     It 'still includes the existing appearance cosmetics (regression)' {
@@ -79,7 +79,7 @@ Describe 'Get-DuneCosmeticsCatalog includes the full building-set universe' -Tag
         $boots.name | Should -Be ("Smuggler{0}s Agile Assault Boots" -f [char]0x2019)
         $boots.name | Should -Not -Match ([char]0x00E2)
     }
-    It 'includes developer cosmetics and building unlocks' {
+    It 'retains non-tech developer entries without name-based omissions' {
         $script:cat.templates.template | Should -Contain 'D_Choam_HeavyArmor_Swatch'
         $script:cat.templates.template | Should -Contain 'D_TestMeshVariant'
         $script:cat.templates.template | Should -Contain 'D_AdvFabricationSet_Patent'
@@ -145,5 +145,69 @@ Describe 'Get-DuneCosmeticsCatalog includes the full building-set universe' -Tag
             $e.template | Should -Not -BeNullOrEmpty
             $e.name     | Should -Not -BeNullOrEmpty
         }
+    }
+}
+
+
+Describe 'Bulk building set catalog' {
+    It 'omits every tech buildable from individual and bulk grants' {
+        $tech = Get-Content (Join-Path $PSScriptRoot '../app/data/dune-tech-catalog.json') -Raw | ConvertFrom-Json
+        $individual = (Get-DuneCosmeticsCatalog).templates.template
+        $bulk = (Get-DuneBuildingSetGrantCatalog).template
+        foreach ($key in $tech.item_keys | Where-Object { $_ -like 'BLD_*' }) {
+            $individual | Should -Not -Contain $key.Substring(4)
+            $bulk | Should -Not -Contain $key.Substring(4)
+        }
+    }
+    It 'preserves non-tech furniture and decor alongside MTX sets' {
+        $bulk = (Get-DuneBuildingSetGrantCatalog).template
+        foreach ($id in @('Choam_OfficeSet_Furniture_Patent','Choam_OfficeSet_SmallDeco_Patent',
+            'Choam_BedroomSet_Furniture_Patent','Choam_BedroomSet_SmallDeco_Patent',
+            'Choam_DiningRoomSet_Furniture_Patent','Choam_DiningRoomSet_SmallDeco_Patent',
+            'Atre_BedroomSet_Patent','Hark_OfficeSet_Patent','D_AdvFurnitureSet_Patent',
+            'MTX_ChoamExtention_Floor_01_Patent')) {
+            (Get-DuneCosmeticsCatalog).templates.template | Should -Contain $id
+            $bulk | Should -Contain $id
+        }
+    }
+    It 'keeps developer storage individually available and out of bulk' {
+        (Get-DuneCosmeticsCatalog).templates.template | Should -Contain 'Developer_Storage_Container_Patent'
+        (Get-DuneBuildingSetGrantCatalog).template | Should -Not -Contain 'Developer_Storage_Container_Patent'
+    }
+}
+
+Describe 'Bulk skin catalogs' {
+    It 'includes every dye rather than only House Swatches' {
+        $dyes = @(Get-DuneSkinGrantCatalog -Kind dyes)
+        $house = @(Get-DuneHouseSwatchCatalog -Kind all)
+        $dyes.Count | Should -BeGreaterThan $house.Count
+        @($dyes | Where-Object group -ne 'Swatches (Dyes)').Count | Should -Be 0
+        foreach ($entry in $house) { $dyes.template | Should -Contain $entry.template }
+    }
+    It 'includes vehicle skins without weapon, armor or building unlocks' {
+        $vehicles = @(Get-DuneSkinGrantCatalog -Kind vehicle)
+        $vehicles.Count | Should -BeGreaterThan 0
+        @($vehicles | Where-Object group -ne 'Vehicle Skins').Count | Should -Be 0
+        $vehicles.template | Should -Contain 'Atreides_Buggy_Variant'
+    }
+    It 'excludes known tokens without a research action while keeping them visible for diagnosis' {
+        $catalog = Get-DuneCosmeticsCatalog
+        $skins = @(Get-DuneSkinGrantCatalog -Kind armor)
+        foreach ($id in @('D_Choam_Assault_SetVariant','D_Choam_HeavyArmor_SetVariant','D_Choam_Scout_SetVariant','D_Choam_Stillsuit_SetVariant','D_HarkonnenAssault_SetVariant')) {
+            $skins.template | Should -Not -Contain $id
+            ($catalog.templates | Where-Object template -eq $id).bulk_exclusion | Should -Match 'no working research action'
+        }
+    }
+    It 'selects armor and suits without dyes, building recipes, weapons or vehicles' {
+        $skins = @(Get-DuneSkinGrantCatalog -Kind armor)
+        $skins.Count | Should -BeGreaterThan 0
+        @($skins | Where-Object { $_.group -ne 'Armor & Suit Sets' }).Count | Should -Be 0
+        $skins.template | Should -Contain 'MTX_B1C3_Smug_LightArmor_SetVariant_Boots'
+        $skins.template | Should -Not -Contain 'D_Choam_HeavyArmor_Swatch'
+    }
+    It 'selects only weapon appearances' {
+        $skins = @(Get-DuneSkinGrantCatalog -Kind weapon)
+        $skins.Count | Should -BeGreaterThan 0
+        @($skins | Where-Object { $_.group -ne 'Weapon Skins' }).Count | Should -Be 0
     }
 }

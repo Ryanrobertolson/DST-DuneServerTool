@@ -1,3 +1,4 @@
+import { useSoloInstallation } from '../hooks/useInstallationMode'
 import { Link, NavLink, useLocation, useSearch } from '../router'
 import { useEffect, useMemo, useState, useRef } from 'react'
 import { createPortal } from 'react-dom'
@@ -54,6 +55,7 @@ export function Sidebar({ collapsed, onExpand }: Props) {
   const { pathname } = useLocation()
   const search = useSearch()
   const { canAccessOwnerSurfaces } = usePortalAccess()
+  const soloOnly = useSoloInstallation()
   const { data: upd } = useUpdateCheck()
   const version = upd?.currentVersion ?? ''
   const testBuild = getTestBuildIdentity(upd)
@@ -177,7 +179,8 @@ export function Sidebar({ collapsed, onExpand }: Props) {
     windows: windowsViewer,
     canAccessOwnerSurfaces,
     includeSidebarHidden: false,
-  }), [canAccessOwnerSurfaces, localViewer, windowsViewer])
+    soloOnly,
+  }), [canAccessOwnerSurfaces, localViewer, windowsViewer, soloOnly])
   const {
     layoutItems,
     reorder,
@@ -390,6 +393,22 @@ export function Sidebar({ collapsed, onExpand }: Props) {
           collapsed ? 'px-1.5 py-2' : 'px-4 py-3'
         } border-t border-border text-[10px] text-text-dim space-y-2`}
       >
+        <a
+          href="https://buymeacoffee.com/coastal_dst"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Buy Me a Coffee"
+          aria-label="Buy Me a Coffee"
+          className={
+            `${collapsed
+              ? 'w-full flex items-center justify-center h-8 rounded-md border border-border text-text-dim hover:text-text hover:bg-surface-2/60 transition-colors'
+              : 'w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md border border-border text-text-muted hover:text-text hover:bg-surface-2/60 transition-colors uppercase tracking-widest'
+            } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent`
+          }
+        >
+          <Icon name="Coffee" size={collapsed ? 14 : 11} />
+          {!collapsed && <span>Buy Me a Coffee</span>}
+        </a>
         {!customizing && (
           <button
             type="button"
@@ -420,20 +439,20 @@ export function Sidebar({ collapsed, onExpand }: Props) {
           </NavLink>
         )}
         {!collapsed && (
-          <div className="flex items-center justify-between">
-            <span className="flex items-center gap-1.5">
-              {version ? fmtToolVersion(version) : '—'}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="flex flex-wrap items-center gap-1.5">
+              <span className="whitespace-nowrap">{version ? fmtToolVersion(version) : '—'}</span>
               {testBuild && (
                 <NavLink
                   to="/settings"
                   title={`${testBuild.title}. Click to open Settings, switch to Stable, and install the released build.`}
-                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider border border-warning/40 bg-warning/10 text-warning hover:bg-warning/20 transition-colors"
+                  className="inline-flex shrink-0 whitespace-nowrap items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider border border-warning/40 bg-warning/10 text-warning hover:bg-warning/20 transition-colors"
                 >
                   <Icon name="FlaskConical" size={9} /> {testBuild.compactLabel}
                 </NavLink>
               )}
             </span>
-            <span className="font-mono">coastal-ms</span>
+            <span className="font-mono whitespace-nowrap">coastal-ms</span>
           </div>
         )}
       </div>

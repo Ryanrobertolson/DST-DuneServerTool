@@ -13,6 +13,431 @@ here cover everything those tags shipped.
 
 ## [Unreleased]
 
+## [16.5.4] - 2026-10-20
+
+Make Solo INI backup controls available, hide the backend console, detect Steam and Xbox game installations on the Mods page, and add a Solo seed-map widget with a Live Map launcher and a minimum size that keeps POIs readable.
+
+Add Widget mode: a compact, movable game-status window with an Open full DST control. Keep map pop-outs and remote management available while the local window is compact. Show current map status without duplicate retired instances. Remember Widget window size and position independently of the full window.
+
+Keep inventory under each player's record, with Backpack & bank, Storage containers and item tools. Browse 28 inventory items per page, with emotes and contract entries loaded separately on demand, load only the selected player's items, and repair the selected container in place. Consolidate older inventory tabs into the player screen. Remember the Load images choice across inventory sections, with compact image-free lists showing 100 items per page. Reuse visited inventory pages and item details, and open containers directly in the correct player record. Keep expanded durability editors in sync after repair or refresh, expose backpack-and-equipped repair in Inventory, and give the actual map-restart path after container repair.
+
+Open Vehicle Fleet with a player selector and load the selected player's fleet, with an explicit All vehicles option for server-wide management.
+
+Pause background map reads when no map viewers remain, preserving the saved Live setting. Remember Solo Live Map layer selections when the window is reopened, including when all layers are turned off.
+
+Use compact Online and Offline requirement labels with consistent player action cards.
+
+Replace the redundant Gameplay Admin dashboard shortcut with Open Live Maps.
+
+Reduce backend CPU use when processing large database results and keeping Live Maps open. Keep market listing refreshes on their configured schedule and skip unused price checks when no player orders exist.
+
+## [16.5.3] - 2026-10-20
+
+Restore faster Live Maps startup after the latest game update for both official and Tank-enabled servers. Keep moving positions updating while resource layers load.
+
+## [16.5.2] - 2026-10-20
+
+Fix server updates leaving Hagga on an older Tank-enabled build. Complete applied updates when Funcom reports existing command links during cleanup and wait for all maps to stop before changing images.
+
+Make self-hosted Regis Tank support off by default, including previous automatic activation. Users who want Tanks must explicitly enable support in Server Settings before the next server start or update. Other users return to the official server image without Tank preparation.
+
+Tanks use a custom server image outside Funcom's normal update path. Disable Tank support before server updates, then re-enable it only when DST supports the new build. Starting the official server with Tank support disabled can remove saved Tanks. Tank compatibility for server build 2160922 is included.
+
+Add Update with Tank support in Server Settings and Commands. It stops the battlegroup, disables support, updates the server, and restores Tank support before resuming. If compatibility cannot be restored, the battlegroup stays stopped.
+
+## [16.5.1] - 2026-10-19
+
+Download the private map Python runtime automatically when needed instead of including it in the installer, and include the full map icon set for clean installations.
+
+Include game-sourced terrain backgrounds for self-host and Solo live maps, with automatic Deep Desert layout selection and no terrain download. Discover the running server layout automatically for live readings after game updates, including Tank-enabled servers.
+
+Speed up console commands for LAN Hyper-V hosts and show VM connection progress immediately, with connection timeouts and clearer failures.
+
+Restore self-host Regis Tank compatibility for Dune Awakening server build 2156652, preserving the matching official server image for rollback.
+
+Keep installed vehicle-module repair values separate from inventory item durability, and restore missing developer and building-grant catalog entries.
+
+Refresh item definitions from the current game files across self-host and Solo. Restore missing equipment durability caps, show the base maximum when a saved item omits it, and fix selected-box repairs incorrectly reporting no repairable items.
+
+Keep map Live collection enabled across DST updates and restarts, and resume reads as worlds return. Stop live stays off until Start live is selected again.
+
+Repair all equipment in a selected self-host storage box, leaving other containers and non-equipment items unchanged.
+
+Allow mod ZIP updates to replace installed mods after confirmation. Warn that replacing mod folders resets their custom control files and settings, while keeping enabled selections and load order.
+
+Refresh the server-update badge automatically when the battlegroup starts. Clear stale notices when the installed server is current and keep the last known status if a version check fails.
+
+Restore DD Atlas live observations for the Dune Awakening 1.5.15.0 server build, including position, gathering, vehicle and point-of-interest discovery.
+
+Correct the Landsraad minimum-term setting and remove obsolete advanced controls for Dune Awakening 1.5.15.0.
+
+Game Config now reads and edits the active persistent INIs exposed by Funcom File Browser. Battlegroup restart preserves those files instead of copying setup templates over manual changes and deletions. Related local game INI differences are advisory: review either direction explicitly, or keep them separate. Live Atlas uses the full available workspace width, supports expanding the map, and keeps expanded base markers within the viewport.
+
+Live Atlas cancels active observation processes when Stop live is pressed, including their child helpers, instead of waiting for long resource scans to time out. Stored, recovering and travelling vehicles are excluded from deployed vehicle map markers.
+
+Live Atlas restores its verified read-only observation helpers after a server reboot and shows when live layers are waiting for a world to start or recover.
+
+Advanced settings and Experimental Lab can clear an already-empty server INI assignment such as `SafeZone.EnableScale=`. Clear now stages removal even when the displayed value is blank, preserving explicit zero values and unrelated manual settings. Refresh rereads manual server edits and deletions without restoring defaults.
+
+- Make DD Atlas a standalone sidebar workspace, removing the duplicate Gameplay Admin navigation and map headers.
+- Limit simultaneous Atlas collection jobs, add recovery time after slow reads, and run observation helpers at lower priority. Avoid redrawing unchanged map responses.
+
+- Track Hagga worms, resources and observed storms with the same guarded live readers as Deep Desert, keeping region data separate.
+- Match Atlas controls to the selected DST theme and slightly enlarge large spice fields and worms.
+- Keep optional gathering discovery from delaying a ready snapshot; clear old refresh errors when live collection starts. Restrict collector timing changes to the local owner and describe intervals as targets rather than guaranteed real time.
+
+- Store local INI recovery copies under DST/INI Backups in the install folder, with the location and an Open folder action in Settings. Unchanged saves leave the file untouched and create no extra copy.
+- Preserve existing INIs on installation and reads, without automatic legacy migration or initialization gates. Compare INIs is an explicit action; field edits identify required destinations and allow intentional local differences to stay separate.
+- Verify recovery copies of every selected server INI before writing settings; stop before settings writes if a recovery copy cannot be verified.
+- Offer Save to local, Local to server and remembered Skip for each INI difference; show changed values again after a previous Skip.
+- Include manual scalar INI entries in optional server/local comparisons, with an exact single-entry review for settings outside the control list.
+- Verify server INI saves with privileged file access so restricted persistent directories do not report a successful write as failed.
+- Keep unselected server/local INI differences visible after a single winner is applied, and ignore equivalent numeric formatting.
+
+- Reclaim Live state height by removing repeated workspace headings while retaining navigation.
+- Bound Atlas snapshot refreshes, allow cancellation, reuse current gathering discovery, and keep marker icons within the visible map viewport.
+
+Server settings and Experimental Lab scalar overrides now follow the saved server files: unset entries remain blank, entering a value writes it, and clearing a value removes the entire assignment on apply. Each setting's Default button writes its available Funcom default; no default is invented when none is known. Refreshing established server INIs respects manual changes instead of replaying older deployed values after a hash change. Local player INIs remain a separate, optional approved apply.
+
+Official server settings sliders now use a 0–10 convenience range, with 0.1 steps for fractional settings and compact readouts. Wheel adjustments change focused fractional controls by 0.1; unfocused controls leave scrolling alone. Exact entry preserves values above the slider range.
+
+Experimental Lab saves now review local Solo/player files and self-hosted server files as separate destinations. Local changes require explicit confirmation, preserve unrelated entries, and back up existing files; Apply server settings deploys the saved server copy separately. Path-related rows are read-only, preserving saved paths and showing inherited Funcom defaults without creating overrides.
+
+Solo and self-hosted distinguish Resource Respawn Speed (higher is faster) from Loot Respawn Time (higher is slower), retaining the original game keys. Water extraction guidance identifies conflicting source descriptions. The base-backup default is 16 hours when defaults are explicitly selected; saved values remain unchanged. Crafting time uses a 0–5 convenience slider, and the base-backup window uses direct entry in hours.
+
+Documented defaults for repair cost, recycler output and vehicle sandworm protection after a server restart match the installed 1.5.3.7 game defaults; existing overrides remain unchanged.
+
+Item decay guidance distinguishes the update interval in seconds from decay speed. Abandoned-vehicle decay no longer guesses the effect of higher values.
+
+### Added
+- Experimental Steam Deck support for stock SteamOS in a dedicated Solo tab: companion download and encrypted pairing, one-way managed settings sync, enabled mods and load order sync, and a separate modded Steam launcher. Save edits and grants stay in PC Solo DST and travel through Steam Cloud.
+- Read Codex ownership and grant selected Codex entries in Solo and self-hosted character tools. Reveal selected paths without completing their quest dependencies.
+- View and download the complete Solo UE4SS log.
+- Drop a mod ZIP into the Solo mod card to install it, using the existing archive validation and preserving installed mods and INI settings. Larger ZIPs can use the file picker.
+- Open Blueprint Designer from Solo's base blueprint import card.
+
+### Changed
+- Open Server Settings and its INI controls directly from the Command Deck bar.
+- Bring official and advanced server controls into one Server Settings page with a shared change review, clear server and player-PC targets, and guarded application that preserves existing configuration and manual management.
+- Keep Review & Apply and its progress/error messages visible while scrolling, use precise wheel steps for official settings, and keep player compatibility headings above their file actions.
+- Distinguish selected-server files from shared player-PC game files, and identify the overlapping official and advanced mining controls without changing existing values.
+- Remove artificial use counts from repeatable Grant All schematic recipes in Solo and self-hosted tools; preserve existing learned recipes and the required quantities for limited-use vehicle parts.
+- Roll up Codex cards in Solo and self-hosted character tools, remembering each view's open or closed state.
+- Combine Solo Journey controls into one completion card, with distinct full tutorial and individual main-quest choices.
+- Framework Adjustments.
+
+### Fixed
+- Adjust focused Solo fractional settings by 0.1 per wheel step, preserving trailing zeroes and decimal precision in the controls and Engine.ini writes.
+- Default Start afterward on in managed settings reviews, including when the battlegroup is already stopped. Leaving it stopped remains an explicit choice.
+- Display the fresh result from manual status refresh, prevent older polls from replacing it, and invalidate port status when the battlegroup changes state.
+- Check public TCP reachability through CanYouSeeMe and PortCheckTool before falling back to Check-Host. Keep checker failures and timeouts separate from a confirmed closed port, recheck Closed results after one minute, and share the same built-in policy with the command-line tool.
+
+## [16.5.0.2] - 2026-10-19
+
+### Fixed
+
+- Allow game server updates when Tank compatibility is enabled.
+- Move Hagga to the updated official server build after an update, preventing mismatched map versions. Tank compatibility is disabled when moving to a newer unsupported build.
+- Correct the Landsraad minimum-term control for Dune Awakening 1.5.15.0 and remove obsolete advanced controls while preserving existing INI values.
+
+### Dune Awakening 1.5.15.0 compatibility
+
+We checked the full DST CVar catalog against the updated game and server files. All identified changes have been handled and cross-checked, including entries removed by Funcom. Existing saved overrides are preserved.
+
+We cannot confirm every CVar's in-game functionality. Controls removed by Funcom are no longer supported, and we will not troubleshoot those removed controls. We will investigate and update DST if other issues arising from this patch are found.
+
+## [16.5.0.2] - 2026-10-19
+
+### Fixed
+- Allow game server updates when Regis Tank compatibility is enabled.
+- Correct the Landsraad minimum-term setting and remove obsolete advanced controls for Dune Awakening 1.5.15.0.
+
+
+## [16.5.0.1] - 2026-10-14
+
+### Changed
+- Order Manage Player item actions with common grants and repairs first, live-required actions next, and experimental Grant All actions last; align card heights within each group. Place Solo Grant All actions directly below Grant Cosmetic / Building Set.
+- Label the three reviewed character collection buttons Grant All in Solo and self-hosted Players actions. New limited-use schematic grants provide one use per recipe, with vehicle locomotion counts sized for one vehicle; existing recipes and remaining uses are preserved.
+- Add a saved UE4SS runtime dropdown for mod launches, defaulting to 1140 with 1164 as an optional choice, and show the selected version, automatic fallback and declared version mismatches. Built-in Tank-only launches keep their existing runtime behavior.
+
+### Fixed
+- Keep Solo Tank grant buttons disabled until the current Solo world is loaded, and reject grants without a fresh in-world runtime signal.
+- Correct the Slaver Stillsuit Gloves display name.
+- Fill compatible existing item stacks before creating new stacks in Solo and self-hosted offline player and storage grants. Restore Welding Wire and ammunition stack metadata and count available stack space when checking inventory slots.
+- Use the previous bundled UE4SS runtime as the compatibility default for optional mods, with the newer runtime available by explicit opt-in and automatic fallback after a confirmed initialization failure. Preserve both runtimes, installed mods and settings. Optional mod requirements do not affect built-in Tank-only launches.
+- Include built-in Solo Tank support for Xbox PC / Game Pass launches using the same game-reflected compatibility checks as Steam, and restore launch files without relying on the background host's hash cmdlet.
+- Rediscover the installed Xbox PC game when an update removes its previously saved package folder and show the accessible XboxGames folder when its registered package path is a junction, preserving valid manual paths and mod selections.
+- Keep Solo mod runtime installation visible while collapsed, offer runtime repair, and report installation results while preserving saves and installed mods.
+- Open the Solo Mods folder through the desktop window when the backend runs as a service, and show loading, completion and errors when refreshing the mod list.
+
+## [16.5.0] - 2026-10-13
+
+### Added
+- Regis Tanks for Steam Solo and self-hosted Hagga: support is prepared automatically during ordinary DST Solo launch or battlegroup start; grant Dart or Flamethrower variants separately using buttons in both modes. Both variants passed driving, weapon and reload persistence checks. Support is limited to the verified game builds; pink weapon effects, missing audio and misleading module labels remain known limitations.
+- Server INI backup download and cleanup in Server Settings: download selected backups as a ZIP, then explicitly delete unchanged selected backups while preserving active configuration files.
+- Shared Solo and self-hosted configuration management checkbox at the bottom of DST Settings, with confirmation before opting out. Opting out preserves all INI content and blocks automatic configuration repair/synchronization, clears DST-owned YAML settings injections, and records the mode in diagnostics. Re-enabling requires explicit Apply INIs before injections resume; explicit saves remain INI-only until then.
+
+### Changed
+- Solo inventory defaults to Backpack and supports collapsing the inventory card. All locations remains selectable.
+- Avoid creating duplicate settings backups when the configuration has not changed.
+- Publish session-scoped enabled-mod lists at the established WPS-compatible paths for NBS Core and similar mods, restoring pre-existing lists after exit without changing UE4SS load order or third-party mod files.
+
+## [16.4.2.1] - 2026-10-12
+
+### Added
+- DD Map tab beside Progression in Solo Mode, showing the Single Player reference layout with location details and legend filters.
+
+### Fixed
+- Correct DD Seed Maps layout 10 using the current Standard reference, replacing the unsupported archived assignment. Other seed layouts are unchanged.
+
+## [16.4.2] - 2026-10-12
+
+### Fixed
+- Solo launch automatically restores an interrupted mod session before starting normally or with mods, and clears stale launch errors after recovery.
+
+### Added
+- Experimental selective House Imota Garment Swatch and Mercenary Light Armor Set grants in self-hosted Players actions and Solo. Only exact naturally mapped customization IDs are accepted; all five armor appearances are saved together. Self-hosted grants recommend a backup and require an offline character; Solo keeps its automatic backup and closed-game checks. All five armor appearances passed controlled Solo gameplay verification; self-hosted gameplay acceptance remains pending.
+- Experimental direct character grants for 311 observed swatches and 401 observed gear appearances, available in both Solo and self-hosted Players actions. Existing unlocks are preserved. These save grants do not create account purchases or entitlements; individual in-game availability remains experimental.
+- Experimental direct grant of 717 observed schematic recipe entries in Solo and self-hosted. Existing recipes and remaining uses are preserved; this adds crafting recipes rather than physical inventory items.
+
+## [16.4.1.1] - 2026-10-12
+
+### Fixed
+- Correct LAN Server Overview VM discovery on workgroup Hyper-V hosts when the Settings connection Test succeeds but the remote PowerShell session is denied. Use the saved host credentials for the compatible Hyper-V query and retain successful status caching.
+
+
+## [16.4.1] - 2026-10-12
+
+### Added
+- Testing Stations in self-hosted Players actions and Solo Progression: choose one station or all six and unlock selectable difficulties with a verified backup. The game still applies faction requirements, and existing higher completion progress is preserved. Self-hosted changes require the selected character to be fully offline.
+
+### Fixed
+- Share external port-check results across HTTP workers, refresh automatically after six hours, and let manual Refresh force a new check. Retain the last confirmed result when an automatic check is inconclusive, and allow slower external observers more time to report.
+- Clarify that cross-battlegroup character recovery guidance is historical and has not been verified for the current game.
+
+## [16.4.0] - 2026-10-11
+
+### Added
+- Xbox app / Microsoft Store PC support for Solo save discovery, backups, editing, settings and mod launching.
+- Individual Solo trainer unlocks; Enable all skills also unlocks all five trainers.
+- PlayerInventoryStartingSize in Solo settings and a separate Skip hologram placement checkbox.
+
+### Changed
+- Connect and validate selects the matching Steam or Xbox mod installation folder and refreshes rotated Xbox save connections.
+- Mod launch controls explain that BattlEye is disabled for the session.
+- The tested mod runtime is bundled for installation without depending on changing upstream downloads.
+
+## [16.3.0] - 2026-10-11
+
+### Added
+- Create a desktop shortcut from Solo mods to launch enabled mods with saved load order and launch options. The shortcut opens DST when needed and uses the existing launch-file restoration workflow.
+- Drag Solo mods to reorder them; saved order applies to subsequent launches. Move Up and Move Down remain available.
+- Repair carried and worn Solo equipment, or repair equipment in one selected built storage container. Requires the game closed and creates a backup before changes; unrelated item data and other containers are preserved.
+
+## [16.2.2] - 2026-10-10
+
+### Fixed
+- Solo blueprint settings can restore saved timers after manual changes or deleted settings, preserving unrelated settings and backing up the current file.
+- Instant blueprint building changes only hold times, leaving the two general build timers untouched. Existing restoration records retain recovery of the previous three settings.
+
+## [16.2.1] - 2026-10-10
+
+### Changed
+- Framework adjustment.
+
+## [16.2.0] - 2026-10-10
+
+### Added
+- Solo Atreides and Harkonnen Chapter 3 Start and Rank 19 Eligible unlock presets, faction reputation/XP edits, and separate character XP controls. Save changes require the game closed and retain a backup.
+
+### Fixed
+- Solo ranged-ammo editing includes unloaded ranged weapons whose ammo data has not yet been saved. The inventory browser now includes worn equipment and equipped weapons and tools.
+
+## [16.1.5] - 2026-10-10
+
+### Fixed
+- Generate SSH keys without an accidental passphrase under PowerShell 7, including Hyper-V LAN setup. Keep passphrase removal and encryption checks compatible with Windows PowerShell 5.1 and Legacy argument passing.
+- Label the SSH-key command as Generate SSH key.
+
+## [16.1.4] - 2026-10-10
+
+### Added
+- Save extra Launch Arguments for both Solo launch buttons in DST.
+
+### Fixed
+- Restore Help's Skip intro / splash screens control in Solo-only installations by allowing shared launch preferences to load and save.
+- Expose shared Help diagnostics, Windows startup, background service and backend-console controls in Solo-only installs; skip dedicated-server probes when collecting Solo diagnostics.
+- Allow Solo connection and progression edits when unrelated save tables or columns change. Retain schema fingerprints for diagnostics and keep wrapper, integrity, required-data and write verification checks.
+- Apply Solo Max Landclaim Segments to both native settings and the required Game.ini building override, preserving other settings and rolling back the native write if Game.ini cannot be updated.
+- Read the shared Game.ini landclaim value used by self-hosted client settings, and reload INI controls when Solo Refresh is clicked so manual edits are reflected.
+
+## [16.1.3] - 2026-10-10
+
+### Fixed
+- Apply Sabotage corpse-loot and Exploration loot-effect tags when granting specialization rewards in Solo and self-hosted servers, including repairs to rewards already marked purchased.
+- Grant Pattern Upgrading's Grade 2–5 schematic-pattern recipes alongside its specialization reward.
+- Make self-hosted Max grant the track's available rewards and reconcile their skill-point bonuses.
+- Clear specialization loot-effect tags when resetting the corresponding rewards, and include them in Solo progression diagnostics.
+
+## [16.1.2] - 2026-10-09
+
+### Fixed
+- Explain when the Dune installation folder has not been saved before a Solo launch.
+- Keep the Solo mod installation-folder controls and launch errors visible while the mod list is collapsed.
+
+## [16.1.1] - 2026-10-09
+
+### Fixed
+- Fix Solo mod Move Up / Move Down order persistence under Windows PowerShell 5.1.
+- Remove a false port-forwarding diagnosis based on historical login failures appearing on one map. Connection checks continue to verify advertised addresses and map readiness.
+
+### Added
+- Add confirmed deletion of an installed Solo mod and its INI settings from its card.
+- Add Move Up / Move Down controls for a saved Solo mod load order, applied from top to bottom on mod launches.
+- Add Nexus Mods download guidance and a link to Dune: Awakening mods.
+- Add a Solo instant blueprint build control with backup and restoration of the prior configuration.
+- Add a Clear displayed list button for Public IP diagnostic map rows. Clearing only hides the displayed rows; warnings and verdicts remain visible, and Run check restores the latest results.
+
+### Changed
+- Clarify Funcom cosmetic licensing in Solo and self-hosted grant controls while retaining the existing grant options.
+
+## [16.1.0] - 2026-10-09
+
+### Added
+- Add Solo mod ZIP installation, enabled mod selection, Open Mods Folder for editing mod INIs, and separate Launch with Mods / Launch Normally controls. Mods live in the Dune Server Tool Mods folder. Declared missing dependencies and conflicts are displayed, with runtime errors available in the loader log.
+- Add Help → Skip intro / splash screens, saved independently of mods and applied to every Dune launch from DST.
+
+### Fixed
+- Write the enabled-mod list without a byte-order mark so the first mod loads when the installed Windows PowerShell host generates it.
+- Make the Mods folder editable by the installing Windows user so mod INIs can be saved in a normal editor under Program Files.
+
+### Changed
+- Ignore launcher and UE4SS version declarations so mods can load without warnings or rewriting their manifests. Actual missing mod dependencies and load errors remain visible.
+- Mod launches use a verified upstream UE4SS runtime and restore previous game launch files after exit. Normal launches bypass that runtime. Mods remain supplied and maintained by their authors.
+
+## [16.0.2] - 2026-10-08
+
+### Added
+- Add Solo client Engine.ini controls for vehicle recovery time limit, durability damage multiplier, relocation, recovery chassis durability reduction fraction, and recovery currency base cost. Coastal tested values 1, 0.01, enabled, 0.001, and 100 respectively. Writes require the game closed, retain a backup, and verify the selected values.
+
+### Fixed
+- Refresh Dashboard web interface links every minute so a VM Starting response clears after the VM and battlegroup become ready. Prevent overlapping requests and stop polling when leaving the page.
+- Allow individual Solo cosmetic grants even when a saved record or held token exists, and show saved or held entries by default in Self-Hosted mode. Saved records do not establish that the game accepts a cosmetic.
+
+### Changed
+- Point website links to duneservertool.com. The website refreshes on stable releases and includes Solo installation guidance, Webmail and email contact links.
+
+## [16.0.1] - 2026-10-07
+
+### Fixed
+- Check for the required PowerShell 7 runtime before installing or upgrading either Solo or Self-Hosted mode, leaving the existing installation intact when it is missing.
+- Direct missing-runtime guidance to PowerShell in the Microsoft Store and record the startup failure in the log.
+
+## [16.0.0] - 2026-10-07
+
+### Added
+- Choose Solo only or Self-Hosted + Solo during installation. Solo setup opens local save tools without dedicated-server setup pages, server navigation, VM discovery, port checks or server background jobs.
+- Solo Journey unlocks provide the main-quest choices from Player Admin, with offline writes, retained backups and save verification.
+
+### Changed
+- Preserve the selected installation mode and existing configuration during reinstalls and silent updates. Existing installations keep Self-Hosted + Solo; switching from Solo to Self-Hosted offers the server setup pages.
+- Keep Solo's Classic interface focused on local save tools and shared settings.
+
+### Fixed
+- Show the correct Retail specialization levels after Max specializations and individual level edits, while retaining the Legacy track mapping.
+
+## [15.2.9] - 2026-10-07
+
+### Fixed
+- Require a fresh installed-default read before Landsraad saves and refuse to write when defaults are unavailable or lack the required struct, preventing partial legacy fallback writes. This protects INI integrity without guaranteeing game-setting behavior.
+- Prevent repeated update checks and channel changes from amplifying GitHub API requests. Reuse release data for channel/build selection, throttle forced refreshes to five minutes, and cache immutable source-tag identities.
+- Respect GitHub rate-limit reset and retry intervals across updater endpoints, with a readable local retry time instead of a generic Forbidden error.
+- Refresh the Test build picker when explicitly checking for updates.
+
+## [15.2.8] - 2026-10-07
+
+- Update the website image dependency to sharp 0.35.5 to resolve its vulnerable bundled SVG renderer.
+
+- Use the dedicated-server Landsraad struct supplied by the installed game's defaults. Preserve legacy custom values and complete default members when updating settings, and read the current struct in Player Admin. Older game defaults retain their legacy format.
+
+### 15.2.8-test5 — Lifecycle rollback after host switches
+
+- Store lifecycle rollback settings separately for each Hyper-V host and VM. Preserve the legacy local record for its original owner so switching to a LAN host no longer blocks reconciliation with another host's rollback state. Identity checks still prevent applying rollback settings to the wrong VM.
+
+### 15.2.8-test4 — LAN installation and management
+
+- Provision LAN hosts from a completed local Steam server-tool download, then transfer and verify the VM image before import. The remote host no longer depends on anonymous SteamCMD access.
+- Keep the existing SSH key when authorizing a new guest, collect world details before setup, and report each provisioning stage accurately.
+- Discover VM state, uptime and guest addresses together with the saved host credential. Share recent observations across requests to reduce repeated remote calls.
+- Verify public TCP reachability through independent external observers, consistently with the header check. An unavailable check remains unverified rather than being reported as a closed port.
+
+
+### 15.2.8-test3 — Public IP updates
+
+- Keep the VM LAN address as Kubernetes InternalIP and the control-plane address when applying a public IP or DDNS update. Apply the public or relay address only as ExternalIP, including after reboot with legacy settings.
+
+
+### 15.2.8-test2 — Solo grants
+
+- Add Solo bulk grants for building sets, armor, weapon and vehicle skins, dyes and house swatches using the same curated catalogs as Self-Hosted. Skip saved unlocks and held tokens, recheck ownership before writing, batch into available backpack slots and retain the previous save automatically. Tokens are processed after login; grants do not guarantee in-game activation.
+- Remove repeated confirmation popups from routine Solo grants and backed-up edits. Keep confirmations for restores, deletions and reward resets.
+- Update vulnerable build dependencies: source-map-js to 1.2.2, smol-toml to 1.9.0 and the site CSS selector parser to 7.1.6.
+
+- Ignore the unfixed CVE-2026-93748 in Astro's transitive `http-cache-semantics` dependency during Trivy scans.
+
+### Additional accepted fixes
+
+- Correct Retail Solo specialization track IDs so Gathering, Exploration, Combat and Sabotage edits target the matching in-game specialization. Preserve Crafting, the legacy adapter, other tracks, purchased rewards and journeys during individual level edits.
+
+
+
+- Exclude buildables unlocked through the tech tree from cosmetic building grants. Preserve other building pieces and decorations; Developer Storage remains available as an individual grant.
+
+- Preserve game UDP forwarding after Start/Restart and Settings IP updates when Kubernetes reports the public-IP alias as InternalIP. Refresh the forwarding helper during manual and DDNS updates, derive the VM address from its local route, reject obsolete public/public caches, and retain working rules when address discovery fails.
+
+- Include Max Landclaim Segments in the explicit client INI review. Retain backup creation and the requirement to close the game before applying client settings.
+
+## [15.2.7] - 2026-10-04
+
+- Give unlock-status refresh immediate button feedback and an explicit completion, error or timeout result; check saved counts once without resending grants.
+
+- Recognize persisted carrier/scout vehicle, Heavy Racer clothing and vehicle/weapon dye IDs so saved unlocks are skipped instead of offered repeatedly.
+
+- Add All Dyes and All Vehicle Skins using the same missing-only bulk grant flow. Show request submission as a neutral notice, finish the action immediately after submission, and refresh unlock status separately without a blocking activation spinner.
+
+- Correct cosmetic ownership matching for campaign weapon skins, trainer armor and individual clothing slots. Distinguish saved unlocks from held tokens, show a searchable bulk catalog including unlocked entries, and exclude known unusable armor tokens and unverified developer building patents from bulk delivery.
+
+- Add separate All Armor Skins and All Weapon Skins actions for online players, including linked-player self grants. Skip learned and pending tokens, and explain Funcom activation limitations.
+
+- Add All Building Sets alongside House Swatches for online players, including linked-player self grants. Deliver only missing building set tokens while preserving existing unlocks and pending inventory tokens.
+- Exclude crafting stations and entries without an item form. Explain that Funcom limitations may prevent some sets from activating, and retain overflow pickup and uncertain-delivery guidance.
+
+## [15.2.6] - 2026-10-03
+
+- Promote the accepted 15.2.6 test changes to stable: Linux Server Settings authority and Custom defaults, host-created Player accounts and Player Portal fixes, retired mobile/Cloudflare removal, and cosmetic/Give Item catalog restoration. Historical catalog availability does not prove every item is functional in the current game.
+- Allow Land Claim Timer client writes to be retried after the game closes, show skipped writes as warnings, require an explicit timer value, and clear leftover timer overrides when restoring defaults.
+- Fix scheduled backup verification on BusyBox cron by transporting the command without percent escaping. Migrate exact managed version 3 schedules while preserving customized commands and retention settings.
+- Restart the unchanged installed package after a failed unattended update, unless recovery is active. Skip fallback if the installed build changed or cannot be verified, preserve the update failure result, and keep the update available indicator truthful.
+- Stop counting kubectl's empty-table notice as a server pod, allowing Server Settings shutdown progress to finish without leaving the page.
+- Make the persistent Linux UserSettings file authoritative for Server Settings, with manual edits reflected on Refresh and synchronized to the runtime configuration at BG startup.
+- Preserve and back up existing YAML overrides on the first migration. Warn when YAML and the file differ; Read current settings loads YAML as a draft that Save writes to the UserSettings file, preserving unknown settings.
+- Prevent restart preparation from overwriting UserServerCustomSettings.ini with a shipped template. Save also updates the physical Linux runtime INI; verify both file writes and restore prior contents if operator synchronization fails.
+- Make Default Settings draft `DifficultyLevel=Custom` so saved custom server settings can take effect.
+- Populate missing documented defaults, including Difficulty Level and an absent PvP Mode, while preserving an existing PvP Mode. Defaults remain a draft until Save; stopped-battlegroup, backup, revision, and operator-readback checks remain in place.
+
+## [15.2.6-test3] - 2026-10-02
+
+- Restore 26 cosmetic variants omitted from the picker, including Atreides and Harkonnen carrier ornithopters, faction vehicle/weapon/armor skins, and specialization helmets. Recognize variant display names when their template IDs lack the Variant suffix.
+- Restore 26 historical Give Item catalog entries with their original IDs, names, and categories. Catalog availability does not establish that every legacy item is supported by the current game.
+
+## [15.2.6-test2] - 2026-10-02
+
+- Add host-created Player accounts linked to one game character. Players can view server status and maps, warm maps, and manage their own character, inventory, progression, and item grants.
+- Enforce character and item ownership on the server for every Player request. Server commands, host settings, other characters, and map stop/reset controls remain unavailable; saved-data edits retain offline requirements.
+- Revoke account sessions when the host changes a role or character link.
+- Restore scrolling throughout the Player Portal. Show package Grade separately from item Mk tier, reject online packages with custom Grade overrides before sending any items, and report package failures instead of unconditional success.
+- Remove the retired native mobile app project and legacy Cloudflare remote-access settings, authentication, and service-token pairing. Keep the responsive Browser Portal, Player accounts, website, and Tailscale Funnel access.
+
 ## [15.2.5] - 2026-10-01
 
 - Verify the archive reported by the current backup run instead of selecting the newest YAML from any battlegroup.

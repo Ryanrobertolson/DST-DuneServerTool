@@ -200,7 +200,7 @@ export type GameConfigFileBundle = {
 
 export type GameConfigResponse = {
   available: boolean
-  source: 'installed' | 'installed-uninitialized' | 'legacy-live' | 'live' | 'template' | 'cache'
+  source: 'installed' | 'installed-uninitialized' | 'legacy-live' | 'live' | 'template' | 'cache' | 'self-managed'
   authoritative?: boolean
   needsInitialization?: boolean
   game: GameConfigFileBundle
@@ -247,9 +247,12 @@ export type RetailServerSettingsResponse = {
   available: boolean
   readOnly: boolean
   source: 'funcom-runtime-projection' | 'funcom-servergroup-user-ini-config'
+    | 'funcom-persistent-user-settings' | 'existing-operator-settings-pending-migration' | 'operator-import-draft'
   authority?: string
   reason?: string
   revision?: string
+  operatorRevision?: string | null
+  operatorMismatch?: boolean
   modifiedAt?: string
   observedAt?: string
   bytes?: number
@@ -364,6 +367,7 @@ export type GameConfigDefaultKey = {
   key: string
   default: string
   current: string
+  hasOverride?: boolean
   overridden: boolean
   isArray: boolean
   prefix?: '+' | '-' | ''
@@ -473,7 +477,7 @@ export type GameConfigClientApplyResult = {
 export type GameConfigSaveResponse = {
   ok: boolean
   applied: number
-  source: 'live' | 'template' | 'cache'
+  source: GameConfigResponse['source']
   game: GameConfigFileBundle
   engine: GameConfigFileBundle
   clientApply?: GameConfigClientApply
@@ -494,6 +498,7 @@ export type LandclaimTimerServerState = {
   enabled: boolean
   seconds: string
   formattedOk: boolean
+  hasOverrides?: boolean
   path?: string
   reason?: string
   error?: string
@@ -507,6 +512,7 @@ export type LandclaimTimerClientState = {
   enabled: boolean
   seconds: string
   formattedOk: boolean
+  hasOverrides?: boolean
 }
 
 export type LandclaimTimerState = {

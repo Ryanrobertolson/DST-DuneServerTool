@@ -206,6 +206,14 @@ Describe 'Vehicle module repair' {
         Get-DuneVehicleModuleDefaultDurability 'SandbikeEngine_6' | Should -Be 1000
     }
 
+    It 'keeps installed-module caps separate from inventory item durability' {
+        (Get-DuneGameplayItemRule 'SandbikeEngine_6').max_durability | Should -Be 100
+        (Get-DuneVehicleModuleRepairDefaults)['SandbikeEngine_6'] | Should -Be 1000
+        (Get-DuneVehicleModuleRepairDefaults).ContainsKey('FullStabilizationBelt') | Should -BeFalse
+        Mock Get-DuneGameplayItemRule { @{max_durability=100} }
+        Get-DuneVehicleModuleDefaultDurability 'UnknownModule' | Should -Be 0
+    }
+
     It 'uses one catalog-backed database statement for every repairable module' {
         $script:repairQueries = @()
         Mock Get-DuneVehicleModuleRepairDefaults {
@@ -427,6 +435,17 @@ INSERT INTO dune.player_markers VALUES (42);
         $integrity.ok | Should -BeTrue -Because $integrity.error
         $integrity.modules[0].current_durability | Should -Be 25
         $integrity.modules[1].current_durability | Should -BeNullOrEmpty
+    }
+
+    It 'filters fleet records by the selected pawn through controller permissions' {
+        $owner = Get-DuneVehicleFleetLive -Ip fixture -PlayerId 100
+        $owner.ok | Should -BeTrue -Because $owner.error
+        @($owner.vehicles).Count | Should -Be 1
+        $owner.vehicles[0].id | Should -Be 42
+        $shared = Get-DuneVehicleFleetLive -Ip fixture -PlayerId 110
+        $shared.ok | Should -BeTrue -Because $shared.error
+        @($shared.vehicles).Count | Should -Be 1
+        @( (Get-DuneVehicleFleetLive -Ip fixture -PlayerId 999).vehicles ).Count | Should -Be 0
     }
 
     It 'renames an exact active vehicle and rejects stale expected names' {

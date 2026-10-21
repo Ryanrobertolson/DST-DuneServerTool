@@ -11,11 +11,43 @@ Register-DuneRoute -Method GET -Path '/api/gameconfig/schema' -Handler {
     Write-DuneJson -Response $res -Body @{ schema = Get-DuneGameConfigSchemaApi }
 }
 
-# Official Retail Self-Hosted settings are a Funcom-managed runtime projection
-# on the Saved PVC. Funcom reconciles direct edits, and no durable upstream write
-# source is currently configured in the battlegroup. The ServerGroup CRD exposes
-# global.userIniConfig as the intended upstream mount contract. Writes below
-# target only that durable field while the battlegroup is fully stopped.
+# Server Settings use the persistent Linux UserSettings file. Existing YAML is
+# retained until a backed-up migration completes; it can also be read as a draft.
+Register-DuneRoute -Method GET -Path '/api/gameconfig/retail-startup-sync' -Handler {
+    param($req,$res,$routeParams,$body)
+    try {Write-DuneJson -Response $res -Body (Get-DuneRetailStartupSyncPreference)}
+    catch {Write-DuneError -Response $res -Status 400 -Message $_.Exception.Message}
+}
+
+Register-DuneRoute -Method PUT -Path '/api/gameconfig/retail-startup-sync' -LocalOnly -Handler {
+    param($req,$res,$routeParams,$body)
+    if(-not($body -is [hashtable]) -or $body.enabled -isnot [bool]){
+        Write-DuneError -Response $res -Status 400 -Message 'enabled must be a boolean.'
+        return
+    }
+    try {
+        $result=Invoke-WithDuneLock -Name 'retail-startup-sync' -Script {
+            $pending = $false
+            $cleanupError = ''
+            if (-not $body.enabled) {
+                # Persist the opt-out before remote cleanup. A transport failure
+                # must not leave automatic writers active after partial cleanup.
+                $null = Set-DuneRetailStartupSyncPreference -Enabled $false -CleanupPending
+                $ctx = Get-DuneGameConfigContext
+                if ($ctx.ok) {
+                    try { $null = Remove-DuneManagedSettingsYamlInjections -Ip $ctx.ip }
+                    catch { $pending=$true; $cleanupError=$_.Exception.Message }
+                }
+                else { $pending = $true }
+            }
+            $saved = Set-DuneRetailStartupSyncPreference -Enabled $body.enabled -CleanupPending:$pending
+            if ($cleanupError) { $saved.cleanupError = $cleanupError }
+            $saved
+        }
+        Write-DuneJson -Response $res -Body $result
+    } catch {Write-DuneError -Response $res -Status 400 -Message $_.Exception.Message}
+}
+
 Register-DuneRoute -Method GET -Path '/api/gameconfig/retail-server-settings' -Handler {
     param($req, $res, $routeParams, $body)
     $ctx = Get-DuneGameConfigContext
@@ -24,7 +56,8 @@ Register-DuneRoute -Method GET -Path '/api/gameconfig/retail-server-settings' -H
         return
     }
     try {
-        Write-DuneJson -Response $res -Body (Get-DuneRetailServerSettings -Ip $ctx.ip)
+        $readOperator = $req -and $req.QueryString['source'] -eq 'operator'
+        Write-DuneJson -Response $res -Body (Get-DuneRetailServerSettings -Ip $ctx.ip -ReadOperator:$readOperator)
     } catch {
         Write-DuneError -Response $res -Status 500 -Message "Official Retail Server Settings load failed: $($_.Exception.Message)"
     }
@@ -47,7 +80,8 @@ Register-DuneRoute -Method PUT -Path '/api/gameconfig/retail-server-settings' -H
     }
     try {
         Write-DuneJson -Response $res -Body (
-            Set-DuneRetailServerSettings -Ip $ctx.ip -Updates $body.updates -ExpectedRevision "$($body.revision)")
+            Set-DuneRetailServerSettings -Ip $ctx.ip -Updates $body.updates -ExpectedRevision "$($body.revision)" `
+                -ImportOperatorRevision "$($body.importOperatorRevision)")
     } catch {
         $status = if ($_.Exception.Message -match 'changed since|changed during save') { 409 } else { 400 }
         Write-DuneError -Response $res -Status $status -Message $_.Exception.Message
@@ -286,7 +320,7 @@ Register-DuneRoute -Method PUT -Path '/api/gameconfig' -Handler {
             }
             if (-not $sec -or -not $file) { continue }
             if (Test-DuneGameConfigRawTargetBlocked -File $file -Section $sec -Key $key) {
-                Write-DuneError -Response $res -Status 400 -Message "The unverified TimeOfDaySettings m_StartTime candidate is evidence-only and cannot be written by DST."
+                Write-DuneError -Response $res -Status 400 -Message "Use the Time of day phase controls to change m_StartTime."
                 return
             }
             # Array-entry payload: rebuild the full set of +/-key= lines for
@@ -324,7 +358,8 @@ Register-DuneRoute -Method PUT -Path '/api/gameconfig' -Handler {
                 Write-DuneError -Response $res -Status 400 -Message 'Raw scalar INI values must be one physical line without control characters.'
                 return
             }
-            $rm = (Test-DuneGameConfigValueIsDefault -Key $key -Value $rawValue)
+            $rm = ($u.remove -eq $true) -or [string]::IsNullOrWhiteSpace($rawValue)
+            if ($u.remove -eq $true) { $rawValue = '' }
             $structured.Add(@{ file = $file; section = $sec; key = $key; value = $rawValue; remove = $rm })
         }
     } else {
@@ -332,13 +367,11 @@ Register-DuneRoute -Method PUT -Path '/api/gameconfig' -Handler {
         $keys = if ($updates -is [hashtable]) { $updates.Keys } else { $updates.PSObject.Properties.Name }
         foreach ($k in $keys) {
             $v = if ($updates -is [hashtable]) { $updates[$k] } else { $updates.$k }
-            $isAdvanced = $false
             if (-not $schemaMap.ContainsKey($k)) {
                 if (-not (Test-DuneAdvancedCvarKey -Key $k)) { continue }
                 $schemaMap[$k] = @{ file = 'engine'; section = $script:DuneGcSecConsole }
-                $isAdvanced = $true
             }
-            $rm = if ($isAdvanced) { [string]::IsNullOrWhiteSpace("$v") } else { Test-DuneGameConfigValueIsDefault -Key $k -Value "$v" }
+            $rm = [string]::IsNullOrWhiteSpace("$v")
             $structured.Add(@{ file = $schemaMap[$k].file; section = $schemaMap[$k].section; key = $k; value = "$v"; remove = $rm })
         }
     }
@@ -357,6 +390,12 @@ Register-DuneRoute -Method PUT -Path '/api/gameconfig' -Handler {
     }
 
     try {
+        if ($body.lab -eq $true) {
+            $before = Get-DuneGameConfig -Ip $ctx.ip
+            foreach ($file in @('game','engine')) {
+                Assert-DuneLabPathsUnchanged -Raw "$($before[$file].raw)" -Updates @($structured | Where-Object { $_.file -eq $file })
+            }
+        }
         Save-DuneGameConfigLocked -Ip $ctx.ip -Updates $structured.ToArray()
         # Console variables are staged, never applied here. The values live in
         # UserEngine.ini; the matching startup commands are rebuilt from that file
@@ -374,7 +413,7 @@ Register-DuneRoute -Method PUT -Path '/api/gameconfig' -Handler {
         # note to the response instead of failing the whole INI save.
         $landsraadApply = $null
         $goalUpdate = $structured | Where-Object { $_.key -eq 'm_TaskGoalAmount' } | Select-Object -Last 1
-        if ($goalUpdate) {
+        if ($goalUpdate -and -not [string]::IsNullOrWhiteSpace("$($goalUpdate.value)")) {
             try {
                 $goalVal = 0L
                 $dbl = 0.0
@@ -428,14 +467,16 @@ Register-DuneRoute -Method POST -Path '/api/gameconfig/reload-pods' -Handler {
     try {
         # Invoke-DuneBattlegroupRestart rebuilds the startup console variables from
         # the current INI before restarting, so no separate sync is needed here.
-        $r = Invoke-DuneBattlegroupRestart -Ip $ctx.ip
+        $r = Invoke-WithDuneLock -Name 'retail-startup-sync' -Script {
+            Invoke-DuneBattlegroupRestart -Ip $ctx.ip -ApplyInis -StartStopped:($body -and $body.startStopped -eq $true)
+        }
         if (-not $r.ok) {
             Write-DuneError -Response $res -Status 502 -Message $r.message
             return
         }
         Write-DuneJson -Response $res -Body @{
             ok      = $true
-            message = 'Battlegroup restart underway - every map reloads together. Watch Server Health; it takes a couple of minutes to come back.'
+            message = $r.message
         }
     } catch {
         Write-DuneError -Response $res -Status 502 -Message "Battlegroup restart failed: $($_.Exception.Message)"
@@ -655,6 +696,24 @@ Register-DuneRoute -Method PUT -Path '/api/gameconfig/client/engine' -LocalOnly 
         }
     } catch {
         Write-DuneError -Response $res -Status 500 -Message "Updating client Engine.ini permission failed: $($_.Exception.Message)"
+    }
+}
+
+# The Lab's explicit destination review authorizes these exact raw targets,
+# including controls outside the curated client-compatibility schema.
+Register-DuneRoute -Method PUT -Path '/api/gameconfig/client/lab' -LocalOnly -Handler {
+    param($req, $res, $routeParams, $body)
+    if (-not ($body -is [hashtable]) -or $body.approved -ne $true) {
+        Write-DuneError -Response $res -Status 400 -Message 'Review and approve the local Lab file changes before saving.'
+        return
+    }
+    try {
+        $result = Save-DuneGameConfigClient -Updates @($body.updates) -ReviewedRaw
+        # Keep the comparison populated with every unselected local entry.
+        $result['client'] = Get-DuneGameConfigClient
+        Write-DuneJson -Response $res -Body $result
+    } catch {
+        Write-DuneError -Response $res -Status 400 -Message "Local Lab save failed: $($_.Exception.Message)"
     }
 }
 
@@ -1036,7 +1095,7 @@ Register-DuneRoute -Method GET -Path '/api/gameconfig/landclaim-timer' -Handler 
             $cst    = Get-DuneLandclaimTimerState -Raw $client.raw
             Write-DuneJson -Response $res -Body @{
                 server = @{ available = $false; enabled = $false; seconds = ''; formattedOk = $false; reason = $ctx.message }
-                client = @{ exists = [bool]$client.exists; dirExists = [bool]$client.dirExists; path = $client.path; dir = $client.dir; enabled = $cst.enabled; seconds = $cst.seconds; formattedOk = $cst.formattedOk }
+                client = @{ exists = [bool]$client.exists; dirExists = [bool]$client.dirExists; path = $client.path; dir = $client.dir; enabled = $cst.enabled; seconds = $cst.seconds; formattedOk = $cst.formattedOk; hasOverrides = $cst.hasOverrides }
                 clientBlock = (Get-DuneLandclaimClientBlock -Seconds ($(if ($cst.enabled) { $cst.seconds } else { '' })))
             }
         }
@@ -1087,4 +1146,21 @@ Register-DuneRoute -Method PUT -Path '/api/gameconfig/landclaim-timer' -Handler 
     } catch {
         Write-DuneError -Response $res -Status 500 -Message "Land-claim timer save failed: $($_.Exception.Message)"
     }
+}
+
+
+# Read-only location query; opening Explorer is an explicit host-local action.
+Register-DuneRoute -Method GET -Path '/api/gameconfig/backup-folder' -LocalOnly -Handler {
+    param($req,$res,$routeParams,$body)
+    $path = if (Test-DuneSoloInstallation) { Join-Path (Get-DuneSoloBackupRoot) 'settings' } else { Get-DuneGameConfigClientBackupRoot }
+    Write-DuneJson -Response $res -Body @{path=$path}
+}
+Register-DuneRoute -Method POST -Path '/api/gameconfig/backup-folder/open' -LocalOnly -Handler {
+    param($req,$res,$routeParams,$body)
+    try {
+        $path = if (Test-DuneSoloInstallation) { Join-Path (Get-DuneSoloBackupRoot) 'settings' } else { Get-DuneGameConfigClientBackupRoot }
+        [void][IO.Directory]::CreateDirectory($path)
+        Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$path`"" | Out-Null
+        Write-DuneJson -Response $res -Body @{ok=$true;path=$path}
+    } catch { Write-DuneError -Response $res -Status 400 -Message $_.Exception.Message }
 }
